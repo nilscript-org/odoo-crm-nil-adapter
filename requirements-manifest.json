@@ -1,0 +1,44 @@
+{
+  "manifest_version": "0.1",
+  "system": "odoo_crm",
+  "nil_spec": "0.1",
+  "backend": {
+    "kind": "odoo",
+    "transport": "xmlrpc-2",
+    "server_version": "saas~19.3",
+    "models": ["crm.lead", "res.partner", "crm.stage"]
+  },
+  "verbs": {
+    "crm.create_lead": {
+      "doctype": "crm.lead",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "hidden_requirements": []
+    },
+    "crm.create_contact": {
+      "doctype": "res.partner",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "hidden_requirements": []
+    },
+    "crm.update_lead_stage": {
+      "doctype": "crm.lead",
+      "tier": "MEDIUM",
+      "reversibility": "IRREVERSIBLE",
+      "hidden_requirements": []
+    },
+    "crm.delete_lead": {
+      "doctype": "crm.lead",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "hidden_requirements": []
+    },
+    "crm.delete_contact": {
+      "doctype": "res.partner",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "hidden_requirements": []
+    }
+  },
+  "transport_quirks": []
+}
