@@ -79,25 +79,24 @@ class CapturingEmitter:
 class HttpEventEmitter:
     """Real emitter: HMAC-SHA256 over the raw body + a monotonic per-workspace sequence header."""
 
-    def __init__(self, webhook_url: str, secret: str) -> None:
+    def __init__(self, webhook_url: str, secret: str, *, source: str = "") -> None:
         self._url = webhook_url
         self._secret = secret.encode("utf-8")
+        self._source = source  # tags events in the control plane (e.g. "playground" vs "mcp")
 
     def emit(self, event_envelope: dict[str, Any], sequence: int) -> None:
         import httpx
 
         raw = json.dumps(event_envelope, separators=(",", ":")).encode("utf-8")
         signature = hmac.new(self._secret, raw, hashlib.sha256).hexdigest()
-        httpx.post(
-            self._url,
-            content=raw,
-            headers={
-                "Content-Type": "application/json",
-                "X-NIL-Signature": signature,
-                "X-NIL-Sequence": str(sequence),
-            },
-            timeout=10.0,
-        )
+        headers = {
+            "Content-Type": "application/json",
+            "X-NIL-Signature": signature,
+            "X-NIL-Sequence": str(sequence),
+        }
+        if self._source:
+            headers["X-NIL-Source"] = self._source
+        httpx.post(self._url, content=raw, headers=headers, timeout=10.0)
 
 
 def _envelope(performative: str, env: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
