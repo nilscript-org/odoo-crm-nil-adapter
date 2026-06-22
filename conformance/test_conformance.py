@@ -299,10 +299,17 @@ def test_field_diff_shows_after_equals_requested_on_a_clean_write() -> None:
     assert email["verified"] is True and email["after"] == "new@x.com"
 
 
-def test_choice_gate_refuses_unresolvable_country_with_candidates() -> None:
-    # The Choice Gate: a constrained value that doesn't resolve is REFUSED at PROPOSE with the live
-    # candidate list — so the agent picks the real member (e.g. "قطر", whose Arabic name doesn't match
-    # Odoo's English res.country, gets the list and chooses Qatar) instead of a silent/wrong write.
+def _assert_valid_proposal_body(body: dict) -> None:
+    # The refusal/proposal MUST satisfy the kernel's wire contract — this is the regression guard for
+    # the candidate-schema crash (id must be str, no stray fields, ≤8 candidates).
+    sentences = pytest.importorskip("nilscript.sdk.sentences")
+    sentences.ProposalBody.model_validate(body)
+
+
+def test_choice_gate_points_to_the_full_list_when_nothing_matches() -> None:
+    # "قطر" (Arabic) doesn't match Odoo's English res.country → 0 matches. The gate refuses and points
+    # the agent at the full list to query (resource.read), so the intelligent agent fetches it, reads
+    # the names in any language, and picks Saudi Arabia/Qatar by id — never a silent/wrong write.
     sys = FakeSystem()
     sys.docs["res.country"] = [{"id": 186, "name": "Qatar", "code": "QA"},
                                {"id": 184, "name": "Saudi Arabia", "code": "SA"}]
@@ -312,11 +319,28 @@ def test_choice_gate_refuses_unresolvable_country_with_candidates() -> None:
     proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
         {"contact_id": "37", "country": "قطر"})).json()["body"]
 
-    assert proposed["outcome"] == "refusal"          # not silently accepted
-    assert proposed["field"] == "country_id"
-    assert proposed.get("candidates"), "the refusal must carry the live options to choose from"
-    names = {c.get("name") for c in proposed["candidates"]}
-    assert "Qatar" in names                          # the agent now sees the real member to pick
+    assert proposed["outcome"] == "refusal" and proposed["field"] == "country_id"
+    assert proposed["code"] == "INVALID_ARGS"
+    assert "resource.read" in proposed["message"] and "res.country" in proposed["message"]
+    _assert_valid_proposal_body(proposed)
+
+
+def test_choice_gate_returns_candidates_on_an_ambiguous_match() -> None:
+    # When the value matches several members, the gate refuses AMBIGUOUS with up to 8 candidates that
+    # obey the kernel Candidate schema ({id: str, name}) — the regression test for the crash bug.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 233, "name": "United States", "code": "US"},
+                               {"id": 232, "name": "United Kingdom", "code": "GB"}]
+    sys.schemas["res.partner"] = [{"name": "country_id", "type": "many2one", "relation": "res.country"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
+        {"contact_id": "37", "country": "United"})).json()["body"]
+
+    assert proposed["outcome"] == "refusal" and proposed["code"] == "AMBIGUOUS"
+    ids = {c["id"] for c in proposed["candidates"]}
+    assert ids == {"233", "232"} and all(isinstance(c["id"], str) for c in proposed["candidates"])
+    _assert_valid_proposal_body(proposed)  # would have caught the id-as-int / extra-code crash
 
 
 def test_choice_gate_passes_a_resolvable_value() -> None:
@@ -444,7 +468,8 @@ def test_resource_update_refuses_unknown_selection_value_at_propose() -> None:
         {"target": "thing", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]
 
     assert proposed["outcome"] == "refusal" and proposed["field"] == "state"
-    assert {c["value"] for c in proposed["candidates"]} == {"available"}  # the allowed set, to pick from
+    assert {c["id"] for c in proposed["candidates"]} == {"available"}  # the allowed set, to pick from
+    _assert_valid_proposal_body(proposed)
     assert "state" not in (sys.get("thing", "x") or {})  # nothing written
 
 

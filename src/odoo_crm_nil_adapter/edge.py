@@ -261,27 +261,51 @@ def _choice_gate(client: SystemClient, doctype: str, native: dict[str, Any],
         meta = meta_by_field.get(field) or {}
         for v in (value if isinstance(value, (list, tuple)) else [value]):
             if meta.get("relation"):
-                model = meta["relation"]
-                try:
-                    _resolve_reference(client, model, v)
-                except SystemError as exc:
-                    code = "AMBIGUOUS" if "AMBIGUOUS" in str(exc) else "INVALID_ARGS"
-                    rows = client.search(model, [["name", "ilike", str(v)[:3]]],
-                                         fields=("id", "name", "code"), limit=30) \
-                        or client.search(model, [], fields=("id", "name", "code"), limit=30)
-                    cands = [{"id": r.get("id"), "name": r.get("name"), "code": r.get("code")} for r in rows]
-                    msg = (f"{field}: '{v}' did not resolve to a {model}. Pick one of the listed options "
-                           f"(or query resource.read target={model} for the full set), then re-propose.")
-                    return _refusal(env, code, msg, field=field, candidates=cands)
+                gate = _gate_relation(client, env, field, meta["relation"], v)
+                if gate is not None:
+                    return gate
             elif meta.get("options"):
-                try:
-                    _resolve_option(meta["options"], v)
-                except SystemError as exc:
-                    code = "AMBIGUOUS" if "AMBIGUOUS" in str(exc) else "INVALID_ARGS"
-                    cands = [{"value": o.get("value"), "label": o.get("label")} for o in meta["options"]]
-                    return _refusal(env, code, f"{field}: '{v}' is not an allowed value — choose one of the "
-                                    f"listed options, then re-propose.", field=field, candidates=cands)
+                gate = _gate_option(env, field, meta["options"], v)
+                if gate is not None:
+                    return gate
     return None
+
+
+def _gate_relation(client: SystemClient, env: dict[str, Any], field: str, model: str,
+                   value: Any) -> dict[str, Any] | None:
+    """Validate a relational value; on failure refuse with up to 8 close matches (AMBIGUOUS), or — if
+    nothing matches (e.g. an Arabic name vs an English res.country) — point the agent at the full list
+    to query and choose from (INVALID_ARGS). Candidates obey the kernel's Candidate schema: {id, name}."""
+    try:
+        _resolve_reference(client, model, value)
+        return None
+    except SystemError:
+        rows = client.search(model, [["name", "ilike", str(value)]], fields=("id", "name", "code"), limit=8)
+        cands = [{"id": str(r.get("id")), "name": _label(r)} for r in rows if r.get("id") is not None]
+        if cands:
+            return _refusal(env, "AMBIGUOUS", f"{field}: '{value}' matched several {model} — pick one of the "
+                            "candidates and re-propose.", field=field, candidates=cands)
+        return _refusal(env, "INVALID_ARGS", f"{field}: '{value}' did not match any {model}. Query "
+                        f"resource.read target={model} for the full list, choose the id, and re-propose.",
+                        field=field)
+
+
+def _gate_option(env: dict[str, Any], field: str, options: list[dict[str, Any]], value: Any) -> dict[str, Any] | None:
+    """Validate a selection value; on failure refuse with the allowed values as candidates (≤8)."""
+    try:
+        _resolve_option(options, value)
+        return None
+    except SystemError:
+        cands = [{"id": str(o.get("value")), "name": str(o.get("label") or o.get("value"))}
+                 for o in options[:8]]
+        return _refusal(env, "INVALID_ARGS", f"{field}: '{value}' is not an allowed value — choose one of "
+                        "the candidates and re-propose.", field=field, candidates=cands)
+
+
+def _label(row: dict[str, Any]) -> str:
+    name = str(row.get("name") or row.get("id") or "")
+    code = row.get("code")
+    return f"{name} ({code})" if code else name
 
 
 def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | None) -> FastAPI:
