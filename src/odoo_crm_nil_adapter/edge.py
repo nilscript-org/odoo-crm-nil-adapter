@@ -175,10 +175,16 @@ def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) 
         if value in (None, ""):
             continue
         meta = meta_by_field.get(field) or {}
+        # D (multi-value): a list/tuple value resolves element-by-element — many2many/tag fields
+        # become a list of referenced ids, multi-selects a list of keys. Cardinality is preserved.
         if meta.get("relation"):
-            resolved[field] = _resolve_reference(client, meta["relation"], value)
+            resolved[field] = ([_resolve_reference(client, meta["relation"], v) for v in value]
+                               if isinstance(value, (list, tuple))
+                               else _resolve_reference(client, meta["relation"], value))
         elif meta.get("options"):
-            resolved[field] = _resolve_option(meta["options"], value)
+            resolved[field] = ([_resolve_option(meta["options"], v) for v in value]
+                               if isinstance(value, (list, tuple))
+                               else _resolve_option(meta["options"], value))
     return resolved
 
 

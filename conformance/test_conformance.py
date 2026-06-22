@@ -378,6 +378,26 @@ def test_resource_update_resolves_selection_and_reference_from_schema() -> None:
     assert committed["result"]["verified"] is True
 
 
+def test_resource_update_resolves_multi_value_tags() -> None:
+    # P3 (D) — a multi-value field (many2many/tags) resolves element-by-element to referenced ids,
+    # preserving cardinality. "VIP", "Wholesale" → [1, 2].
+    sys = FakeSystem()
+    sys.docs["res.partner.category"] = [{"id": 1, "name": "VIP"}, {"id": 2, "name": "Wholesale"}]
+    sys.schemas["res.partner"] = [
+        {"name": "category_id", "type": "many2many", "relation": "res.partner.category"},
+    ]
+    sys.create("res.partner", {"name": "Badr"})
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    pid = client.post("/nil/v0.1/propose", json=_env("resource.update", {"target": "res.partner",
+        "id": "Badr", "data": {"category_id": ["VIP", "Wholesale"]}})).json()["body"]["id"]
+    committed = client.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {"proposal": pid, "idempotency_key": pid}}).json()["body"]
+
+    assert sys.get("res.partner", "Badr")["category_id"] == [1, 2]   # each tag → its id
+    assert committed["result"]["verified"] is True
+
+
 def test_resource_update_refuses_unknown_selection_value() -> None:
     # Fail-closed for bucket B: a value outside the field's allowed set is a terminal failure, never
     # a silently-wrong write.
