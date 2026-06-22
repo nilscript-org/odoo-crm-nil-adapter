@@ -353,6 +353,47 @@ def test_list_countries_reads_the_dropdown_values() -> None:
     assert resp["data"]["items"][0]["name"] == "Qatar"
 
 
+def test_schema_extracts_selection_options_relation_and_readonly() -> None:
+    # P1 — the resolver needs to know HOW to write each field. schema() must surface a selection's
+    # option list (enum), a many2one's relation (comodel), and the readonly flag — from fields_get.
+    from odoo_crm_nil_adapter.system import RealSystemClient
+
+    c = RealSystemClient("http://x", db="d", login="l", api_key="k")
+    fake_fields_get = {
+        "name": {"type": "char", "required": True, "readonly": False},
+        "country_id": {"type": "many2one", "relation": "res.country", "readonly": False},
+        "state": {"type": "selection", "selection": [["available", "Available"], ["sold", "Sold"]]},
+        "create_date": {"type": "datetime", "readonly": True},
+    }
+    c._kw = lambda *a, **k: fake_fields_get  # type: ignore[assignment]  # stub the XML-RPC call
+
+    fields = {f["name"]: f for f in c.schema("res.partner")}
+    assert fields["country_id"]["relation"] == "res.country"            # C: where it points
+    assert fields["state"]["options"] == [{"value": "available", "label": "Available"},
+                                          {"value": "sold", "label": "Sold"}]  # B: the allowed list
+    assert fields["create_date"]["readonly"] is True                    # F: never a write target
+    assert "options" not in fields["name"] and "relation" not in fields["name"]  # A: plain scalar
+
+
+def test_describe_surfaces_field_metadata_for_callers() -> None:
+    # The read surface behind resolution: a caller (agent/UI) can see a field's allowed values and
+    # where a reference points — so "what can this field be?" is answerable before a write.
+    sys = FakeSystem()
+    sys.schemas["res.partner"] = [
+        {"name": "name", "type": "char", "required": True, "readonly": False},
+        {"name": "country_id", "type": "many2one", "required": False, "readonly": False,
+         "relation": "res.country"},
+        {"name": "state", "type": "selection", "required": False, "readonly": False,
+         "options": [{"value": "available", "label": "Available"}, {"value": "sold", "label": "Sold"}]},
+    ]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    d = client.get("/nil/v0.1/describe").json()
+    fields = {f["name"]: f for f in d["targets"]["res.partner"]["fields"]}
+    assert fields["country_id"]["relation"] == "res.country"
+    assert {o["value"] for o in fields["state"]["options"]} == {"available", "sold"}
+
+
 def test_propose_flags_unsupported_args_as_ignored() -> None:
     # An arg the verb cannot write must be surfaced as ignored, never echoed as accepted.
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)

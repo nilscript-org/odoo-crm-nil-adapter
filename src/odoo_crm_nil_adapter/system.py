@@ -72,6 +72,31 @@ def _writable(record: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _field_meta(name: str, meta: dict[str, Any]) -> dict[str, Any]:
+    """Resolution-oriented metadata for one field — what the edge resolver needs to know HOW to write
+    it. Beyond name/type: a `selection` option list (enum — the value must be one of these keys), a
+    `relation` (the comodel a many2one points to — the value must be a record id there), and the
+    `readonly` flag (never a write target). This is the per-field surface that drives buckets A–F."""
+    field: dict[str, Any] = {
+        "name": name,
+        "type": meta.get("type"),
+        "required": bool(meta.get("required")),
+        "readonly": bool(meta.get("readonly")),
+    }
+    selection = meta.get("selection")
+    if isinstance(selection, (list, tuple)):  # Odoo gives [[value, label], …]
+        options = [
+            {"value": pair[0], "label": pair[1]}
+            for pair in selection
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        ]
+        if options:
+            field["options"] = options
+    if meta.get("relation"):
+        field["relation"] = meta["relation"]
+    return field
+
+
 class RealSystemClient:
     """Talk to Odoo via the XML-RPC External API — the only I/O in the adapter."""
 
@@ -164,16 +189,13 @@ class RealSystemClient:
         if target in self._fields_cache:
             return self._fields_cache[target]
         try:
-            fg = self._kw(target, "fields_get", [], {"attributes": ["string", "type", "required"]})
+            fg = self._kw(target, "fields_get", [],
+                          {"attributes": ["string", "type", "required", "readonly", "selection", "relation"]})
         except SystemError:
             self._fields_cache[target] = None  # model not provisioned / not accessible
             return None
-        fields = [
-            {"name": name, "type": meta.get("type"), "required": bool(meta.get("required"))}
-            for name, meta in sorted(fg.items())
-        ]
-        self._fields_cache[target] = fields
-        return fields
+        self._fields_cache[target] = [_field_meta(name, meta) for name, meta in sorted(fg.items())]
+        return self._fields_cache[target]
 
     def get(self, target: str, record_id: str) -> dict[str, Any] | None:
         rid = _as_int(record_id)
@@ -189,6 +211,7 @@ class FakeSystem:
     def __init__(self) -> None:
         self.docs: dict[str, list[dict[str, Any]]] = {}
         self.messages: dict[tuple[str, str], list[str]] = {}  # (target, record_id) -> chatter notes
+        self.schemas: dict[str, list[dict[str, Any]]] = {}  # optional per-target field_meta (tests)
         self._counter = 0
 
     def create(self, target: str, doc: dict[str, Any]) -> dict[str, Any]:
@@ -240,7 +263,7 @@ class FakeSystem:
         return True  # in-memory backend is always ready (creates targets on demand)
 
     def schema(self, target: str) -> list[dict[str, Any]] | None:
-        return []  # schemaless in-memory store — provisioned, no declared fields
+        return self.schemas.get(target, [])  # seeded field_meta if a test set it, else provisioned/empty
 
     def get(self, target: str, record_id: str) -> dict[str, Any] | None:
         return next((r for r in self.docs.get(target, []) if r.get("name") == record_id), None)
