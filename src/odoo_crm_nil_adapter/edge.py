@@ -112,6 +112,34 @@ def _before_image_reversal(
     return reversal, before
 
 
+def _resolve_reference(client: SystemClient, model: str, value: Any) -> int:
+    """Resolve a human dropdown value (a many2one: country/state/…) to the backend record id the
+    field actually accepts — never write the raw string into a relational field. Strategy: a bare
+    numeric id passes straight through (already resolved); a short alpha token is tried as an ISO code;
+    otherwise a name match, preferring an exact (case-insensitive) hit. Zero matches => UNRESOLVED,
+    many => AMBIGUOUS — both raise (the edge turns them into an honest terminal failure, no write)."""
+    v = str(value).strip()
+    if not v:
+        raise SystemError(f"empty reference for {model}")
+    if v.isdigit():
+        return int(v)
+    candidates: list[dict[str, Any]] = []
+    if 2 <= len(v) <= 3 and v.isalpha():
+        candidates = client.search(model, [["code", "=", v.upper()]], fields=("id", "name", "code"), limit=2)
+    if not candidates:
+        candidates = client.search(model, [["name", "ilike", v]], fields=("id", "name", "code"), limit=8)
+    exact = [c for c in candidates if str(c.get("name", "")).strip().lower() == v.lower()]
+    pool = exact or candidates
+    if not pool:
+        raise SystemError(f"UNRESOLVED_REFERENCE: no {model} matches {value!r}")
+    if len(pool) > 1:
+        raise SystemError(f"AMBIGUOUS_REFERENCE: {len(pool)} {model} records match {value!r}")
+    rid = pool[0].get("id")
+    if rid is None:
+        raise SystemError(f"UNRESOLVED_REFERENCE: {model} match for {value!r} has no id")
+    return int(rid)
+
+
 class EventEmitter(Protocol):
     def emit(self, event_envelope: dict[str, Any], sequence: int) -> None: ...
 
@@ -311,6 +339,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             # to_native is inside the try so an UNFILLED stub (NotImplementedError) is a clean
             # terminal failure, not a 500 — the conformance proof reads it as non-conformance.
             native = overlay_requirements(stored["verb"], verb.to_native(stored["args"]))  # manifest pre-fill
+            # Resolve declared many2one args (e.g. country → country_id) to backend reference ids
+            # BEFORE the write — a relational field rejects raw text. An unresolvable/ambiguous value
+            # raises SystemError here, becoming an honest terminal failure (no silent write).
+            for nil_arg, native_field, model in verb.references:
+                if stored["args"].get(nil_arg) not in (None, ""):
+                    native[native_field] = _resolve_reference(client, model, stored["args"][nil_arg])
             # Write-path dispatch by the verb's DECLARED execution strategy (translate.py), not by
             # guessing from the name prefix — name inference only ever modelled CRUD. The record id
             # for update/delete is the verb's first required arg (e.g. lead_id, contact_id).

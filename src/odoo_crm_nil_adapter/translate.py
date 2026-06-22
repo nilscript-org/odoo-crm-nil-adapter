@@ -38,6 +38,11 @@ class WriteVerb:
     # NIL arg keys this verb can actually write/use. When declared, PROPOSE flags any provided arg
     # outside this set as `ignored` — so an unwritable field (e.g. country) is never silently accepted.
     supported_args: tuple[str, ...] = ()
+    # many2one (dropdown) args this verb resolves to a backend reference id before writing. Each entry
+    # is (nil_arg, native_field, model): the edge looks the human value up in `model` and writes the
+    # resolved id into `native_field` — never the raw string (a relational field rejects text). The
+    # supported_args list still gates acceptance; references only declares HOW the value is resolved.
+    references: tuple[tuple[str, str, str], ...] = ()
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
@@ -149,6 +154,16 @@ def _run_list_stages(client: SystemClient, _args: dict[str, Any]) -> dict[str, A
     return {"target": "crm.stage", "count": len(rows), "items": rows}
 
 
+def _run_list_countries(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    """Read the country dropdown (res.country) so a caller can see the values country_id accepts —
+    optionally filtered by a name/code fragment (`match`). This is the read surface behind the
+    reference resolver: the value the agent picks here is what update_contact's `country` resolves."""
+    match = str(args.get("match", "")).strip()
+    domain = ["|", ["name", "ilike", match], ["code", "ilike", match]] if match else []
+    rows = client.search("res.country", domain, fields=("id", "name", "code"), limit=300)
+    return {"target": "res.country", "count": len(rows), "items": rows}
+
+
 def _run_get_contact_by_phone(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     """Hot-path identity lookup: the WhatsApp entry point IS a phone number. Indexed exact match on
     `phone`, falling back to Odoo's normalized `phone_sanitized` (handles formatting differences) —
@@ -217,7 +232,11 @@ WRITE_VERBS: dict[str, WriteVerb] = {
             + (f" ← {a['email']}" if a.get("email") else ""),
         },
         entity_type="contact",
-        supported_args=("contact_id", "name", "phone", "email", "comment", "company"),
+        supported_args=("contact_id", "name", "phone", "email", "comment", "company", "country"),
+        # `country` is a dropdown (res.partner.country_id is many2one → res.country): accept the human
+        # name ("قطر"/"Qatar"/"QA"), resolve it to the country record id, write country_id. Writing the
+        # raw string would be rejected by the relational field — resolution is the whole point.
+        references=(("country", "country_id", "res.country"),),
     ),
     "crm.log_note": WriteVerb(
         verb="crm.log_note",
@@ -279,6 +298,7 @@ QUERY_VERBS: dict[str, QueryVerb] = {
     "crm.list_leads": QueryVerb(verb="crm.list_leads", run=_run_list_leads),
     "crm.list_contacts": QueryVerb(verb="crm.list_contacts", run=_run_list_contacts),
     "crm.list_stages": QueryVerb(verb="crm.list_stages", run=_run_list_stages),
+    "crm.list_countries": QueryVerb(verb="crm.list_countries", run=_run_list_countries),
     "crm.get_contact_by_phone": QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone),
 }
 

@@ -299,15 +299,70 @@ def test_field_diff_shows_after_equals_requested_on_a_clean_write() -> None:
     assert email["verified"] is True and email["after"] == "new@x.com"
 
 
+def test_update_contact_resolves_country_dropdown_to_reference_id() -> None:
+    # country_id is a many2one (dropdown → res.country). The adapter must resolve the human value to
+    # the backend record id; writing the raw text would be rejected by the relational field. This is
+    # the whole point — the agent says "Qatar", the adapter writes the id the field actually accepts.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 190, "name": "Qatar", "code": "QA"},
+                               {"id": 184, "name": "Saudi Arabia", "code": "SA"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Badr", phone="0509998888")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Badr", "country": "Qatar"})
+
+    assert sys.get("res.partner", "Badr")["country_id"] == 190           # resolved id, not the text
+    f = {x["field"]: x for x in committed["result"]["ssot"]["fields"]}
+    assert f["country_id"]["requested"] == 190 and f["country_id"]["after"] == 190
+    assert f["country_id"]["verified"] is True and committed["result"]["verified"] is True
+
+
+def test_update_contact_resolves_country_by_iso_code() -> None:
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 190, "name": "Qatar", "code": "QA"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Badr", phone="0507776666")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Badr", "country": "QA"})
+
+    assert committed["result"]["verified"] is True and sys.get("res.partner", "Badr")["country_id"] == 190
+
+
+def test_update_contact_terminal_fails_on_unresolvable_country() -> None:
+    # No silent write: a country that matches nothing fails terminally, never writes a bad value.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 190, "name": "Qatar", "code": "QA"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Badr", phone="0501112233")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Badr", "country": "Atlantis"})
+
+    assert committed["state"] == "failed_terminal"
+    assert "country_id" not in (sys.get("res.partner", "Badr") or {})   # nothing written
+
+
+def test_list_countries_reads_the_dropdown_values() -> None:
+    # The read surface behind the resolver — closes the "no way to see country values" gap.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 190, "name": "Qatar", "code": "QA"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    resp = client.post("/nil/v0.1/query", json=_env("crm.list_countries", {})).json()
+
+    assert resp["data"]["target"] == "res.country"
+    assert resp["data"]["items"][0]["name"] == "Qatar"
+
+
 def test_propose_flags_unsupported_args_as_ignored() -> None:
     # An arg the verb cannot write must be surfaced as ignored, never echoed as accepted.
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
 
     proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
-        {"contact_id": "10", "country": "السعودية", "email": "x@y.com"})).json()["body"]
+        {"contact_id": "10", "credit_limit": 5000, "country": "السعودية", "email": "x@y.com"})).json()["body"]
 
-    assert "country" in proposed.get("ignored", []), "an unwritable arg must be flagged, not silently dropped"
+    assert "credit_limit" in proposed.get("ignored", []), "an unwritable arg must be flagged, not silently dropped"
     assert "email" not in proposed.get("ignored", []), "a supported arg must not be flagged"
+    assert "country" not in proposed.get("ignored", []), "country is now a supported (resolved) arg, not ignored"
 
 
 def test_describe_exposes_skeleton() -> None:
