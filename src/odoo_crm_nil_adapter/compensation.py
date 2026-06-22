@@ -16,10 +16,17 @@ from __future__ import annotations
 
 from typing import Any
 
-# verb -> {"reversibility": "REVERSIBLE" | "COMPENSABLE", "verb": "<compensating verb>"}
+# verb -> reversibility + how to reverse it:
+#   "verb"     : compensating verb (create -> delete) — id taken from the committed result entity.
+#   "strategy" : "before_image" — the edge captures the pre-write values of the patched fields and
+#                synthesizes a `resource.update` restore (COMPENSABLE, best-effort on relations).
 COMPENSATIONS: dict[str, dict[str, Any]] = {
     "crm.create_lead": {"reversibility": "REVERSIBLE", "verb": "crm.delete_lead"},
+    # create_contact is op=upsert: this entry is the reversal for its CREATE sub-case (no dedup match)
+    # — delete the freshly created record. The MATCHED sub-case is reversed by a before-image restore
+    # the edge synthesizes inline (comp_override), so it never reaches this verb-mapped delete.
     "crm.create_contact": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
+    "crm.update_contact": {"reversibility": "COMPENSABLE", "strategy": "before_image"},
 }
 
 # compensating verb -> the arg that carries the real record id to act on.

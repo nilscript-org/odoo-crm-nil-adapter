@@ -62,6 +62,17 @@ def _resolve_id(client: SystemClient, target: str, value: str) -> str | None:
     return None
 
 
+def _before_image_reversal(
+    client: SystemClient, doctype: str, record_id: str, native: dict[str, Any]
+) -> dict[str, Any]:
+    """A COMPENSABLE reversal that restores ONLY the fields a write is about to patch — so ROLLBACK
+    never clobbers an unrelated concurrent edit. Synthesized as a generic `resource.update`."""
+    before = client.get(doctype, record_id) or {}
+    before_changed = {field: before.get(field) for field in native}
+    return {"resource": True, "rev_verb": "resource.update",
+            "rev_args": {"target": doctype, "id": record_id, "data": before_changed}}
+
+
 class EventEmitter(Protocol):
     def emit(self, event_envelope: dict[str, Any], sequence: int) -> None: ...
 
@@ -238,29 +249,62 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                          "proposal": proposal_id, "result": result}), state.next_sequence(env.get("workspace", "")))
             return _envelope("STATUS", env, status_body)
         verb = WRITE_VERBS[stored["verb"]]
+        comp_spec = COMPENSATIONS.get(stored["verb"], {})
+        comp_override: dict[str, Any] | None = None  # a before-image reversal the op handler synthesizes
         try:
             # to_native is inside the try so an UNFILLED stub (NotImplementedError) is a clean
             # terminal failure, not a 500 — the conformance proof reads it as non-conformance.
             native = overlay_requirements(stored["verb"], verb.to_native(stored["args"]))  # manifest pre-fill
-            # Write-path dispatch by the standard's verb lexicon: delete_* -> DELETE, update_* ->
-            # PATCH/UPDATE, everything else (create_/record_/send_/draft_/process_) -> CREATE. The
-            # record id for update/delete is the verb's first required arg (e.g. product_id).
-            action = stored["verb"].split(".")[-1]
-            if action.startswith("delete_"):
+            # Write-path dispatch by the verb's DECLARED execution strategy (translate.py), not by
+            # guessing from the name prefix — name inference only ever modelled CRUD. The record id
+            # for update/delete is the verb's first required arg (e.g. lead_id, contact_id).
+            if verb.op == "delete":
                 raw = str(stored["args"].get(verb.required[0], "")) if verb.required else ""
                 record_id = _resolve_id(client, verb.doctype, raw) or raw  # accept id or human identifier
                 client.delete(verb.doctype, record_id)
                 created = {"name": record_id}
-            elif action.startswith("update_"):
+            elif verb.op == "update":
                 raw = str(stored["args"].get(verb.required[0], "")) if verb.required else ""
                 record_id = _resolve_id(client, verb.doctype, raw) or raw
+                if comp_spec.get("strategy") == "before_image":
+                    comp_override = _before_image_reversal(client, verb.doctype, record_id, native)
                 created = client.update(verb.doctype, record_id, native)
-            else:
+            elif verb.op == "upsert":
+                # Probe the dedup keys (in order) for an existing record. A single hit ⇒ update it in
+                # place (COMPENSABLE before-image); no hit ⇒ create (REVERSIBLE by the verb's delete).
+                match_id: str | None = None
+                for field in verb.dedup_keys:
+                    value = native.get(field)
+                    if not value:
+                        continue
+                    hits = client.search(verb.doctype, [[field, "=", value]], limit=2)
+                    if len(hits) > 1:
+                        # Ambiguous: >1 record matches this key. Guessing one (or creating a third)
+                        # corrupts the identity graph — refuse instead. Terminal, no write performed.
+                        raise SystemError(f"upsert ambiguous: {len(hits)}+ records match {field}={value!r}")
+                    if len(hits) == 1:
+                        match_id = str(hits[0].get("id") or hits[0].get("name") or "")
+                        break
+                if match_id is None:
+                    created = client.create(verb.doctype, native)  # leaves comp_override None → verb-mapped delete
+                else:
+                    comp_override = _before_image_reversal(client, verb.doctype, match_id, native)
+                    created = client.update(verb.doctype, match_id, native)
+            elif verb.op == "method":
+                # Invoke an Odoo model method (not CRUD). The record id is the first required arg.
+                raw = str(stored["args"].get(verb.required[0], "")) if verb.required else ""
+                record_id = _resolve_id(client, verb.doctype, raw) or raw
+                if verb.method == "message_post":
+                    client.message_post(verb.doctype, record_id, str(native.get("body", "")))
+                else:  # call_method dispatch (convert / won / lost) lands with Phase 1
+                    raise NotImplementedError(f"op=method '{verb.method}' is not wired yet")
+                created = {"name": record_id}
+            else:  # op == "create"
                 created = client.create(verb.doctype, native)  # the real write
         except (SystemError, NotImplementedError) as exc:
             print(f"[shim] WRITE FAILED verb={stored['verb']} -> {exc}", flush=True)
             return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
-        reversibility = COMPENSATIONS.get(stored["verb"], {}).get("reversibility", "IRREVERSIBLE")
+        reversibility = "COMPENSABLE" if comp_override else comp_spec.get("reversibility", "IRREVERSIBLE")
         status_body = {"proposal": proposal_id, "state": "executed", "replayed": False}
         result = {
             "claim": "success",
@@ -272,7 +316,10 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         comp_block = {"reversibility": reversibility}  # every effect declares its reversibility honestly
         if reversibility != "IRREVERSIBLE":  # mint a reversal handle the owner/agent can ROLLBACK
             comp_token = uuid4().hex[:16]
-            state.compensations[comp_token] = {"verb": stored["verb"], "result": {"entity": result["entity"]}}
+            # before-image reversals carry the captured restore; verb-mapped ones (create->delete)
+            # carry the committed entity so compensate() can target the record.
+            state.compensations[comp_token] = comp_override or {
+                "verb": stored["verb"], "result": {"entity": result["entity"]}}
             comp_block["token"] = comp_token  # token present only when actually reversible
         status_body["compensation"] = comp_block
         result["compensation"] = comp_block

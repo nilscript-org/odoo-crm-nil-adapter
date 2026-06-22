@@ -24,10 +24,17 @@ class WriteVerb:
     verb: str
     tier: str
     doctype: str  # the Odoo model this verb writes (e.g. "crm.lead", "res.partner")
+    # Explicit execution strategy. The edge dispatches COMMIT on THIS, never on the verb name —
+    # name-prefix inference only ever modelled CRUD. `op` is the spine every verb plugs into.
+    op: str  # one of: "create" | "update" | "delete"  (later: "archive" | "upsert" | "method")
     required: tuple[str, ...]
     to_native: Callable[[dict[str, Any]], dict[str, Any]]
     preview: Callable[[dict[str, Any]], Bilingual]
     entity_type: str
+    # for op="upsert": native fields probed (in order) to find an existing record before writing —
+    # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
+    dedup_keys: tuple[str, ...] = ()
+    method: str | None = None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
@@ -85,6 +92,27 @@ def _to_native_create_contact(args: dict[str, Any]) -> dict[str, Any]:
     return doc
 
 
+# res.partner fields a curated contact update may touch. The whitelist IS this map — `to_native`
+# never blind-writes args, so a stray field (credit_limit, system flags) can't reach Odoo.
+_CONTACT_WRITABLE: tuple[tuple[str, str], ...] = (
+    ("name", "name"),
+    ("phone", "phone"),
+    ("email", "email"),
+    ("comment", "comment"),
+    ("company", "company_name"),
+)
+
+
+def _to_native_update_contact(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → a whitelisted `res.partner` patch. `contact_id` is the record id (used by the edge),
+    not a written field. Only declared contact fields pass; everything else is dropped."""
+    doc: dict[str, Any] = {}
+    for nil_key, odoo_key in _CONTACT_WRITABLE:
+        if args.get(nil_key) is not None:
+            doc[odoo_key] = args[nil_key]
+    return doc
+
+
 def _to_native_update_lead_stage(args: dict[str, Any]) -> dict[str, Any]:
     """NIL args → the `crm.lead` patch that moves it to another pipeline stage. `lead_id` is the
     record id (used by the edge), not a written field — only `stage_id` is patched."""
@@ -94,6 +122,12 @@ def _to_native_update_lead_stage(args: dict[str, Any]) -> dict[str, Any]:
 def _to_native_delete(_args: dict[str, Any]) -> dict[str, Any]:
     """delete_* verbs identify the record by their first required arg; nothing is written."""
     return {}
+
+
+def _to_native_log_note(args: dict[str, Any]) -> dict[str, Any]:
+    """log_note carries only the chatter `body`; `contact_id` is the record id (used by the edge).
+    `.get` (not `[]`) keeps to_native crash-free if a malformed COMMIT bypasses PROPOSE validation."""
+    return {"body": args.get("body", "")}
 
 
 # ── crm.* read-through verbs (fresh business truth, no side effects) ──────────────────────────
@@ -112,11 +146,25 @@ def _run_list_stages(client: SystemClient, _args: dict[str, Any]) -> dict[str, A
     return {"target": "crm.stage", "count": len(rows), "items": rows}
 
 
+def _run_get_contact_by_phone(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    """Hot-path identity lookup: the WhatsApp entry point IS a phone number. Indexed exact match on
+    `phone`, falling back to `mobile` — never a full-scan via list_contacts. An unmatched number is a
+    valid empty read (count 0), not an error."""
+    phone = str(args.get("phone", "")).strip()
+    if not phone:
+        return {"target": "res.partner", "count": 0, "items": []}
+    rows = client.search("res.partner", [["phone", "=", phone]], limit=10)
+    if not rows:
+        rows = client.search("res.partner", [["mobile", "=", phone]], limit=10)
+    return {"target": "res.partner", "count": len(rows), "items": rows}
+
+
 WRITE_VERBS: dict[str, WriteVerb] = {
     "crm.create_lead": WriteVerb(
         verb="crm.create_lead",
         tier="MEDIUM",
         doctype="crm.lead",
+        op="create",
         required=("name",),
         to_native=_to_native_create_lead,
         preview=lambda a: {
@@ -131,13 +179,44 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         verb="crm.create_contact",
         tier="MEDIUM",
         doctype="res.partner",
+        op="upsert",  # create-or-update: dedup on email/phone so retries don't fork the identity graph
         required=("name",),
         to_native=_to_native_create_contact,
         preview=lambda a: {
-            "en": f"Create contact “{a.get('name', '')}”"
+            "en": f"Create or update contact “{a.get('name', '')}”"
             + (f" <{a['email']}>" if a.get("email") else ""),
-            "ar": f"إنشاء جهة اتصال «{a.get('name', '')}»"
+            "ar": f"إنشاء أو تحديث جهة اتصال «{a.get('name', '')}»"
             + (f" <{a['email']}>" if a.get("email") else ""),
+        },
+        entity_type="contact",
+        dedup_keys=("email", "phone"),
+    ),
+    "crm.update_contact": WriteVerb(
+        verb="crm.update_contact",
+        tier="MEDIUM",
+        doctype="res.partner",
+        op="update",
+        required=("contact_id",),
+        to_native=_to_native_update_contact,
+        preview=lambda a: {
+            "en": f"Update contact {a.get('contact_id', '')}"
+            + (f" → {a['email']}" if a.get("email") else ""),
+            "ar": f"تحديث جهة الاتصال {a.get('contact_id', '')}"
+            + (f" ← {a['email']}" if a.get("email") else ""),
+        },
+        entity_type="contact",
+    ),
+    "crm.log_note": WriteVerb(
+        verb="crm.log_note",
+        tier="MEDIUM",
+        doctype="res.partner",
+        op="method",
+        method="message_post",
+        required=("contact_id", "body"),
+        to_native=_to_native_log_note,
+        preview=lambda a: {
+            "en": f"Log a note on contact {a.get('contact_id', '')}: “{a.get('body', '')}”",
+            "ar": f"تسجيل ملاحظة على جهة الاتصال {a.get('contact_id', '')}: «{a.get('body', '')}»",
         },
         entity_type="contact",
     ),
@@ -145,6 +224,7 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         verb="crm.update_lead_stage",
         tier="MEDIUM",
         doctype="crm.lead",
+        op="update",
         required=("lead_id", "stage_id"),
         to_native=_to_native_update_lead_stage,
         preview=lambda a: {
@@ -157,6 +237,7 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         verb="crm.delete_lead",
         tier="HIGH",
         doctype="crm.lead",
+        op="delete",
         required=("lead_id",),
         to_native=_to_native_delete,
         preview=lambda a: {
@@ -169,6 +250,7 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         verb="crm.delete_contact",
         tier="HIGH",
         doctype="res.partner",
+        op="delete",
         required=("contact_id",),
         to_native=_to_native_delete,
         preview=lambda a: {
@@ -184,6 +266,7 @@ QUERY_VERBS: dict[str, QueryVerb] = {
     "crm.list_leads": QueryVerb(verb="crm.list_leads", run=_run_list_leads),
     "crm.list_contacts": QueryVerb(verb="crm.list_contacts", run=_run_list_contacts),
     "crm.list_stages": QueryVerb(verb="crm.list_stages", run=_run_list_stages),
+    "crm.get_contact_by_phone": QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone),
 }
 
 
