@@ -35,6 +35,9 @@ class WriteVerb:
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
     dedup_keys: tuple[str, ...] = ()
     method: str | None = None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
+    # NIL arg keys this verb can actually write/use. When declared, PROPOSE flags any provided arg
+    # outside this set as `ignored` — so an unwritable field (e.g. country) is never silently accepted.
+    supported_args: tuple[str, ...] = ()
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
@@ -214,6 +217,7 @@ WRITE_VERBS: dict[str, WriteVerb] = {
             + (f" ← {a['email']}" if a.get("email") else ""),
         },
         entity_type="contact",
+        supported_args=("contact_id", "name", "phone", "email", "comment", "company"),
     ),
     "crm.log_note": WriteVerb(
         verb="crm.log_note",

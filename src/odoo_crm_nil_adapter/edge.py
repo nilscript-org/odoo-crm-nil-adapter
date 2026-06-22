@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import uuid4
@@ -60,6 +61,31 @@ def _resolve_id(client: SystemClient, target: str, value: str) -> str | None:
         if len(hits) == 1:
             return str(hits[0].get("id") or hits[0].get("name"))
     return None
+
+
+_HTML_TAG = re.compile(r"<[^>]+>")
+
+
+def _field_landed(actual: Any, intended: Any) -> bool:
+    """Did the SSOT actually take the intended value? Tolerates backend normalization (html wrapping,
+    formatting) but treats empty/false-where-a-value-was-intended as a hard miss — the exact signature
+    of a silently dropped write (e.g. country_id:false). Equality first, then a tag-stripped contains."""
+    if actual == intended:
+        return True
+    intended_s = str(intended).strip() if intended is not None else ""
+    if not intended_s:  # nothing meaningful was asked for
+        return True
+    actual_s = _HTML_TAG.sub("", str(actual if actual not in (None, False) else "")).strip()
+    return intended_s == actual_s or intended_s in actual_s
+
+
+def _verify_write(
+    client: SystemClient, doctype: str, record_id: str, native: dict[str, Any]
+) -> list[str]:
+    """Read the record back from the SSOT and return the written fields that did NOT land. An empty
+    list means every intended field is present — only THEN may the edge claim verified."""
+    after = client.get(doctype, record_id) or {}
+    return [field for field, value in native.items() if not _field_landed(after.get(field), value)]
 
 
 def _before_image_reversal(
@@ -182,20 +208,22 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                             f"backend target '{verb.doctype}' is not provisioned on this system")
         proposal_id = uuid4().hex[:16]
         state.proposals[proposal_id] = {"verb": verb_name, "args": args}  # NO write — dry-run only
-        return _envelope(
-            "PROPOSAL",
-            env,
-            {
-                "outcome": "proposal",
-                "id": proposal_id,
-                "verb": verb_name,
-                "tier": verb.tier,
-                "preview": verb.preview(args),
-                "resolved": args,
-                "modifiable": [],
-                "expires_at": _now(),
-            },
-        )
+        # Honesty at PROPOSE: if the verb declares the args it can write, surface anything outside
+        # that set as `ignored` — an unwritable field (e.g. country) is flagged, never silently kept.
+        ignored = [k for k in args if k not in verb.supported_args] if verb.supported_args else []
+        body: dict[str, Any] = {
+            "outcome": "proposal",
+            "id": proposal_id,
+            "verb": verb_name,
+            "tier": verb.tier,
+            "preview": verb.preview(args),
+            "resolved": args,
+            "modifiable": [],
+            "expires_at": _now(),
+        }
+        if ignored:
+            body["ignored"] = ignored
+        return _envelope("PROPOSAL", env, body)
 
     @app.post("/nil/v0.1/commit")
     def commit(env: dict[str, Any] = Body(...), authorization: str | None = Header(None)) -> dict[str, Any]:
@@ -238,9 +266,20 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             tok = uuid4().hex[:16]
             state.compensations[tok] = {"resource": True, "rev_verb": rev_verb, "rev_args": rev_args}
             comp_block["token"] = tok
-            result = {"claim": "success", "changed": True, "verified": True,
+            # EARN verified here too: create/update re-read and compare `data`; delete confirms absence.
+            if op == "delete":
+                unverified, verified = [], client.get(target, rid) is None
+            else:
+                unverified = _verify_write(client, target, rid, data)
+                verified = not unverified
+            ssot = {"system": SYSTEM, "read_after_write": True}
+            if unverified:
+                ssot["unverified_fields"] = unverified
+            result = {"claim": "success" if verified else "partial", "changed": True, "verified": verified,
                       "entity": {"type": stored["verb"], "id": rid, "url": f"/{target}/{rid}"},
-                      "ssot": {"system": SYSTEM, "read_after_write": True}, "compensation": comp_block}
+                      "ssot": ssot, "compensation": comp_block}
+            if unverified:
+                result["unverified_fields"] = unverified
             status_body = {"proposal": proposal_id, "state": "executed", "replayed": False,
                            "compensation": comp_block, "result": result}
             state.ledger[key] = status_body
@@ -306,13 +345,29 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
         reversibility = "COMPENSABLE" if comp_override else comp_spec.get("reversibility", "IRREVERSIBLE")
         status_body = {"proposal": proposal_id, "state": "executed", "replayed": False}
+        # EARN the verification — never assert it. Re-read the SSOT and confirm the written fields
+        # actually landed. A field that didn't persist (silent backend drop) ⇒ verified:false.
+        fields_written = native if verb.op in ("create", "update", "upsert") else {}
+        effect_id = str(created.get("id") or created.get("name") or "")
+        if verb.op == "delete":
+            unverified, verified, did_read = [], client.get(verb.doctype, effect_id) is None, True
+        elif fields_written and effect_id:
+            unverified = _verify_write(client, verb.doctype, effect_id, fields_written)
+            verified, did_read = (not unverified), True
+        else:  # method ops (e.g. log_note): executed via the call, no field-level read-back claimed
+            unverified, verified, did_read = [], True, False
+        ssot: dict[str, Any] = {"system": SYSTEM, "read_after_write": did_read}
+        if unverified:
+            ssot["unverified_fields"] = unverified
         result = {
-            "claim": "success",
-            "changed": True,
-            "verified": True,
+            "claim": "success" if verified else "partial",
+            "changed": bool(fields_written) or verb.op in ("delete", "method"),
+            "verified": verified,
             "entity": entity_ref(verb, created),
-            "ssot": {"system": SYSTEM, "read_after_write": True},
+            "ssot": ssot,
         }
+        if unverified:
+            result["unverified_fields"] = unverified
         comp_block = {"reversibility": reversibility}  # every effect declares its reversibility honestly
         if reversibility != "IRREVERSIBLE":  # mint a reversal handle the owner/agent can ROLLBACK
             comp_token = uuid4().hex[:16]

@@ -221,6 +221,64 @@ def test_create_contact_upsert_refuses_ambiguous_match() -> None:
     assert len(sys.docs["res.partner"]) == 2, "an ambiguous upsert must never create a third duplicate"
 
 
+class _DropsEmailBackend(FakeSystem):
+    """Mimics a backend that silently ignores a field on write (Odoo dropping an unresolved value)."""
+
+    def update(self, target, record_id, doc):
+        return super().update(target, record_id, {k: v for k, v in doc.items() if k != "email"})
+
+
+def test_verified_is_false_when_a_written_field_does_not_persist() -> None:
+    # The core of the thesis: the success envelope must be EARNED by a read-back, never asserted.
+    sys = _DropsEmailBackend()
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Sara", phone="0501112222")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Sara", "email": "new@x.com"})
+
+    result = committed["result"]
+    assert result["verified"] is False, "a field that did not land in the SSOT must NOT report verified"
+    assert "email" in result.get("unverified_fields", []), "the unverified field must be named"
+    assert result["claim"] == "partial", "an unverified write is partial success, not success"
+
+
+def test_verified_is_true_when_the_write_actually_persists() -> None:
+    # Guard against crying wolf: a write that genuinely lands must still verify true.
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Sara", phone="0501112222")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Sara", "email": "new@x.com"})
+
+    assert committed["result"]["verified"] is True
+    assert committed["result"].get("unverified_fields", []) == []
+
+
+def test_resource_update_is_also_honestly_verified() -> None:
+    # The generic resource.* path must earn verified too — not just the curated crm.* verbs.
+    sys = _DropsEmailBackend()
+    sys.create("res.partner", {"name": "Sara"})
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    pid = client.post("/nil/v0.1/propose", json=_env("resource.update",
+        {"target": "res.partner", "id": "Sara", "data": {"email": "new@x.com"}})).json()["body"]["id"]
+    committed = client.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {"proposal": pid, "idempotency_key": pid}}).json()["body"]
+
+    assert committed["result"]["verified"] is False, "resource.* must not assert verified either"
+    assert "email" in committed["result"].get("unverified_fields", [])
+
+
+def test_propose_flags_unsupported_args_as_ignored() -> None:
+    # An arg the verb cannot write must be surfaced as ignored, never echoed as accepted.
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
+        {"contact_id": "10", "country": "السعودية", "email": "x@y.com"})).json()["body"]
+
+    assert "country" in proposed.get("ignored", []), "an unwritable arg must be flagged, not silently dropped"
+    assert "email" not in proposed.get("ignored", []), "a supported arg must not be flagged"
+
+
 def test_describe_exposes_skeleton() -> None:
     """MANDATORY: /nil/v0.1/describe exposes a valid skeleton — nil version, a verb catalog, and
     per native target {exists, fields}. This is the universal connect handshake the kernel uses."""
