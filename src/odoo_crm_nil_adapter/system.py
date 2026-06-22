@@ -23,7 +23,18 @@ class SystemClient(Protocol):
 
     def list(self, target: str, filters: dict[str, Any] | None = None) -> list[dict[str, Any]]: ...
 
+    def search(  # indexed lookup by a native domain (phone/email match, dedup probe, tag listing)
+        self,
+        target: str,
+        domain: list[list[Any]],
+        *,
+        fields: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]: ...
+
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]: ...
+
+    def message_post(self, target: str, record_id: str, body: str) -> None: ...  # append a chatter note
 
     def delete(self, target: str, record_id: str) -> None: ...
 
@@ -113,12 +124,32 @@ class RealSystemClient:
         rows = self._kw(target, "search_read", [domain], {"limit": 50})
         return [dict(r) for r in rows]
 
+    def search(
+        self,
+        target: str,
+        domain: list[list[Any]],
+        *,
+        fields: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        kw: dict[str, Any] = {"limit": limit}
+        if fields:
+            kw["fields"] = list(fields)
+        rows = self._kw(target, "search_read", [domain], kw)
+        return [dict(r) for r in rows]
+
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         rid = _as_int(record_id)
         if rid is None:
             raise SystemError(f"odoo update needs a numeric record id, got {record_id!r}")
         self._kw(target, "write", [[rid], self._clean(doc)])
         return self.get(target, str(rid)) or {"id": rid}
+
+    def message_post(self, target: str, record_id: str, body: str) -> None:
+        rid = _as_int(record_id)
+        if rid is None:
+            raise SystemError(f"odoo message_post needs a numeric record id, got {record_id!r}")
+        self._kw(target, "message_post", [[rid]], {"body": body})
 
     def delete(self, target: str, record_id: str) -> None:
         rid = _as_int(record_id)
@@ -157,6 +188,7 @@ class FakeSystem:
 
     def __init__(self) -> None:
         self.docs: dict[str, list[dict[str, Any]]] = {}
+        self.messages: dict[tuple[str, str], list[str]] = {}  # (target, record_id) -> chatter notes
         self._counter = 0
 
     def create(self, target: str, doc: dict[str, Any]) -> dict[str, Any]:
@@ -172,6 +204,23 @@ class FakeSystem:
             rows = [r for r in rows if str(value).lower() in str(r.get(field, "")).lower()]
         return rows
 
+    def search(
+        self,
+        target: str,
+        domain: list[list[Any]],
+        *,
+        fields: tuple[str, ...] | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        # Interpret the same AND-of-triples domain RealSystemClient forwards to Odoo search_read.
+        rows = list(self.docs.get(target, []))
+        for field, op, value in domain or []:
+            if op == "ilike":
+                rows = [r for r in rows if str(value).lower() in str(r.get(field, "")).lower()]
+            else:  # "=" exact: type-true first (matches Odoo on int/bool ids), str fallback for sugar
+                rows = [r for r in rows if r.get(field) == value or str(r.get(field, "")) == str(value)]
+        return rows[:limit]
+
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         for record in self.docs.get(target, []):
             if record.get("name") == record_id:
@@ -180,6 +229,9 @@ class FakeSystem:
         record = {**doc, "name": record_id, "target": target}  # upsert keeps the proof deterministic
         self.docs.setdefault(target, []).append(record)
         return record
+
+    def message_post(self, target: str, record_id: str, body: str) -> None:
+        self.messages.setdefault((target, record_id), []).append(body)
 
     def delete(self, target: str, record_id: str) -> None:
         self.docs[target] = [r for r in self.docs.get(target, []) if r.get("name") != record_id]

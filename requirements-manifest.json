@@ -17,8 +17,25 @@
     },
     "crm.create_contact": {
       "doctype": "res.partner",
+      "op": "upsert",
       "tier": "MEDIUM",
-      "reversibility": "REVERSIBLE",
+      "reversibility": "CONDITIONAL",
+      "dedup_keys": ["email", "phone"],
+      "hidden_requirements": []
+    },
+    "crm.update_contact": {
+      "doctype": "res.partner",
+      "op": "update",
+      "tier": "MEDIUM",
+      "reversibility": "COMPENSABLE",
+      "hidden_requirements": []
+    },
+    "crm.log_note": {
+      "doctype": "res.partner",
+      "op": "method",
+      "method": "message_post",
+      "tier": "MEDIUM",
+      "reversibility": "IRREVERSIBLE",
       "hidden_requirements": []
     },
     "crm.update_lead_stage": {
