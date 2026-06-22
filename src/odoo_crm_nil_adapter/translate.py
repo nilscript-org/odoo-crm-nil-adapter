@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from odoo_crm_nil_adapter.system import SystemClient
+from odoo_crm_nil_adapter.system import SystemClient, SystemError
 
 Bilingual = dict[str, str]
 
@@ -148,15 +148,24 @@ def _run_list_stages(client: SystemClient, _args: dict[str, Any]) -> dict[str, A
 
 def _run_get_contact_by_phone(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     """Hot-path identity lookup: the WhatsApp entry point IS a phone number. Indexed exact match on
-    `phone`, falling back to `mobile` — never a full-scan via list_contacts. An unmatched number is a
-    valid empty read (count 0), not an error."""
+    `phone`, falling back to Odoo's normalized `phone_sanitized` (handles formatting differences) —
+    never a full-scan via list_contacts. An unmatched number is a valid empty read, not an error."""
     phone = str(args.get("phone", "")).strip()
     if not phone:
         return {"target": "res.partner", "count": 0, "items": []}
-    rows = client.search("res.partner", [["phone", "=", phone]], limit=10)
-    if not rows:
-        rows = client.search("res.partner", [["mobile", "=", phone]], limit=10)
+    rows = _safe_search(client, [["phone", "=", phone]])
+    if not rows:  # the stored value may be formatted differently than the inbound number
+        rows = _safe_search(client, [["phone_sanitized", "=", phone]])
     return {"target": "res.partner", "count": len(rows), "items": rows}
+
+
+def _safe_search(client: SystemClient, domain: list[list[Any]]) -> list[dict[str, Any]]:
+    """A read-side search that degrades to empty if the backend rejects the domain (e.g. a field the
+    model lacks) — a lookup must never turn a missing match into a 500."""
+    try:
+        return client.search("res.partner", domain, limit=10)
+    except SystemError:
+        return []
 
 
 WRITE_VERBS: dict[str, WriteVerb] = {

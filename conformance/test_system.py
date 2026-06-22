@@ -7,7 +7,29 @@ the domain shape FakeSystem interprets here is the exact `search_read` domain Re
 
 from __future__ import annotations
 
-from odoo_crm_nil_adapter.system import FakeSystem
+from odoo_crm_nil_adapter.system import FakeSystem, SystemError
+from odoo_crm_nil_adapter.translate import _run_get_contact_by_phone
+
+
+class _PickyFake(FakeSystem):
+    """Mimics live Odoo: a search on a field the model doesn't have raises (here, anything but phone)."""
+
+    def search(self, target, domain, *, fields=None, limit=50):
+        for field, _op, _value in domain:
+            if field != "phone":
+                raise SystemError(f"Invalid field {field!r} on model {target}")
+        return super().search(target, domain, fields=fields, limit=limit)
+
+
+def test_get_contact_by_phone_survives_unknown_fallback_field() -> None:
+    # A number that doesn't exact-match `phone` triggers the secondary lookup. On real Odoo that
+    # field must exist; if a backend rejects it, the READ degrades to empty — never a 500.
+    sys = _PickyFake()
+    sys.create("res.partner", {"name": "Sara", "phone": "0501112222"})
+
+    out = _run_get_contact_by_phone(sys, {"phone": "0000000000"})
+
+    assert out["count"] == 0
 
 
 def test_search_exact_match_returns_only_that_record() -> None:
