@@ -299,6 +299,39 @@ def test_field_diff_shows_after_equals_requested_on_a_clean_write() -> None:
     assert email["verified"] is True and email["after"] == "new@x.com"
 
 
+def test_choice_gate_refuses_unresolvable_country_with_candidates() -> None:
+    # The Choice Gate: a constrained value that doesn't resolve is REFUSED at PROPOSE with the live
+    # candidate list — so the agent picks the real member (e.g. "قطر", whose Arabic name doesn't match
+    # Odoo's English res.country, gets the list and chooses Qatar) instead of a silent/wrong write.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 186, "name": "Qatar", "code": "QA"},
+                               {"id": 184, "name": "Saudi Arabia", "code": "SA"}]
+    sys.schemas["res.partner"] = [{"name": "country_id", "type": "many2one", "relation": "res.country"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
+        {"contact_id": "37", "country": "قطر"})).json()["body"]
+
+    assert proposed["outcome"] == "refusal"          # not silently accepted
+    assert proposed["field"] == "country_id"
+    assert proposed.get("candidates"), "the refusal must carry the live options to choose from"
+    names = {c.get("name") for c in proposed["candidates"]}
+    assert "Qatar" in names                          # the agent now sees the real member to pick
+
+
+def test_choice_gate_passes_a_resolvable_value() -> None:
+    # A value that DOES resolve sails through the gate — proposal, not refusal.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 186, "name": "Qatar", "code": "QA"}]
+    sys.schemas["res.partner"] = [{"name": "country_id", "type": "many2one", "relation": "res.country"}]
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("crm.update_contact",
+        {"contact_id": "37", "country": "Qatar"})).json()["body"]
+
+    assert proposed["outcome"] == "proposal"         # "Qatar" resolves → no gate refusal
+
+
 def test_update_contact_resolves_country_dropdown_to_reference_id() -> None:
     # country_id is a many2one (dropdown → res.country). The adapter must resolve the human value to
     # the backend record id; writing the raw text would be rejected by the relational field. This is
@@ -398,21 +431,20 @@ def test_resource_update_resolves_multi_value_tags() -> None:
     assert committed["result"]["verified"] is True
 
 
-def test_resource_update_refuses_unknown_selection_value() -> None:
-    # Fail-closed for bucket B: a value outside the field's allowed set is a terminal failure, never
-    # a silently-wrong write.
+def test_resource_update_refuses_unknown_selection_value_at_propose() -> None:
+    # Fail-closed for bucket B, now enforced earlier by the Choice Gate: a value outside the field's
+    # allowed set is REFUSED at PROPOSE with the allowed options as candidates — never reaches a write.
     sys = FakeSystem()
     sys.schemas["thing"] = [{"name": "state", "type": "selection",
                              "options": [{"value": "available", "label": "Available"}]}]
     sys.create("thing", {"name": "x"})
     client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
 
-    pid = client.post("/nil/v0.1/propose", json=_env("resource.update",
-        {"target": "thing", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]["id"]
-    committed = client.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w",
-        "body": {"proposal": pid, "idempotency_key": pid}}).json()["body"]
+    proposed = client.post("/nil/v0.1/propose", json=_env("resource.update",
+        {"target": "thing", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]
 
-    assert committed["state"] == "failed_terminal"
+    assert proposed["outcome"] == "refusal" and proposed["field"] == "state"
+    assert {c["value"] for c in proposed["candidates"]} == {"available"}  # the allowed set, to pick from
     assert "state" not in (sys.get("thing", "x") or {})  # nothing written
 
 
