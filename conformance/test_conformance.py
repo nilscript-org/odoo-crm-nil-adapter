@@ -268,6 +268,37 @@ def test_resource_update_is_also_honestly_verified() -> None:
     assert "email" in committed["result"].get("unverified_fields", [])
 
 
+def test_executed_event_carries_per_field_before_after_diff() -> None:
+    # The control-plane field table needs more than a named drop: for each written field it shows
+    # what it WAS, what was ASKED, and what actually LANDED. A dropped field must read after≠requested
+    # so the silent drop is visible field-by-field, not just listed in unverified_fields.
+    sys = _DropsEmailBackend()
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Sara", phone="0501112222")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Sara", "email": "new@x.com"})
+
+    fields = committed["result"]["ssot"].get("fields", [])
+    by = {f["field"]: f for f in fields}
+    assert "email" in by, "every written field must appear in the per-field diff"
+    email = by["email"]
+    assert email["requested"] == "new@x.com"
+    assert email["verified"] is False                 # it did not persist
+    assert email["after"] != "new@x.com"              # the SSOT shows the real (dropped) value, not the ask
+    assert "before" in email                          # the prior value is captured for before→after
+
+
+def test_field_diff_shows_after_equals_requested_on_a_clean_write() -> None:
+    # Guard against crying wolf: a field that genuinely lands must read verified with after==requested.
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    _seed_contact(client, name="Sara", phone="0501112222")
+
+    committed = _commit_args(client, "crm.update_contact", {"contact_id": "Sara", "email": "new@x.com"})
+
+    email = {f["field"]: f for f in committed["result"]["ssot"]["fields"]}["email"]
+    assert email["verified"] is True and email["after"] == "new@x.com"
+
+
 def test_propose_flags_unsupported_args_as_ignored() -> None:
     # An arg the verb cannot write must be surfaced as ignored, never echoed as accepted.
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)

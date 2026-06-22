@@ -79,24 +79,37 @@ def _field_landed(actual: Any, intended: Any) -> bool:
     return intended_s == actual_s or intended_s in actual_s
 
 
-def _verify_write(
-    client: SystemClient, doctype: str, record_id: str, native: dict[str, Any]
-) -> list[str]:
-    """Read the record back from the SSOT and return the written fields that did NOT land. An empty
-    list means every intended field is present — only THEN may the edge claim verified."""
+def _verify_and_diff(
+    client: SystemClient, doctype: str, record_id: str,
+    before: dict[str, Any], native: dict[str, Any],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """One SSOT read-back → (unverified_fields, per-field before→after diff). The diff carries, for
+    every written field, what it WAS, what was ASKED, and what actually LANDED — so the control plane
+    can show a silent drop (country_id: السعودية → false) field-by-field, not just name it in a list.
+    `unverified` (a field that did not land) still drives the verified/partial verdict, unchanged."""
     after = client.get(doctype, record_id) or {}
-    return [field for field, value in native.items() if not _field_landed(after.get(field), value)]
+    unverified: list[str] = []
+    diff: list[dict[str, Any]] = []
+    for field, intended in native.items():
+        landed = _field_landed(after.get(field), intended)
+        if not landed:
+            unverified.append(field)
+        diff.append({"field": field, "before": before.get(field), "requested": intended,
+                     "after": after.get(field), "verified": landed})
+    return unverified, diff
 
 
 def _before_image_reversal(
     client: SystemClient, doctype: str, record_id: str, native: dict[str, Any]
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """A COMPENSABLE reversal that restores ONLY the fields a write is about to patch — so ROLLBACK
-    never clobbers an unrelated concurrent edit. Synthesized as a generic `resource.update`."""
+    never clobbers an unrelated concurrent edit. Returns (reversal, before_image): the before-image
+    is reused as the diff's 'before' column, so the patch is read from the SSOT exactly once."""
     before = client.get(doctype, record_id) or {}
     before_changed = {field: before.get(field) for field in native}
-    return {"resource": True, "rev_verb": "resource.update",
-            "rev_args": {"target": doctype, "id": record_id, "data": before_changed}}
+    reversal = {"resource": True, "rev_verb": "resource.update",
+                "rev_args": {"target": doctype, "id": record_id, "data": before_changed}}
+    return reversal, before
 
 
 class EventEmitter(Protocol):
@@ -267,14 +280,17 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             state.compensations[tok] = {"resource": True, "rev_verb": rev_verb, "rev_args": rev_args}
             comp_block["token"] = tok
             # EARN verified here too: create/update re-read and compare `data`; delete confirms absence.
+            field_diff: list[dict[str, Any]] = []
             if op == "delete":
                 unverified, verified = [], client.get(target, rid) is None
             else:
-                unverified = _verify_write(client, target, rid, data)
+                unverified, field_diff = _verify_and_diff(client, target, rid, before, data)
                 verified = not unverified
             ssot = {"system": SYSTEM, "read_after_write": True}
             if unverified:
                 ssot["unverified_fields"] = unverified
+            if field_diff:
+                ssot["fields"] = field_diff
             result = {"claim": "success" if verified else "partial", "changed": True, "verified": verified,
                       "entity": {"type": stored["verb"], "id": rid, "url": f"/{target}/{rid}"},
                       "ssot": ssot, "compensation": comp_block}
@@ -290,6 +306,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         verb = WRITE_VERBS[stored["verb"]]
         comp_spec = COMPENSATIONS.get(stored["verb"], {})
         comp_override: dict[str, Any] | None = None  # a before-image reversal the op handler synthesizes
+        before_image: dict[str, Any] = {}  # pre-write SSOT snapshot → the diff's 'before' column
         try:
             # to_native is inside the try so an UNFILLED stub (NotImplementedError) is a clean
             # terminal failure, not a 500 — the conformance proof reads it as non-conformance.
@@ -306,7 +323,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 raw = str(stored["args"].get(verb.required[0], "")) if verb.required else ""
                 record_id = _resolve_id(client, verb.doctype, raw) or raw
                 if comp_spec.get("strategy") == "before_image":
-                    comp_override = _before_image_reversal(client, verb.doctype, record_id, native)
+                    comp_override, before_image = _before_image_reversal(client, verb.doctype, record_id, native)
                 created = client.update(verb.doctype, record_id, native)
             elif verb.op == "upsert":
                 # Probe the dedup keys (in order) for an existing record. A single hit ⇒ update it in
@@ -327,7 +344,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 if match_id is None:
                     created = client.create(verb.doctype, native)  # leaves comp_override None → verb-mapped delete
                 else:
-                    comp_override = _before_image_reversal(client, verb.doctype, match_id, native)
+                    comp_override, before_image = _before_image_reversal(client, verb.doctype, match_id, native)
                     created = client.update(verb.doctype, match_id, native)
             elif verb.op == "method":
                 # Invoke an Odoo model method (not CRUD). The record id is the first required arg.
@@ -349,16 +366,19 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # actually landed. A field that didn't persist (silent backend drop) ⇒ verified:false.
         fields_written = native if verb.op in ("create", "update", "upsert") else {}
         effect_id = str(created.get("id") or created.get("name") or "")
+        field_diff: list[dict[str, Any]] = []
         if verb.op == "delete":
             unverified, verified, did_read = [], client.get(verb.doctype, effect_id) is None, True
         elif fields_written and effect_id:
-            unverified = _verify_write(client, verb.doctype, effect_id, fields_written)
+            unverified, field_diff = _verify_and_diff(client, verb.doctype, effect_id, before_image, fields_written)
             verified, did_read = (not unverified), True
         else:  # method ops (e.g. log_note): executed via the call, no field-level read-back claimed
             unverified, verified, did_read = [], True, False
         ssot: dict[str, Any] = {"system": SYSTEM, "read_after_write": did_read}
         if unverified:
             ssot["unverified_fields"] = unverified
+        if field_diff:
+            ssot["fields"] = field_diff
         result = {
             "claim": "success" if verified else "partial",
             "changed": bool(fields_written) or verb.op in ("delete", "method"),
