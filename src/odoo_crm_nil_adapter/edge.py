@@ -140,6 +140,48 @@ def _resolve_reference(client: SystemClient, model: str, value: Any) -> int:
     return int(rid)
 
 
+def _resolve_option(options: list[dict[str, Any]], value: Any) -> Any:
+    """Resolve a human term to a selection field's stored key (bucket B): "متاح"/"Available" →
+    "available". Matches the stored key directly, else the label (case-insensitive) or the key text.
+    Zero matches => UNRESOLVED, many => AMBIGUOUS — never write a value outside the allowed set."""
+    v = str(value).strip()
+    if not v:
+        raise SystemError("empty selection value")
+    keys = [o.get("value") for o in options]
+    if value in keys or v in [str(k) for k in keys]:  # already the stored key
+        return value
+    hits = [
+        o.get("value") for o in options
+        if str(o.get("label", "")).strip().lower() == v.lower()
+        or str(o.get("value", "")).strip().lower() == v.lower()
+    ]
+    if not hits:
+        raise SystemError(f"UNRESOLVED_OPTION: {value!r} not in allowed values {[str(k) for k in keys]}")
+    if len({str(h) for h in hits}) > 1:
+        raise SystemError(f"AMBIGUOUS_OPTION: {value!r} matches multiple options")
+    return hits[0]
+
+
+def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) -> dict[str, Any]:
+    """Schema-driven resolution of every written field to the value the backend actually accepts —
+    a selection value → its stored key (B), a many2one value → the referenced record id (C). Driven
+    by field_meta from schema(); a plain scalar with no constraint passes through, and an
+    already-resolved id/key resolves to itself (idempotent). A backend that exposes no schema simply
+    leaves values untouched (declared `references` still cover the critical ones). Raises on an
+    unresolvable/ambiguous value → honest terminal failure, never a silently wrong write."""
+    meta_by_field = {f.get("name"): f for f in (client.schema(doctype) or [])}
+    resolved = dict(native)
+    for field, value in native.items():
+        if value in (None, ""):
+            continue
+        meta = meta_by_field.get(field) or {}
+        if meta.get("relation"):
+            resolved[field] = _resolve_reference(client, meta["relation"], value)
+        elif meta.get("options"):
+            resolved[field] = _resolve_option(meta["options"], value)
+    return resolved
+
+
 class EventEmitter(Protocol):
     def emit(self, event_envelope: dict[str, Any], sequence: int) -> None: ...
 
@@ -284,6 +326,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             data = stored["args"].get("data") or {}
             before: dict[str, Any] = {}
             try:
+                data = _resolve_writes(client, target, data)  # B/C resolution before any write
                 if op == "create":
                     created = client.create(target, data)
                     rid = str(created.get("id") or created.get("name") or "")
@@ -345,6 +388,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             for nil_arg, native_field, model in verb.references:
                 if stored["args"].get(nil_arg) not in (None, ""):
                     native[native_field] = _resolve_reference(client, model, stored["args"][nil_arg])
+            # Then resolve EVERY written field against the live schema — selection → key (B),
+            # any undeclared many2one → referenced id (C). Declared references above are idempotent here.
+            native = _resolve_writes(client, verb.doctype, native)
             # Write-path dispatch by the verb's DECLARED execution strategy (translate.py), not by
             # guessing from the name prefix — name inference only ever modelled CRUD. The record id
             # for update/delete is the verb's first required arg (e.g. lead_id, contact_id).

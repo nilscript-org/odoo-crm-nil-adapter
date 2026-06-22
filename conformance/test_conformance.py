@@ -353,6 +353,49 @@ def test_list_countries_reads_the_dropdown_values() -> None:
     assert resp["data"]["items"][0]["name"] == "Qatar"
 
 
+def test_resource_update_resolves_selection_and_reference_from_schema() -> None:
+    # P2 — schema-driven resolution: a selection value resolves to its stored key (bucket B, the
+    # "متاح" case), a many2one value to the referenced id (bucket C) — automatically, no per-field
+    # declaration. Driven purely by the field metadata schema() exposes.
+    sys = FakeSystem()
+    sys.docs["res.country"] = [{"id": 190, "name": "Qatar", "code": "QA"}]
+    sys.schemas["res.partner"] = [
+        {"name": "state", "type": "selection",
+         "options": [{"value": "available", "label": "Available"}, {"value": "sold", "label": "Sold"}]},
+        {"name": "country_id", "type": "many2one", "relation": "res.country"},
+    ]
+    sys.create("res.partner", {"name": "Badr"})
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    pid = client.post("/nil/v0.1/propose", json=_env("resource.update", {"target": "res.partner",
+        "id": "Badr", "data": {"state": "Available", "country_id": "Qatar"}})).json()["body"]["id"]
+    committed = client.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {"proposal": pid, "idempotency_key": pid}}).json()["body"]
+
+    rec = sys.get("res.partner", "Badr")
+    assert rec["state"] == "available"      # selection label → stored key (B)
+    assert rec["country_id"] == 190         # many2one value → referenced id (C), undeclared
+    assert committed["result"]["verified"] is True
+
+
+def test_resource_update_refuses_unknown_selection_value() -> None:
+    # Fail-closed for bucket B: a value outside the field's allowed set is a terminal failure, never
+    # a silently-wrong write.
+    sys = FakeSystem()
+    sys.schemas["thing"] = [{"name": "state", "type": "selection",
+                             "options": [{"value": "available", "label": "Available"}]}]
+    sys.create("thing", {"name": "x"})
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    pid = client.post("/nil/v0.1/propose", json=_env("resource.update",
+        {"target": "thing", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]["id"]
+    committed = client.post("/nil/v0.1/commit", json={"nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {"proposal": pid, "idempotency_key": pid}}).json()["body"]
+
+    assert committed["state"] == "failed_terminal"
+    assert "state" not in (sys.get("thing", "x") or {})  # nothing written
+
+
 def test_schema_extracts_selection_options_relation_and_readonly() -> None:
     # P1 — the resolver needs to know HOW to write each field. schema() must surface a selection's
     # option list (enum), a many2one's relation (comodel), and the readonly flag — from fields_get.
