@@ -1,7 +1,12 @@
 # odoo-crm-nil-adapter
 
-A **conformant NIL translation shim for [Odoo CRM](https://www.odoo.com/app/crm)** — it speaks the
-six NIL endpoints (+ `/nil/v0.1/describe`) at the edge and translates each verb into native Odoo
+**A NIL governed-action adapter for Odoo CRM.** It speaks the NIL contract (propose -> approve ->
+commit, skeleton-bounded, earned reversibility): an agent proposes intent, the deterministic kernel
+is the only thing that commits, and a verb or target Odoo never declared is unexpressible, not
+filtered.
+
+It is a **conformant NIL translation shim for [Odoo CRM](https://www.odoo.com/app/crm)** — it speaks
+the six NIL endpoints (+ `/nil/v0.1/describe`) at the edge and translates each verb into native Odoo
 records over the [XML-RPC External API](https://www.odoo.com/documentation/master/developer/reference/external_api.html).
 A NIL `target` is simply an Odoo model name (`crm.lead`, `res.partner`, `crm.stage`).
 
