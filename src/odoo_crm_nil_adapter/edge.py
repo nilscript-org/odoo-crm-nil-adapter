@@ -22,7 +22,13 @@ from odoo_crm_nil_adapter.compensation import COMPENSATIONS, compensate
 from odoo_crm_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
 from odoo_crm_nil_adapter.state import ShimState
 from odoo_crm_nil_adapter.system import SystemClient, SystemError
-from odoo_crm_nil_adapter.translate import QUERY_VERBS, WRITE_VERBS, entity_ref
+from odoo_crm_nil_adapter.translate import (
+    DECLARED_TARGETS,
+    QUERY_VERBS,
+    RESOURCE_VERBS,
+    WRITE_VERBS,
+    entity_ref,
+)
 
 NIL = "0.1"
 SYSTEM = "odoo_crm"
@@ -334,6 +340,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             target = args.get("target")
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
+            # Skeleton bound (advertised ≡ committable): resource.* may only touch a DECLARED target.
+            # A provisioned-but-undeclared model (account.payment, hr.employee, …) is unexpressible —
+            # refused here, never committed. This is what makes Guarantee 2 hold literally.
+            if target not in DECLARED_TARGETS:
+                return _refusal(env, "UNKNOWN_VERB",
+                                f"target '{target}' is not in this adapter's declared skeleton")
             if op in ("update", "delete") and not args.get("id"):
                 return _refusal(env, "INVALID_ARGS", "missing required arg: id", field="id")
             if op in ("create", "update") and not isinstance(args.get("data"), dict):
@@ -584,8 +596,10 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         if body.get("verb") == "resource.read":
             qargs = body.get("args", {}) or {}
             target = qargs.get("target")
-            if not target or not client.exists(target):
-                raise HTTPException(status_code=404, detail=f"unknown or unprovisioned target: {target}")
+            # Reads obey the same skeleton bound — resource.read must not pull salaries/payments
+            # from an undeclared model. advertised ≡ committable applies to QUERY as well as COMMIT.
+            if not target or target not in DECLARED_TARGETS or not client.exists(target):
+                raise HTTPException(status_code=404, detail=f"unknown or undeclared target: {target}")
             rows = client.list(target, qargs.get("match") or None)
             return {"data": {"target": target, "count": len(rows), "items": rows}}
         verb = QUERY_VERBS.get(body.get("verb"))
@@ -662,15 +676,17 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
     def describe() -> dict[str, Any]:
         """Discovery handshake (no auth): verbs + live readiness/shape of each native target.
         Lets the kernel/any client connect uniformly — reachable, conformant, provisioned."""
-        names = sorted({v.doctype for v in WRITE_VERBS.values()})
+        # Advertise EXACTLY the committable skeleton: the resource.* family + the curated verbs, and
+        # the DECLARED_TARGETS resource.* is bounded to. advertised ≡ committable — describe() is the
+        # single source of truth for what this adapter will actually commit.
         targets: dict[str, Any] = {}
-        for t in names:
+        for t in sorted(DECLARED_TARGETS):
             s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
             targets[t] = {"exists": s is not None, "fields": s or []}
         return {
             "nil": NIL,
             "system": SYSTEM,
-            "verbs": sorted(WRITE_VERBS) + sorted(QUERY_VERBS),
+            "verbs": list(RESOURCE_VERBS) + sorted(WRITE_VERBS) + sorted(QUERY_VERBS),
             "targets": targets,
         }
 

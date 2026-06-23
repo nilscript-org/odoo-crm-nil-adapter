@@ -19,6 +19,26 @@ from odoo_crm_nil_adapter.system import SystemClient, SystemError
 Bilingual = dict[str, str]
 
 
+# The committable target set for the generic `resource.*` CRUD family — the adapter's DECLARED
+# skeleton for direct CRUD. `describe()` advertises exactly this set, and the edge refuses
+# `resource.*` against any target outside it (default-deny). So advertised ≡ committable: a CRM
+# adapter wired to a full Odoo cannot be steered into accounting/HR/payroll (account.payment,
+# hr.employee, …). Scoped to the CRM domain the curated verbs + reference resolvers legitimately
+# use; widen DELIBERATELY (and re-advertise) only when a real flow needs another model.
+DECLARED_TARGETS: frozenset[str] = frozenset({
+    "crm.lead",             # opportunities / leads
+    "res.partner",          # contacts / customers
+    "crm.stage",            # pipeline stages
+    "crm.tag",              # opportunity tags
+    "res.partner.category", # contact tags
+    "crm.team",             # sales teams (assignment)
+    "res.country",          # country reference (country_id resolution)
+    "res.country.state",    # state / region reference
+})
+
+RESOURCE_VERBS: tuple[str, ...] = ("resource.create", "resource.read", "resource.update", "resource.delete")
+
+
 @dataclass(frozen=True)
 class WriteVerb:
     verb: str

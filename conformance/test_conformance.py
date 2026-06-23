@@ -458,19 +458,19 @@ def test_resource_update_resolves_multi_value_tags() -> None:
 def test_resource_update_refuses_unknown_selection_value_at_propose() -> None:
     # Fail-closed for bucket B, now enforced earlier by the Choice Gate: a value outside the field's
     # allowed set is REFUSED at PROPOSE with the allowed options as candidates — never reaches a write.
-    sys = FakeSystem()
-    sys.schemas["thing"] = [{"name": "state", "type": "selection",
-                             "options": [{"value": "available", "label": "Available"}]}]
-    sys.create("thing", {"name": "x"})
+    sys = FakeSystem()  # use a DECLARED target — undeclared ones are now refused before the choice gate
+    sys.schemas["crm.lead"] = [{"name": "state", "type": "selection",
+                                "options": [{"value": "available", "label": "Available"}]}]
+    sys.create("crm.lead", {"name": "x"})
     client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
 
     proposed = client.post("/nil/v0.1/propose", json=_env("resource.update",
-        {"target": "thing", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]
+        {"target": "crm.lead", "id": "x", "data": {"state": "NoSuchStatus"}})).json()["body"]
 
     assert proposed["outcome"] == "refusal" and proposed["field"] == "state"
     assert {c["id"] for c in proposed["candidates"]} == {"available"}  # the allowed set, to pick from
     _assert_valid_proposal_body(proposed)
-    assert "state" not in (sys.get("thing", "x") or {})  # nothing written
+    assert "state" not in (sys.get("crm.lead", "x") or {})  # nothing written
 
 
 def test_schema_extracts_selection_options_relation_and_readonly() -> None:
@@ -524,6 +524,52 @@ def test_propose_flags_unsupported_args_as_ignored() -> None:
     assert "credit_limit" in proposed.get("ignored", []), "an unwritable arg must be flagged, not silently dropped"
     assert "email" not in proposed.get("ignored", []), "a supported arg must not be flagged"
     assert "country" not in proposed.get("ignored", []), "country is now a supported (resolved) arg, not ignored"
+
+
+def test_resource_create_on_undeclared_target_is_refused_with_zero_effect() -> None:
+    # The REAL attack surface: resource.* against a provisioned-but-UNDECLARED model. A CRM adapter
+    # wired to a full Odoo must NOT let an agent reach accounting/HR — advertised ≡ committable.
+    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
+    assert "account.payment" not in DECLARED_TARGETS  # sanity: it is genuinely undeclared
+    sys = FakeSystem()  # FakeSystem.exists() is True for ANY target — i.e. "fully provisioned"
+    client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("resource.create",
+        {"target": "account.payment", "data": {"amount": 999999}})).json()["body"]
+
+    assert proposed["outcome"] == "refusal", f"undeclared target must be refused at PROPOSE, got {proposed}"
+    assert proposed["code"] == "UNKNOWN_VERB", f"out-of-skeleton target → UNKNOWN_VERB, got {proposed}"
+    assert sys.docs.get("account.payment") is None, "EL must be 0: no record on an undeclared target"
+
+
+def test_resource_create_on_declared_target_still_works() -> None:
+    # Guard against over-clamping: a legitimately declared target must remain committable.
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    proposed = client.post("/nil/v0.1/propose", json=_env("resource.create",
+        {"target": "res.partner", "data": {"name": "Legit"}})).json()["body"]
+
+    assert proposed["outcome"] == "proposal", f"a declared target must still be proposable, got {proposed}"
+
+
+def test_resource_read_on_undeclared_target_is_refused() -> None:
+    # Reads leak too: a CRM adapter must not let resource.read pull salaries/payments.
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    res = client.post("/nil/v0.1/query", json=_env("resource.read", {"target": "hr.employee"}))
+
+    assert res.status_code == 404, "resource.read on an undeclared target must be refused, not served"
+
+
+def test_describe_advertises_committable_set_equals_declared() -> None:
+    # advertised ≡ committable: describe targets are EXACTLY DECLARED_TARGETS, and resource.* is listed.
+    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+    d = client.get("/nil/v0.1/describe").json()
+
+    assert set(d["targets"]) == set(DECLARED_TARGETS), "describe must advertise exactly the committable set"
+    assert "resource.create" in d["verbs"], "the resource.* family is committable, so it must be advertised"
 
 
 def test_describe_exposes_skeleton() -> None:
