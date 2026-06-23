@@ -94,14 +94,28 @@ def _verify_and_diff(
     can show a silent drop (country_id: السعودية → false) field-by-field, not just name it in a list.
     `unverified` (a field that did not land) still drives the verified/partial verdict, unchanged."""
     after = client.get(doctype, record_id) or {}
+    meta_by_field = {f.get("name"): f for f in (client.schema(doctype) or [])}
     unverified: list[str] = []
     diff: list[dict[str, Any]] = []
     for field, intended in native.items():
         landed = _field_landed(after.get(field), intended)
         if not landed:
             unverified.append(field)
-        diff.append({"field": field, "before": before.get(field), "requested": intended,
-                     "after": after.get(field), "verified": landed})
+        row: dict[str, Any] = {"field": field, "before": before.get(field), "requested": intended,
+                               "after": after.get(field), "verified": landed}
+        # Fault B (reference legibility): re-resolve the value that actually LANDED to its human
+        # label, so the Observation reads "country_id → Türkiye (224)" — grounded in the SSOT, with
+        # nothing left for the agent to fabricate. before_label gives the reversible prior meaning.
+        meta = meta_by_field.get(field) or {}
+        if meta.get("relation") or meta.get("options"):
+            relation = meta.get("relation")
+            for col in ("before", "after"):
+                raw = (before if col == "before" else after).get(field)
+                label = (_label_for(client, relation, raw) if relation
+                         else _option_label(meta["options"], raw)) if raw not in (None, "", False) else None
+                if label is not None:
+                    row[f"{col}_label"] = label
+        diff.append(row)
     return unverified, diff
 
 
@@ -192,6 +206,53 @@ def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) 
                                if isinstance(value, (list, tuple))
                                else _resolve_option(meta["options"], value))
     return resolved
+
+
+def _option_label(options: list[dict[str, Any]], value: Any) -> str | None:
+    """Best-effort label for a selection value (its stored key OR its label) — None if not an option."""
+    v = str(value).strip().lower()
+    for opt in options:
+        if str(opt.get("value")).lower() == v or str(opt.get("label", "")).strip().lower() == v:
+            return opt.get("label")
+    return None
+
+
+def _label_for(client: SystemClient, model: str, value: Any) -> str | None:
+    """Best-effort human label for a stored relational value (an id OR a name) — the inverse of
+    _resolve_reference, for the legible echo (docs/reference-legibility.md). Never raises and never
+    guesses: returns None unless the value labels to exactly one record. The Choice Gate, not this,
+    owns ambiguity refusal — legibility only makes an already-decided value readable."""
+    v = str(value).strip()
+    if not v:
+        return None
+    try:
+        if v.isdigit():
+            rows = client.search(model, [["id", "=", int(v)]], fields=("id", "name", "code"), limit=1)
+        else:
+            rows = client.search(model, [["name", "ilike", v]], fields=("id", "name", "code"), limit=8)
+            rows = [r for r in rows if str(r.get("name", "")).strip().lower() == v.lower()] or rows
+    except SystemError:
+        return None
+    return _label(rows[0]) if len(rows) == 1 else None
+
+
+def _legible(client: SystemClient, doctype: str, fields: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """{field: {value, label}} for every constrained (relation/selection) field written in `fields` —
+    the symmetric reference-legibility echo (docs/reference-legibility.md). Used on PROPOSE (Fault A:
+    an opaque foreign key never crosses approval illegibly) and on read-back (Fault B: the receipt is
+    built from a live re-resolution of the landed value, not from agent narration). Schema-driven;
+    plain scalars, multi-values, and unlabelable values are omitted."""
+    meta_by_field = {f.get("name"): f for f in (client.schema(doctype) or [])}
+    echo: dict[str, dict[str, Any]] = {}
+    for field, value in fields.items():
+        if value in (None, "") or isinstance(value, (list, tuple)):
+            continue
+        meta = meta_by_field.get(field) or {}
+        label = (_label_for(client, meta["relation"], value) if meta.get("relation")
+                 else _option_label(meta["options"], value) if meta.get("options") else None)
+        if label is not None:
+            echo[field] = {"value": value, "label": label}
+    return echo
 
 
 class EventEmitter(Protocol):
@@ -360,10 +421,19 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             pid = uuid4().hex[:16]
             state.proposals[pid] = {"verb": verb_name, "args": args, "resource": True}
             en, ar = _resource_phrase(op, target, args)
+            # Fault A (reference legibility): echo each relational/selection field by resolved name,
+            # so a bare foreign key (e.g. country_id: 224) is approved as "country_id → Türkiye",
+            # never as a magic number the agent can mislabel.
+            refs = _legible(client, target, args.get("data") or {})
+            if refs:
+                tail = " · ".join(f"{f} → {x['label']}" for f, x in refs.items())
+                en, ar = f"{en} · {tail}", f"{ar} · {tail}"
             return _envelope("PROPOSAL", env, {
                 "outcome": "proposal", "id": pid, "verb": verb_name,
                 "tier": {"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}[op],
-                "preview": {"en": en, "ar": ar}, "resolved": args, "modifiable": [], "expires_at": _now()})
+                "preview": {"en": en, "ar": ar},
+                "resolved": {**args, "references": refs} if refs else args,
+                "modifiable": [], "expires_at": _now()})
 
         verb = WRITE_VERBS.get(verb_name)
         if verb is None:
@@ -390,13 +460,20 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # Honesty at PROPOSE: if the verb declares the args it can write, surface anything outside
         # that set as `ignored` — an unwritable field (e.g. country) is flagged, never silently kept.
         ignored = [k for k in args if k not in verb.supported_args] if verb.supported_args else []
+        # Fault A (reference legibility): echo the constrained native fields by resolved name, so the
+        # preview reads "… · country_id → Qatar (QA)" and `resolved.references` carries the meaning.
+        refs = _legible(client, verb.doctype, gate_native)
+        preview = verb.preview(args)
+        if refs:
+            tail = " · ".join(f"{f} → {x['label']}" for f, x in refs.items())
+            preview = {loc: f"{txt} · {tail}" for loc, txt in preview.items()}
         body: dict[str, Any] = {
             "outcome": "proposal",
             "id": proposal_id,
             "verb": verb_name,
             "tier": verb.tier,
-            "preview": verb.preview(args),
-            "resolved": args,
+            "preview": preview,
+            "resolved": {**args, "references": refs} if refs else args,
             "modifiable": [],
             "expires_at": _now(),
         }
