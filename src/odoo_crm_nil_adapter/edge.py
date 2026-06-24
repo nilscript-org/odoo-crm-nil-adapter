@@ -119,6 +119,16 @@ def _verify_and_diff(
     return unverified, diff
 
 
+def _hash_snap(snapshot: dict[str, Any]) -> str:
+    """Canonical hash of an SSOT field snapshot — the state-witness bound at PROPOSE and rechecked at
+    COMMIT. Empty snapshot → '' (no precondition, e.g. a create). Sibling of reference-legibility: the
+    kernel refuses to commit against a world that drifted since the human approved the preview (TOCTOU)."""
+    if not snapshot:
+        return ""
+    blob = json.dumps(snapshot, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def _before_image_reversal(
     client: SystemClient, doctype: str, record_id: str, native: dict[str, Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -420,6 +430,13 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     return gate
             pid = uuid4().hex[:16]
             state.proposals[pid] = {"verb": verb_name, "args": args, "resource": True}
+            # State-witness (TOCTOU): bind the proposal to the SSOT values it previewed, so a COMMIT
+            # after a delayed approval against a changed world fails closed instead of writing stale.
+            if op == "update":
+                rid0 = _resolve_id(client, target, str(args.get("id", "")))
+                if rid0 is not None:
+                    rec0 = client.get(target, rid0) or {}
+                    state.proposals[pid]["witness"] = _hash_snap({f: rec0.get(f) for f in (args.get("data") or {})})
             en, ar = _resource_phrase(op, target, args)
             # Fault A (reference legibility): echo each relational/selection field by resolved name,
             # so a bare foreign key (e.g. country_id: 224) is approved as "country_id → Türkiye",
@@ -510,6 +527,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                         return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
                     rid = resolved
                     before = client.get(target, rid) or {}
+                    # State-witness recheck: if the SSOT drifted since PROPOSE, fail closed (no write).
+                    if op == "update" and stored.get("witness"):
+                        if stored["witness"] != _hash_snap({f: before.get(f) for f in data}):
+                            return _refusal(env, "PRECONDITION_FAILED",
+                                            "state changed since this proposal was previewed; "
+                                            "re-propose to get a fresh preview and re-approve")
                     if op == "update":
                         client.update(target, rid, data)
                         rev_verb, rev_args, rev = "resource.update", {"target": target, "id": rid, "data": before}, "COMPENSABLE"
