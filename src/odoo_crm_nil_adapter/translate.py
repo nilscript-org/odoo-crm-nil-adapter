@@ -431,6 +431,8 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         outcome = _resolver(client).resolve(intent)
     except SystemError as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "UPSTREAM_ERROR", "message": str(exc)}
+    except Exception as exc:  # noqa: BLE001 — any resolution fault is a structured refusal, never a 500
+        return {"outcome": "refused", "code": "INTENT_ERROR", "message": str(exc)}
     if outcome.kind == "refusal":
         return {"outcome": "refused", "code": outcome.code, "message": outcome.fix}
     return {"outcome": "result", "value": outcome.value}

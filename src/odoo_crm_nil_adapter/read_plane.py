@@ -103,7 +103,12 @@ class OdooReadBackend:
         rows = self._client.search(target, _to_domain(predicates), fields=(group_by, "id"), limit=100_000)
         buckets: dict[Any, int] = {}
         for r in rows:
-            buckets[r.get(group_by)] = buckets.get(r.get(group_by), 0) + 1
+            key = r.get(group_by)
+            if isinstance(key, (list, tuple)):  # Odoo many2one comes back as [id, label] → group by label
+                key = key[1] if len(key) == 2 else (key[0] if key else None)
+            elif key is False:  # Odoo's empty value
+                key = None
+            buckets[key] = buckets.get(key, 0) + 1
         return [{"key": k, "count": v} for k, v in buckets.items()]
 
 
