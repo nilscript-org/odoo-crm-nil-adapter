@@ -330,8 +330,12 @@ QUERY_VERBS: dict[str, QueryVerb] = {
 from datetime import UTC, datetime  # noqa: E402
 
 from nilscript.dataplane import (  # noqa: E402
+    Binding,
     BulkApprovalRequired,
     CapabilityUnsupported,
+    IdentityResolver,
+    Intent,
+    IntentResolver,
     InvalidFilter,
     ResultTooLarge,
 )
@@ -403,7 +407,37 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         return _refusal(exc)
 
 
+_RESOLVERS: dict[int, Any] = {}
+
+
+def _resolver(client: SystemClient) -> Any:
+    r = _RESOLVERS.get(id(client))
+    if r is None:
+        r = IntentResolver(_plane(client), IdentityResolver())
+        _RESOLVERS[id(client)] = r
+    return r
+
+
+def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    """The single intent payload: build an Intent and resolve it deterministically over the ReadPlane.
+    The caller selects no verb and builds no filter — the system owns the mechanics."""
+    where = tuple(
+        Binding(attr=b.get("attr"), rel=b.get("rel"), value=b.get("value"))
+        for b in (args.get("where") or [])
+    )
+    intent = Intent(about=args.get("about", ""), where=where, seek=args.get("seek", "all"),
+                    limit=int(args.get("limit") or 50), cursor=args.get("cursor"))
+    try:
+        outcome = _resolver(client).resolve(intent)
+    except SystemError as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
+        return {"outcome": "refused", "code": "UPSTREAM_ERROR", "message": str(exc)}
+    if outcome.kind == "refusal":
+        return {"outcome": "refused", "code": outcome.code, "message": outcome.fix}
+    return {"outcome": "result", "value": outcome.value}
+
+
 QUERY_VERBS.update({
+    "nil.intent": QueryVerb(verb="nil.intent", run=_run_nil_intent),
     "nil.search": QueryVerb(verb="nil.search", run=_run_nil_search),
     "nil.count": QueryVerb(verb="nil.count", run=_run_nil_count),
     "nil.get": QueryVerb(verb="nil.get", run=_run_nil_get),

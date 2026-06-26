@@ -27,7 +27,9 @@ from odoo_crm_nil_adapter.system import SystemClient
 # Curated lean projections per CRM target — what an agent actually needs, never the whole record.
 # (id is always retained by projection.) Widen deliberately as real flows need more fields.
 _TARGET_FIELDS: dict[str, tuple[str, ...]] = {
-    "res.partner": ("id", "name", "phone", "email", "company_name", "country_id"),
+    # Lean set guaranteed to exist on every res.partner (company_name/country_id are not universally
+    # present — a projection must never name a field the model lacks, or search_read 500s).
+    "res.partner": ("id", "name", "phone", "email"),
     "crm.lead": ("id", "name", "contact_name", "email_from", "phone", "stage_id", "expected_revenue"),
     "crm.stage": ("id", "name", "sequence"),
     "crm.team": ("id", "name"),
