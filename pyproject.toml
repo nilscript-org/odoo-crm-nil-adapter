@@ -7,7 +7,10 @@ name = "odoo-crm-nil-adapter"
 version = "0.1.0"
 description = "A NIL translation shim for odoo_crm, scaffolded by nilscript."
 requires-python = ">=3.12"
-dependencies = ["fastapi", "pydantic>=2.0"]
+# `nilscript` provides the shared read data plane (nilscript.dataplane.ReadPlane): projection,
+# byte-cap-refuse, capability fallback, read authz, export handles. Built from the kernel checkout in
+# deploy (kernel + adapters build from their mains); installed editable for local dev.
+dependencies = ["fastapi", "pydantic>=2.0", "nilscript"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]

@@ -323,6 +323,95 @@ QUERY_VERBS: dict[str, QueryVerb] = {
 }
 
 
+# ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
+# These delegate to the shared `ReadPlane` (projection + byte-cap-refuse + capability fallback + read
+# authz + export/bulk gating). The edge dispatches them through QUERY_VERBS like any read verb; engine
+# refusals come back as structured `{outcome: refused, code, message}` answers, never 500s.
+from datetime import UTC, datetime  # noqa: E402
+
+from nilscript.dataplane import (  # noqa: E402
+    BulkApprovalRequired,
+    CapabilityUnsupported,
+    InvalidFilter,
+    ResultTooLarge,
+)
+
+from odoo_crm_nil_adapter.read_plane import build_read_plane  # noqa: E402
+
+_READ_REFUSALS = (ResultTooLarge, InvalidFilter, CapabilityUnsupported, BulkApprovalRequired)
+_PLANES: dict[int, Any] = {}
+
+
+def _plane(client: SystemClient) -> Any:
+    plane = _PLANES.get(id(client))
+    if plane is None:
+        plane = build_read_plane(client)
+        _PLANES[id(client)] = plane
+    return plane
+
+
+def _refusal(exc: Exception) -> dict[str, Any]:
+    return {"outcome": "refused", "code": getattr(exc, "code", "ERROR"),
+            "message": getattr(exc, "message", str(exc))}
+
+
+def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _plane(client).search(
+            args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
+            limit=int(args.get("limit") or 50), cursor=args.get("cursor"),
+        )
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
+
+
+def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _plane(client).count(args["target"], filter=args.get("filter") or [])
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
+
+
+def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"))
+        return rec if rec is not None else {"found": False, "id": args.get("id")}
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
+
+
+def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _plane(client).aggregate(
+            args["target"], filter=args.get("filter") or [],
+            group_by=args["group_by"], metrics=tuple(args.get("metrics") or ("count",)),
+        )
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
+
+
+def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        handle = _plane(client).export(
+            args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
+            tenant=str(args.get("tenant") or "default"), now=datetime.now(UTC),
+            approved=bool(args.get("approved")),
+        )
+        return {"handle": handle.handle, "format": handle.format, "rows": handle.rows,
+                "bytes": handle.bytes, "schema": handle.schema, "expires_at": handle.expires_at.isoformat()}
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
+
+
+QUERY_VERBS.update({
+    "nil.search": QueryVerb(verb="nil.search", run=_run_nil_search),
+    "nil.count": QueryVerb(verb="nil.count", run=_run_nil_count),
+    "nil.get": QueryVerb(verb="nil.get", run=_run_nil_get),
+    "nil.aggregate": QueryVerb(verb="nil.aggregate", run=_run_nil_aggregate),
+    "nil.export": QueryVerb(verb="nil.export", run=_run_nil_export),
+})
+
+
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:
     # The SSOT entity id MUST be the backend's real record key, so a compensating delete (ROLLBACK)
     # targets the record itself — never a human attribute that can collide or change.

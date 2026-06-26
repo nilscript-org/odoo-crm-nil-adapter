@@ -40,9 +40,35 @@ class SystemClient(Protocol):
 
     def exists(self, target: str) -> bool: ...  # is this native target provisioned? (PROPOSE preflight)
 
+    def count(self, target: str, domain: list[list[Any]]) -> int: ...  # O(1)-shaped 'how many'
+
     def schema(self, target: str) -> list[dict[str, Any]] | None: ...  # target shape (skeleton), or None
 
     def get(self, target: str, record_id: str) -> dict[str, Any] | None: ...  # one record (before-image)
+
+
+def _triple(row: dict[str, Any], triple: list[Any]) -> bool:
+    """Evaluate one Odoo domain triple [field, op, value] against an in-memory row (FakeSystem). Mirrors
+    the op set the ReadPlane forwards, so the fake honours the same filters Odoo would server-side."""
+    field, op, value = triple
+    v = row.get(field)
+    if op in ("=", "=="):
+        return v == value or str(v if v is not None else "") == str(value)
+    if op == "!=":
+        return v != value
+    if op in ("ilike", "like"):
+        return str(value).lower() in str(v if v is not None else "").lower()
+    if op == ">":
+        return v is not None and v > value
+    if op == ">=":
+        return v is not None and v >= value
+    if op == "<":
+        return v is not None and v < value
+    if op == "<=":
+        return v is not None and v <= value
+    if op == "in":
+        return v in (value or [])
+    return False
 
 
 def _as_int(value: Any) -> int | None:
@@ -156,12 +182,19 @@ class RealSystemClient:
         *,
         fields: tuple[str, ...] | None = None,
         limit: int = 50,
+        order: str | None = None,
     ) -> list[dict[str, Any]]:
         kw: dict[str, Any] = {"limit": limit}
         if fields:
             kw["fields"] = list(fields)
+        if order:
+            kw["order"] = order
         rows = self._kw(target, "search_read", [domain], kw)
         return [dict(r) for r in rows]
+
+    def count(self, target: str, domain: list[list[Any]]) -> int:
+        """O(1)-shaped 'how many' via Odoo `search_count` — never a full list to count."""
+        return int(self._kw(target, "search_count", [domain]))
 
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         rid = _as_int(record_id)
@@ -234,15 +267,17 @@ class FakeSystem:
         *,
         fields: tuple[str, ...] | None = None,
         limit: int = 50,
+        order: str | None = None,
     ) -> list[dict[str, Any]]:
         # Interpret the same AND-of-triples domain RealSystemClient forwards to Odoo search_read.
-        rows = list(self.docs.get(target, []))
-        for field, op, value in domain or []:
-            if op == "ilike":
-                rows = [r for r in rows if str(value).lower() in str(r.get(field, "")).lower()]
-            else:  # "=" exact: type-true first (matches Odoo on int/bool ids), str fallback for sugar
-                rows = [r for r in rows if r.get(field) == value or str(r.get(field, "")) == str(value)]
+        rows = [r for r in self.docs.get(target, []) if all(_triple(r, t) for t in (domain or []))]
+        if order:
+            key = order.split()[0]
+            rows = sorted(rows, key=lambda r: (r.get(key) is None, r.get(key)), reverse="desc" in order)
         return rows[:limit]
+
+    def count(self, target: str, domain: list[list[Any]]) -> int:
+        return sum(1 for r in self.docs.get(target, []) if all(_triple(r, t) for t in (domain or [])))
 
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         for record in self.docs.get(target, []):
