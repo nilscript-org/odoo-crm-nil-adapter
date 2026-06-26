@@ -403,6 +403,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         body = env.get("body", {})
         verb_name = body.get("verb")
         args = body.get("args", {}) or {}
+        tenant = env.get("workspace") or None  # the per-tenant grant scope (SaaS); None = shipped skeleton
         # Generic op=method (universal workflow actions): call a governed model method on a record —
         # action_post, button_validate, action_confirm, … — with NO per-action verb. Gated by the
         # method allow-list (default-deny), so an unlisted/financial method is unexpressible.
@@ -414,7 +415,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 return _refusal(env, "INVALID_ARGS", "missing required arg: method", field="method")
             if not rid:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: id", field="id")
-            tier = governance.method_tier(target, method)
+            tier = governance.method_tier(target, method, tenant=tenant)
             if tier is None:
                 return _refusal(env, "UNKNOWN_VERB",
                                 f"method '{method}' on '{target}' is not granted by this adapter's governance policy")
@@ -422,7 +423,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 return _refusal(env, "UPSTREAM_UNAVAILABLE",
                                 f"backend target '{target}' is not provisioned on this system")
             pid = uuid4().hex[:16]
-            state.proposals[pid] = {"verb": verb_name, "args": args, "resource_method": True}
+            state.proposals[pid] = {"verb": verb_name, "args": args, "resource_method": True, "tier": tier}
             return _envelope("PROPOSAL", env, {
                 "outcome": "proposal", "id": pid, "verb": verb_name, "tier": tier,
                 "preview": {"en": f"Call {method} on {target}/{rid}",
@@ -440,7 +441,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             # read surface. A provisioned-but-ungranted model (account.payment, hr.employee, …) reads
             # via nil.* but is unexpressible for writes — refused here, never committed. Lifting the
             # read ceiling (dynamic discovery) does NOT lift the write ceiling. Guarantee 2 holds.
-            tier = governance.write_tier(target, op)
+            tier = governance.write_tier(target, op, tenant=tenant)
             if tier is None:
                 return _refusal(env, "UNKNOWN_VERB",
                                 f"target '{target}' is not writable under this adapter's governance policy")
@@ -482,6 +483,11 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         verb = WRITE_VERBS.get(verb_name)
         if verb is None:
             return _refusal(env, "UNKNOWN_VERB", f"verb not supported by this backend: {verb_name}")
+        # A curated (semantic) verb is a deliberate grant — but it still obeys the operator's module
+        # scope: a verb on an out-of-scope module is unexpressible, same as the generic path.
+        if not governance.module_enabled(verb.doctype):
+            return _refusal(env, "UNKNOWN_VERB",
+                            f"verb '{verb_name}' targets module-scoped-out model '{verb.doctype}'")
         missing = verb.missing(args)
         if missing:
             return _refusal(env, "INVALID_ARGS", f"missing required arg: {missing[0]}", field=missing[0])
@@ -547,10 +553,18 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             except (SystemError, NotImplementedError) as exc:
                 print(f"[shim] METHOD FAILED {target}.{method} -> {exc}", flush=True)
                 return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
-            # A generic workflow method is IRREVERSIBLE by default — no compensating method is
-            # synthesized (post≠un-post). The result declares the effect honestly: changed, executed via
-            # the call, with no field-level read-back claimed (did_read=False).
-            comp_block = {"reversibility": "IRREVERSIBLE"}
+            # Reversibility is declared per (model, method) in governance: a method with a registered
+            # inverse (action_post→button_draft, action_confirm→action_cancel) is COMPENSABLE — we mint a
+            # token that calls the inverse on ROLLBACK; one with no inverse stays honestly IRREVERSIBLE.
+            tenant = env.get("workspace") or None
+            reverse = governance.method_reverse(target, method, tenant=tenant)
+            if reverse:
+                tok = uuid4().hex[:16]
+                state.compensations[tok] = {"resource_method": True, "target": target, "id": rid,
+                                            "method": reverse, "tier": stored.get("tier", "HIGH")}
+                comp_block = {"reversibility": "COMPENSABLE", "token": tok}
+            else:
+                comp_block = {"reversibility": "IRREVERSIBLE"}
             result = {"claim": "success", "changed": True, "verified": False,
                       "entity": {"type": stored["verb"], "id": rid, "url": f"/{target}/{rid}"},
                       "ssot": {"system": SYSTEM, "read_after_write": False, "method": method},
@@ -681,8 +695,8 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 record_id = _resolve_id(client, verb.doctype, raw) or raw
                 if verb.method == "message_post":
                     client.message_post(verb.doctype, record_id, str(native.get("body", "")))
-                else:  # call_method dispatch (convert / won / lost) lands with Phase 1
-                    raise NotImplementedError(f"op=method '{verb.method}' is not wired yet")
+                else:  # any granted workflow method (action_post / button_validate / action_confirm / …)
+                    client.call_method(verb.doctype, record_id, verb.method or "", {})
                 created = {"name": record_id}
             else:  # op == "create"
                 created = client.create(verb.doctype, native)  # the real write
@@ -787,6 +801,19 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         committed = state.compensations.get(token)
         if committed is None:
             return _refusal(env, "COMPENSATION_EXPIRED", f"unknown or expired compensation token: {token}")
+        if committed.get("resource_method"):  # workflow-method reversal — preview the inverse method call
+            target, rid, method = committed["target"], committed["id"], committed["method"]
+            pid = uuid4().hex[:16]
+            state.proposals[pid] = {"verb": "resource.method", "resource_method": True,
+                                    "tier": committed.get("tier", "HIGH"),
+                                    "args": {"target": target, "id": rid, "method": method}}
+            return _envelope("PROPOSAL", env, {
+                "outcome": "proposal", "id": pid, "verb": "resource.method",
+                "tier": committed.get("tier", "HIGH"),
+                "preview": {"en": f"Reverse: call {method} on {target}/{rid}",
+                            "ar": f"عكس: استدعاء {method} على {target}/{rid}"},
+                "resolved": {"target": target, "id": rid, "method": method},
+                "modifiable": [], "expires_at": _now()})
         if committed.get("resource"):  # generic-CRUD reversal — preview the synthesized compensating verb
             rev_verb, rev_args = committed["rev_verb"], committed["rev_args"]
             rop = rev_verb.split(".", 1)[1]
@@ -835,7 +862,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # writes — describe() is the single source of truth for what this adapter will actually commit.
         # (Reads are universal via nil.* and not enumerated here — discovery is per-model, on demand.)
         targets: dict[str, Any] = {}
-        for t in sorted(governance.WRITABLE_TARGETS):
+        for t in governance.writable_targets():
             s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
             targets[t] = {"exists": s is not None, "fields": s or []}
         return {

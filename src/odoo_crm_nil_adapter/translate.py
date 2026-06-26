@@ -161,6 +161,34 @@ def _to_native_log_note(args: dict[str, Any]) -> dict[str, Any]:
     return {"body": args.get("body", "")}
 
 
+# ── semantic verbs (Phase 6): curated sugar over the generic plane for the highest-value flows.
+# Capability comes from the universal plane (resource.* CRUD + resource.method); these add clean args,
+# bilingual approval previews, and a precise per-verb tier. Representative set across module groups —
+# the long tail stays on the generic plane (the "don't hand-write a thousand verbs" discipline).
+def _to_native_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo customer invoice (`account.move`, move_type=out_invoice). Lines are the Odoo
+    one2many write form [(0, 0, {…})]; the hidden move_type is supplied so the agent never sees it."""
+    doc: dict[str, Any] = {"move_type": "out_invoice"}
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("invoice_date"):
+        doc["invoice_date"] = args["invoice_date"]
+    lines = args.get("lines") or []
+    if lines:
+        doc["invoice_line_ids"] = [
+            (0, 0, {"name": ln.get("name", ""), "quantity": _maybe_float(ln.get("quantity", 1)),
+                    "price_unit": _maybe_float(ln.get("price_unit", 0))})
+            for ln in lines if isinstance(ln, dict)
+        ]
+    return doc
+
+
+def _to_native_method_only(_args: dict[str, Any]) -> dict[str, Any]:
+    """A workflow-method verb (validate / confirm) writes no fields — the record id is the first
+    required arg, consumed by the edge; the method itself drives the state transition in Odoo."""
+    return {}
+
+
 # ── crm.* read-through verbs (fresh business truth, no side effects) ──────────────────────────
 def _run_list_leads(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     rows = client.list("crm.lead", args.get("match") or None)
@@ -314,6 +342,51 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         },
         entity_type="contact",
     ),
+    # ── semantic verbs across module groups (Phase 6) ─────────────────────────────────────────────
+    "account.create_invoice": WriteVerb(
+        verb="account.create_invoice",
+        tier="HIGH",  # a financial document — owner-reviewed, never MEDIUM-auto like a CRM note
+        doctype="account.move",
+        op="create",
+        required=("partner_id",),
+        to_native=_to_native_create_invoice,
+        preview=lambda a: {
+            "en": f"Create a customer invoice for partner {a.get('partner_id', '')}"
+            + (f" ({len(a['lines'])} line(s))" if a.get("lines") else ""),
+            "ar": f"إنشاء فاتورة عميل للعميل {a.get('partner_id', '')}"
+            + (f" ({len(a['lines'])} بند)" if a.get("lines") else ""),
+        },
+        entity_type="invoice",
+        supported_args=("partner_id", "invoice_date", "lines"),
+    ),
+    "stock.validate_picking": WriteVerb(
+        verb="stock.validate_picking",
+        tier="HIGH",
+        doctype="stock.picking",
+        op="method",
+        method="button_validate",
+        required=("picking_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Validate stock transfer {a.get('picking_id', '')} (commit the moves)",
+            "ar": f"اعتماد إذن الصرف {a.get('picking_id', '')} (تثبيت الحركات)",
+        },
+        entity_type="picking",
+    ),
+    "sale.confirm_order": WriteVerb(
+        verb="sale.confirm_order",
+        tier="HIGH",
+        doctype="sale.order",
+        op="method",
+        method="action_confirm",
+        required=("order_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Confirm sales order {a.get('order_id', '')}",
+            "ar": f"تأكيد أمر البيع {a.get('order_id', '')}",
+        },
+        entity_type="sale_order",
+    ),
 }
 
 
@@ -362,11 +435,19 @@ def _refusal(exc: Exception) -> dict[str, Any]:
             "message": getattr(exc, "message", str(exc))}
 
 
+# Default to an EMPTY grant (`()`), so the ReadPlane redacts every field classified sensitive
+# (salary / VAT / IBAN / credit on financial & HR models) unless the caller explicitly `reveal`s it.
+# `None` would mean "unrestricted" and leak those by default — discovery must never do that.
+def _grant(args: dict[str, Any]) -> tuple[str, ...]:
+    reveal = args.get("reveal")
+    return tuple(reveal) if reveal else ()
+
+
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).search(
             args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
-            limit=int(args.get("limit") or 50), cursor=args.get("cursor"),
+            limit=int(args.get("limit") or 50), cursor=args.get("cursor"), grant_fields=_grant(args),
         )
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -381,7 +462,8 @@ def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]
 
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"))
+        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"),
+                                 grant_fields=_grant(args))
         return rec if rec is not None else {"found": False, "id": args.get("id")}
     except _READ_REFUSALS as exc:
         return _refusal(exc)

@@ -110,7 +110,12 @@ class OdooReadBackend:
         """Shape of any readable model. Curated CRM targets keep their hand-tuned projection; ANY other
         model the instance provisions is discovered live from `fields_get` and given a derived lean
         projection — so reads cover every Odoo module, not just CRM. A model the instance does not
-        expose (empty/None schema) returns None → a clean refusal upstream, never a guess."""
+        expose (empty/None schema) returns None → a clean refusal upstream, never a guess. A model
+        outside the operator's enabled module scope is undiscoverable too (Phase 5)."""
+        from odoo_crm_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
+
+        if not governance.module_enabled(target):
+            return None
         fields = _TARGET_FIELDS.get(target)
         if fields is None:
             field_meta = self._client.schema(target)

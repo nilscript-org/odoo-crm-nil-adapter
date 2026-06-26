@@ -13,10 +13,19 @@ the curated CRM targets — while WRITES stay governed by a default-deny policy.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
+from odoo_crm_nil_adapter import governance
 from odoo_crm_nil_adapter.edge import CapturingEmitter, create_app
 from odoo_crm_nil_adapter.system import FakeSystem
+
+
+@pytest.fixture(autouse=True)
+def _reset_policy() -> None:
+    governance.reset_policy()  # per-tenant grants / module scope never leak between tests
+    yield
+    governance.reset_policy()
 
 
 def _client(sys: FakeSystem) -> TestClient:
@@ -133,3 +142,88 @@ def test_method_verb_is_advertised_in_describe() -> None:
     client = _client(FakeSystem())
     verbs = client.get("/nil/v0.1/describe").json()["verbs"]
     assert "resource.method" in verbs
+
+
+def _rollback(client: TestClient, token: str) -> dict:
+    env = {"nil": "0.1", "grant": "g", "workspace": "w", "body": {"compensation_token": token}}
+    return client.post("/nil/v0.1/rollback", json=env).json()["body"]
+
+
+# ── Phase 3: a method with a declared inverse is COMPENSABLE; rollback previews + runs the inverse ──
+def test_reversible_method_mints_compensation_and_rollback_runs_inverse() -> None:
+    governance.grant_method("w", "account.move", "action_post", "HIGH", reverse="button_draft")
+    sys = FakeSystem()
+    sys.docs["account.move"] = [{"id": 1, "name": "INV/2026/0001"}]
+    client = _client(sys)
+    body = _propose(client, "resource.method", {"target": "account.move", "id": 1, "method": "action_post"})
+    assert body["tier"] == "HIGH", body
+    status = _commit(client, body["id"])
+    comp = status["compensation"]
+    assert comp["reversibility"] == "COMPENSABLE" and "token" in comp, comp
+    # ROLLBACK previews the inverse (button_draft), never writes directly.
+    rb = _rollback(client, comp["token"])
+    assert rb["outcome"] == "proposal" and rb["resolved"]["method"] == "button_draft", rb
+    # committing the reversal actually calls the inverse method.
+    assert _commit(client, rb["id"])["state"] == "executed"
+    assert ("account.move", "1", "button_draft", {}) in sys.method_calls
+
+
+def test_method_without_inverse_is_irreversible() -> None:
+    sys = FakeSystem()
+    sys.docs["res.partner"] = [{"id": 5, "name": "Acme"}]
+    client = _client(sys)
+    body = _propose(client, "resource.method",
+                    {"target": "res.partner", "id": 5, "method": "message_post", "params": {"body": "x"}})
+    status = _commit(client, body["id"])
+    assert status["compensation"]["reversibility"] == "IRREVERSIBLE"
+    assert "token" not in status["compensation"]
+
+
+# ── Phase 5: operator module scope makes out-of-scope models undiscoverable AND unwritable ─────────
+def test_module_scope_blocks_discovery_and_writes_end_to_end() -> None:
+    governance.set_enabled_modules({"crm"})
+    sys = _seeded_account_move()  # finance model, provisioned but out of the enabled scope
+    client = _client(sys)
+    read = _query(client, "nil.count", {"target": "account.move"})
+    assert read["data"].get("outcome") == "refused", read  # undiscoverable under scope
+    # crm.lead (in scope) still discoverable/writable
+    sys.docs["crm.lead"] = [{"id": 1, "name": "L1"}]
+    assert _query(client, "nil.count", {"target": "crm.lead"})["data"] == {"count": 1}
+
+
+# ── Phase 6: semantic verbs (curated sugar) across module groups ──────────────────────────────────
+def test_semantic_create_invoice_creates_account_move() -> None:
+    sys = FakeSystem()
+    client = _client(sys)
+    body = _propose(client, "account.create_invoice",
+                    {"partner_id": 7, "lines": [{"name": "Item", "quantity": 2, "price_unit": 50}]})
+    assert body["outcome"] == "proposal" and body["tier"] == "HIGH", body
+    assert _commit(client, body["id"])["state"] == "executed"
+    invoices = sys.docs.get("account.move", [])
+    assert len(invoices) == 1 and invoices[0]["move_type"] == "out_invoice"
+    assert invoices[0]["partner_id"] == 7
+
+
+def test_semantic_validate_picking_invokes_button_validate() -> None:
+    sys = FakeSystem()
+    sys.docs["stock.picking"] = [{"id": 3, "name": "WH/OUT/00003"}]
+    client = _client(sys)
+    body = _propose(client, "stock.validate_picking", {"picking_id": 3})
+    assert body["outcome"] == "proposal", body
+    assert _commit(client, body["id"])["state"] == "executed"
+    assert ("stock.picking", "3", "button_validate", {}) in sys.method_calls
+
+
+def test_semantic_confirm_order_invokes_action_confirm() -> None:
+    sys = FakeSystem()
+    sys.docs["sale.order"] = [{"id": 9, "name": "S00009"}]
+    client = _client(sys)
+    body = _propose(client, "sale.confirm_order", {"order_id": 9})
+    assert _commit(client, body["id"])["state"] == "executed"
+    assert ("sale.order", "9", "action_confirm", {}) in sys.method_calls
+
+
+def test_semantic_verbs_advertised_in_describe() -> None:
+    verbs = _client(FakeSystem()).get("/nil/v0.1/describe").json()["verbs"]
+    for v in ("account.create_invoice", "stock.validate_picking", "sale.confirm_order"):
+        assert v in verbs
