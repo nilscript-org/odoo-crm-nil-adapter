@@ -41,6 +41,47 @@ _SENSITIVE: dict[str, frozenset[str]] = {
 # Odoo speaks all of these server-side via search_read / search_count / read_group.
 _ODOO_CAPS = Capabilities(server_filter=True, server_sort=True, server_paginate=True, server_aggregate=True)
 
+# ── dynamic discovery: derive a lean projection for ANY model from its live `fields_get` shape ─────
+# Scalar/relational field types worth projecting by default. Heavy/collection types (text, html,
+# binary, one2many, many2many) are EXCLUDED — a lean read must never pull a 5 KB narration or an
+# unbounded line list (the 590 KB flood, generalized to every module).
+_LEAN_TYPES: frozenset[str] = frozenset({
+    "char", "integer", "float", "monetary", "boolean", "date", "datetime", "selection", "many2one",
+})
+_MAX_DERIVED_FIELDS = 8  # cap so a 200-field model still yields a small projection
+# Field-name fragments that mark financial/PII data on ANY model — sensitivity is dropped without a
+# grant by the ReadPlane's field authz, so discovery never leaks a salary/VAT/IBAN by default.
+_SENSITIVE_FRAGMENTS: tuple[str, ...] = (
+    "salary", "wage", "vat", "iban", "bank", "credit", "ssn", "tax_id", "passport", "national_id",
+)
+
+
+def _is_sensitive(target: str, field: str) -> bool:
+    if field in _SENSITIVE.get(target, frozenset()):
+        return True
+    low = field.lower()
+    return any(frag in low for frag in _SENSITIVE_FRAGMENTS)
+
+
+def _derive_projection(field_meta: list[dict[str, Any]]) -> tuple[str, ...]:
+    """Pick a lean default projection from a model's live field catalog (Odoo `fields_get`): always
+    `id`, then the human label (`display_name`/`name`), then a few lean scalars/relations — capped,
+    heavy fields excluded. The structural replacement for the hand-curated `_TARGET_FIELDS`."""
+    names = {f.get("name") for f in field_meta}
+    chosen: list[str] = ["id"]
+    for label in ("display_name", "name"):
+        if label in names and label not in chosen:
+            chosen.append(label)
+    for f in field_meta:
+        name = f.get("name")
+        if not name or name in chosen:
+            continue
+        if f.get("type") in _LEAN_TYPES:
+            chosen.append(name)
+        if len(chosen) >= _MAX_DERIVED_FIELDS:
+            break
+    return tuple(chosen)
+
 _OP_TO_ODOO = {
     "eq": "=", "ne": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<=",
     "in": "in", "contains": "ilike", "ilike": "ilike",
@@ -66,14 +107,20 @@ class OdooReadBackend:
         self._client = client
 
     def describe_target(self, target: str) -> TargetSchema | None:
+        """Shape of any readable model. Curated CRM targets keep their hand-tuned projection; ANY other
+        model the instance provisions is discovered live from `fields_get` and given a derived lean
+        projection — so reads cover every Odoo module, not just CRM. A model the instance does not
+        expose (empty/None schema) returns None → a clean refusal upstream, never a guess."""
         fields = _TARGET_FIELDS.get(target)
         if fields is None:
-            return None
-        sensitive = _SENSITIVE.get(target, frozenset())
+            field_meta = self._client.schema(target)
+            if not field_meta:  # not provisioned / not accessible → undiscoverable
+                return None
+            fields = _derive_projection(field_meta)
         specs = tuple(
             FieldSpec(
                 name=f, type="str", is_key=(f == "id"),
-                sensitivity="sensitive" if f in sensitive else "normal",
+                sensitivity="sensitive" if _is_sensitive(target, f) else "normal",
             )
             for f in fields
         )

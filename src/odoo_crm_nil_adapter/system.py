@@ -36,6 +36,10 @@ class SystemClient(Protocol):
 
     def message_post(self, target: str, record_id: str, body: str) -> None: ...  # append a chatter note
 
+    def call_method(  # invoke a governed workflow method on a record (action_post, button_validate, …)
+        self, target: str, record_id: str, method: str, params: dict[str, Any]
+    ) -> Any: ...
+
     def delete(self, target: str, record_id: str) -> None: ...
 
     def exists(self, target: str) -> bool: ...  # is this native target provisioned? (PROPOSE preflight)
@@ -209,6 +213,15 @@ class RealSystemClient:
             raise SystemError(f"odoo message_post needs a numeric record id, got {record_id!r}")
         self._kw(target, "message_post", [[rid]], {"body": body})
 
+    def call_method(self, target: str, record_id: str, method: str, params: dict[str, Any]) -> Any:
+        """Invoke an arbitrary Odoo model method on one record via execute_kw (the workflow surface:
+        action_post / button_validate / action_confirm / …). The edge only ever reaches here AFTER the
+        governance allow-list grants (target, method) — this layer performs the call, never authorizes."""
+        rid = _as_int(record_id)
+        if rid is None:
+            raise SystemError(f"odoo {method} needs a numeric record id, got {record_id!r}")
+        return self._kw(target, method, [[rid]], dict(params or {}))
+
     def delete(self, target: str, record_id: str) -> None:
         rid = _as_int(record_id)
         if rid is None:
@@ -245,6 +258,7 @@ class FakeSystem:
         self.docs: dict[str, list[dict[str, Any]]] = {}
         self.messages: dict[tuple[str, str], list[str]] = {}  # (target, record_id) -> chatter notes
         self.schemas: dict[str, list[dict[str, Any]]] = {}  # optional per-target field_meta (tests)
+        self.method_calls: list[tuple[str, str, str, dict[str, Any]]] = []  # generic op=method invocations
         self._counter = 0
 
     def create(self, target: str, doc: dict[str, Any]) -> dict[str, Any]:
@@ -290,6 +304,12 @@ class FakeSystem:
 
     def message_post(self, target: str, record_id: str, body: str) -> None:
         self.messages.setdefault((target, record_id), []).append(body)
+
+    def call_method(self, target: str, record_id: str, method: str, params: dict[str, Any]) -> Any:
+        self.method_calls.append((target, record_id, method, dict(params or {})))
+        if method == "message_post":  # keep chatter semantics so the note surface stays observable
+            self.message_post(target, record_id, str((params or {}).get("body", "")))
+        return True
 
     def delete(self, target: str, record_id: str) -> None:
         self.docs[target] = [r for r in self.docs.get(target, []) if r.get("name") != record_id]
