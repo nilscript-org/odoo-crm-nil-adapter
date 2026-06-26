@@ -426,7 +426,7 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         for b in (args.get("where") or [])
     )
     intent = Intent(about=args.get("about", ""), where=where, seek=args.get("seek", "all"),
-                    limit=int(args.get("limit") or 50), cursor=args.get("cursor"))
+                    by=args.get("by"), limit=int(args.get("limit") or 50), cursor=args.get("cursor"))
     try:
         outcome = _resolver(client).resolve(intent)
     except SystemError as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
