@@ -36,7 +36,10 @@ DECLARED_TARGETS: frozenset[str] = frozenset({
     "res.country.state",    # state / region reference
 })
 
-RESOURCE_VERBS: tuple[str, ...] = ("resource.create", "resource.read", "resource.update", "resource.delete")
+RESOURCE_VERBS: tuple[str, ...] = (
+    "resource.create", "resource.read", "resource.update", "resource.delete",
+    "resource.method",  # generic governed workflow-method invocation (action_post, button_validate, …)
+)
 
 
 @dataclass(frozen=True)

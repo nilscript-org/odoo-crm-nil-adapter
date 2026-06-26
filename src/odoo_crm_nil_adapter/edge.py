@@ -18,12 +18,12 @@ from uuid import uuid4
 
 from fastapi import Body, FastAPI, Header, HTTPException, Response
 
+from odoo_crm_nil_adapter import governance
 from odoo_crm_nil_adapter.compensation import COMPENSATIONS, compensate
 from odoo_crm_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
 from odoo_crm_nil_adapter.state import ShimState
 from odoo_crm_nil_adapter.system import SystemClient, SystemError
 from odoo_crm_nil_adapter.translate import (
-    DECLARED_TARGETS,
     QUERY_VERBS,
     RESOURCE_VERBS,
     WRITE_VERBS,
@@ -403,6 +403,31 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         body = env.get("body", {})
         verb_name = body.get("verb")
         args = body.get("args", {}) or {}
+        # Generic op=method (universal workflow actions): call a governed model method on a record —
+        # action_post, button_validate, action_confirm, … — with NO per-action verb. Gated by the
+        # method allow-list (default-deny), so an unlisted/financial method is unexpressible.
+        if verb_name == "resource.method":
+            target, method, rid = args.get("target"), args.get("method"), args.get("id")
+            if not target:
+                return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
+            if not method:
+                return _refusal(env, "INVALID_ARGS", "missing required arg: method", field="method")
+            if not rid:
+                return _refusal(env, "INVALID_ARGS", "missing required arg: id", field="id")
+            tier = governance.method_tier(target, method)
+            if tier is None:
+                return _refusal(env, "UNKNOWN_VERB",
+                                f"method '{method}' on '{target}' is not granted by this adapter's governance policy")
+            if not client.exists(target):
+                return _refusal(env, "UPSTREAM_UNAVAILABLE",
+                                f"backend target '{target}' is not provisioned on this system")
+            pid = uuid4().hex[:16]
+            state.proposals[pid] = {"verb": verb_name, "args": args, "resource_method": True}
+            return _envelope("PROPOSAL", env, {
+                "outcome": "proposal", "id": pid, "verb": verb_name, "tier": tier,
+                "preview": {"en": f"Call {method} on {target}/{rid}",
+                            "ar": f"استدعاء {method} على {target}/{rid}"},
+                "resolved": args, "modifiable": [], "expires_at": _now()})
         # Generic resource.* CRUD (universal): target/id/data from args, no per-verb doctype.
         if isinstance(verb_name, str) and verb_name.startswith("resource."):
             op = verb_name.split(".", 1)[1]
@@ -411,12 +436,14 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             target = args.get("target")
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
-            # Skeleton bound (advertised ≡ committable): resource.* may only touch a DECLARED target.
-            # A provisioned-but-undeclared model (account.payment, hr.employee, …) is unexpressible —
-            # refused here, never committed. This is what makes Guarantee 2 hold literally.
-            if target not in DECLARED_TARGETS:
+            # Skeleton bound (advertised ≡ committable): the WRITE ceiling is governance policy, not the
+            # read surface. A provisioned-but-ungranted model (account.payment, hr.employee, …) reads
+            # via nil.* but is unexpressible for writes — refused here, never committed. Lifting the
+            # read ceiling (dynamic discovery) does NOT lift the write ceiling. Guarantee 2 holds.
+            tier = governance.write_tier(target, op)
+            if tier is None:
                 return _refusal(env, "UNKNOWN_VERB",
-                                f"target '{target}' is not in this adapter's declared skeleton")
+                                f"target '{target}' is not writable under this adapter's governance policy")
             if op in ("update", "delete") and not args.get("id"):
                 return _refusal(env, "INVALID_ARGS", "missing required arg: id", field="id")
             if op in ("create", "update") and not isinstance(args.get("data"), dict):
@@ -447,7 +474,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 en, ar = f"{en} · {tail}", f"{ar} · {tail}"
             return _envelope("PROPOSAL", env, {
                 "outcome": "proposal", "id": pid, "verb": verb_name,
-                "tier": {"create": "MEDIUM", "update": "MEDIUM", "delete": "HIGH"}[op],
+                "tier": tier,
                 "preview": {"en": en, "ar": ar},
                 "resolved": {**args, "references": refs} if refs else args,
                 "modifiable": [], "expires_at": _now()})
@@ -509,6 +536,32 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         stored = state.proposals.get(proposal_id)
         if stored is None:
             return _refusal(env, "EXPIRED", f"unknown or expired proposal: {proposal_id}")
+        if stored.get("resource_method"):  # generic workflow-method path — invoke, no synthesized reversal
+            target = stored["args"]["target"]
+            method = stored["args"]["method"]
+            params = stored["args"].get("params") or {}
+            rid = str(stored["args"].get("id", ""))
+            try:
+                rid = _resolve_id(client, target, rid) or rid
+                client.call_method(target, rid, method, params)
+            except (SystemError, NotImplementedError) as exc:
+                print(f"[shim] METHOD FAILED {target}.{method} -> {exc}", flush=True)
+                return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
+            # A generic workflow method is IRREVERSIBLE by default — no compensating method is
+            # synthesized (post≠un-post). The result declares the effect honestly: changed, executed via
+            # the call, with no field-level read-back claimed (did_read=False).
+            comp_block = {"reversibility": "IRREVERSIBLE"}
+            result = {"claim": "success", "changed": True, "verified": False,
+                      "entity": {"type": stored["verb"], "id": rid, "url": f"/{target}/{rid}"},
+                      "ssot": {"system": SYSTEM, "read_after_write": False, "method": method},
+                      "compensation": comp_block}
+            status_body = {"proposal": proposal_id, "state": "executed", "replayed": False,
+                           "compensation": comp_block, "result": result}
+            state.ledger[key] = status_body
+            state.executed.add(proposal_id)
+            emitter.emit(_envelope("EVENT", env, {"event": "executed", "severity": "info",
+                         "proposal": proposal_id, "result": result}), state.next_sequence(env.get("workspace", "")))
+            return _envelope("STATUS", env, status_body)
         if stored.get("resource"):  # generic CRUD path — dispatch by args.target, synthesize result + reversal
             op = stored["verb"].split(".", 1)[1]
             target = stored["args"]["target"]
@@ -696,9 +749,10 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         if body.get("verb") == "resource.read":
             qargs = body.get("args", {}) or {}
             target = qargs.get("target")
-            # Reads obey the same skeleton bound — resource.read must not pull salaries/payments
-            # from an undeclared model. advertised ≡ committable applies to QUERY as well as COMMIT.
-            if not target or target not in DECLARED_TARGETS or not client.exists(target):
+            # The LEGACY raw read (whole-record list) stays bounded to the writable skeleton — pulling
+            # raw salaries/payments from an arbitrary model would re-open the 590 KB flood AND leak
+            # sensitive fields. Universal, projected, sensitivity-gated reads flow through nil.* instead.
+            if not target or not governance.reads_allowed_raw(target) or not client.exists(target):
                 raise HTTPException(status_code=404, detail=f"unknown or undeclared target: {target}")
             rows = client.list(target, qargs.get("match") or None)
             return {"data": {"target": target, "count": len(rows), "items": rows}}
@@ -776,11 +830,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
     def describe() -> dict[str, Any]:
         """Discovery handshake (no auth): verbs + live readiness/shape of each native target.
         Lets the kernel/any client connect uniformly — reachable, conformant, provisioned."""
-        # Advertise EXACTLY the committable skeleton: the resource.* family + the curated verbs, and
-        # the DECLARED_TARGETS resource.* is bounded to. advertised ≡ committable — describe() is the
-        # single source of truth for what this adapter will actually commit.
+        # Advertise EXACTLY the committable WRITE skeleton: the resource.* family + the curated verbs,
+        # and the governed writable targets resource.* is bounded to. advertised ≡ committable for
+        # writes — describe() is the single source of truth for what this adapter will actually commit.
+        # (Reads are universal via nil.* and not enumerated here — discovery is per-model, on demand.)
         targets: dict[str, Any] = {}
-        for t in sorted(DECLARED_TARGETS):
+        for t in sorted(governance.WRITABLE_TARGETS):
             s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
             targets[t] = {"exists": s is not None, "fields": s or []}
         return {
