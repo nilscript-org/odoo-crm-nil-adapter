@@ -75,6 +75,42 @@ def test_search_discovers_uncurated_model_and_projects_lean() -> None:
     assert "narration" not in keys and "line_ids" not in keys  # heavy/collection fields dropped
 
 
+def test_projection_ranks_business_fields_over_technical_noise() -> None:
+    # A real Odoo model carries dozens of mail/audit/technical fields that sort BEFORE the business
+    # ones alphabetically (access_*, activity_*, message_*). The derived projection must rank by
+    # business value, not alphabet — otherwise accounting reads return access_token, not amount_total.
+    sys = FakeSystem()
+    sys.schemas["account.move"] = [
+        {"name": "id", "type": "integer"},
+        {"name": "access_token", "type": "char"},
+        {"name": "activity_state", "type": "selection"},
+        {"name": "message_main_attachment_id", "type": "many2one", "relation": "ir.attachment"},
+        {"name": "name", "type": "char"},
+        {"name": "ref", "type": "char"},
+        {"name": "state", "type": "selection"},
+        {"name": "move_type", "type": "selection"},
+        {"name": "amount_total", "type": "monetary"},
+        {"name": "partner_id", "type": "many2one", "relation": "res.partner"},
+        {"name": "invoice_date", "type": "date"},
+        {"name": "narration", "type": "text"},          # heavy → always dropped
+        {"name": "line_ids", "type": "one2many"},        # collection → always dropped
+    ]
+    sys.docs["account.move"] = [{
+        "id": 1, "name": "INV/1", "amount_total": 100, "state": "posted", "move_type": "out_invoice",
+        "ref": "PO-9", "partner_id": [7, "Acme"], "invoice_date": "2026-06-27",
+        "access_token": "x", "activity_state": "overdue", "message_main_attachment_id": [3, "a"],
+        "narration": "y", "line_ids": [1, 2],
+    }]
+    client = _client(sys)
+    keys = set(_query(client, "nil.search", {"target": "account.move", "limit": 1})["data"]["items"][0].keys())
+    # business fields kept
+    for biz in ("name", "state", "move_type", "amount_total", "partner_id"):
+        assert biz in keys, f"{biz} should be in the projection; got {sorted(keys)}"
+    # technical / mail noise dropped
+    for noise in ("access_token", "activity_state", "message_main_attachment_id", "narration", "line_ids"):
+        assert noise not in keys, f"{noise} must not be in the projection; got {sorted(keys)}"
+
+
 def test_count_works_on_discovered_model() -> None:
     client = _client(_seeded_account_move())
     out = _query(client, "nil.count", {"target": "account.move"})

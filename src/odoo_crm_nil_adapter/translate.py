@@ -418,15 +418,19 @@ from nilscript.dataplane import (  # noqa: E402
 
 from odoo_crm_nil_adapter.read_plane import build_read_plane  # noqa: E402
 
+import weakref  # noqa: E402
+
 _READ_REFUSALS = (ResultTooLarge, InvalidFilter, CapabilityUnsupported, BulkApprovalRequired)
-_PLANES: dict[int, Any] = {}
+# Keyed by the client OBJECT (WeakKeyDictionary), not id(client): id() is reused after GC, which would
+# hand a fresh client a stale plane bound to a dead backend. Weak keys are GC-safe and collision-free.
+_PLANES: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 def _plane(client: SystemClient) -> Any:
-    plane = _PLANES.get(id(client))
+    plane = _PLANES.get(client)
     if plane is None:
         plane = build_read_plane(client)
-        _PLANES[id(client)] = plane
+        _PLANES[client] = plane
     return plane
 
 
@@ -492,14 +496,14 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         return _refusal(exc)
 
 
-_RESOLVERS: dict[int, Any] = {}
+_RESOLVERS: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 def _resolver(client: SystemClient) -> Any:
-    r = _RESOLVERS.get(id(client))
+    r = _RESOLVERS.get(client)
     if r is None:
         r = IntentResolver(_plane(client), IdentityResolver())
-        _RESOLVERS[id(client)] = r
+        _RESOLVERS[client] = r
     return r
 
 
