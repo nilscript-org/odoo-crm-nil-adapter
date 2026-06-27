@@ -34,6 +34,16 @@ _TARGET_FIELDS: dict[str, tuple[str, ...]] = {
     "crm.stage": ("id", "name", "sequence"),
     "crm.team": ("id", "name"),
     "res.country": ("id", "name", "code"),
+    # Accounting (hand-tuned — better than the generic ranker for the highest-value finance models).
+    "account.move": ("id", "name", "ref", "state", "move_type", "partner_id", "invoice_date",
+                     "invoice_date_due", "amount_total", "amount_residual", "currency_id", "journal_id"),
+    "account.payment": ("id", "name", "state", "payment_type", "partner_id", "amount", "currency_id",
+                        "journal_id", "date", "ref"),
+    "account.move.line": ("id", "name", "move_id", "account_id", "partner_id", "debit", "credit",
+                          "balance", "date", "quantity", "price_unit"),
+    "account.journal": ("id", "name", "code", "type", "currency_id", "company_id"),
+    "account.account": ("id", "name", "code", "account_type", "reconcile", "currency_id"),
+    "account.tax": ("id", "name", "amount", "amount_type", "type_tax_use", "company_id"),
 }
 _SENSITIVE: dict[str, frozenset[str]] = {
     "res.partner": frozenset({"credit_limit", "vat"}),
@@ -49,6 +59,48 @@ _LEAN_TYPES: frozenset[str] = frozenset({
     "char", "integer", "float", "monetary", "boolean", "date", "datetime", "selection", "many2one",
 })
 _MAX_DERIVED_FIELDS = 8  # cap so a 200-field model still yields a small projection
+
+# Real Odoo models carry dozens of mail-thread / audit / technical fields that sort BEFORE the business
+# ones alphabetically. Ranking (not alphabet) is what makes a discovered projection USEFUL: on
+# account.account we want code/account_type/currency, not access_token/activity_*. Pure-noise fields
+# are dropped even when projection slots remain.
+import re  # noqa: E402
+
+_NOISE = re.compile(
+    r"^(access_|activity_|message_|my_activity|has_message|rating_|website_|signup_|oauth_|"
+    r"image_|avatar_|create_uid|create_date|write_uid|write_date|__|.*_online_|online_)", re.I
+)
+# Common cross-module business fields, in rough priority order (earlier ⇒ higher score). Generic, not
+# per-model: these names recur across Odoo (sale/account/stock/hr/product), so one list lifts every module.
+_PRIORITY: tuple[str, ...] = (
+    "name", "display_name", "code", "default_code", "ref", "reference", "state", "move_type", "type",
+    "partner_id", "product_id", "account_id", "journal_id", "currency_id", "company_id", "user_id",
+    "amount_total", "amount_untaxed", "amount_residual", "amount", "balance", "debit", "credit",
+    "price_unit", "price_subtotal", "list_price", "standard_price", "quantity", "product_qty",
+    "date", "invoice_date", "date_order", "date_maturity", "account_type", "email", "phone", "barcode",
+)
+_PRIORITY_RANK = {name: i for i, name in enumerate(_PRIORITY)}
+
+
+def _field_score(f: dict[str, Any]) -> int:
+    """Business value of a field for a default projection. Priority business names rank highest;
+    technical/mail/audit fields are pushed below the cut; required + meaningful types get a nudge."""
+    name = f.get("name", "")
+    score = 0
+    if name in _PRIORITY_RANK:
+        score += 100 - _PRIORITY_RANK[name]
+    if _NOISE.match(name):
+        score -= 100
+    if f.get("required"):
+        score += 8
+    t = f.get("type")
+    if t in ("selection", "monetary", "date", "datetime"):
+        score += 4
+    elif t == "many2one":
+        score += 3
+    elif t == "boolean":
+        score -= 2
+    return score
 # Field-name fragments that mark financial/PII data on ANY model — sensitivity is dropped without a
 # grant by the ReadPlane's field authz, so discovery never leaks a salary/VAT/IBAN by default.
 _SENSITIVE_FRAGMENTS: tuple[str, ...] = (
@@ -72,14 +124,19 @@ def _derive_projection(field_meta: list[dict[str, Any]]) -> tuple[str, ...]:
     for label in ("display_name", "name"):
         if label in names and label not in chosen:
             chosen.append(label)
-    for f in field_meta:
-        name = f.get("name")
-        if not name or name in chosen:
-            continue
-        if f.get("type") in _LEAN_TYPES:
-            chosen.append(name)
+    # Rank the remaining lean fields by business value (not alphabet); drop pure noise even if slots
+    # remain, so the projection is lean AND right across every module.
+    candidates = [
+        f for f in field_meta
+        if f.get("name") and f["name"] not in chosen and f.get("type") in _LEAN_TYPES
+    ]
+    candidates.sort(key=lambda f: (-_field_score(f), f.get("name") or ""))
+    for f in candidates:
         if len(chosen) >= _MAX_DERIVED_FIELDS:
             break
+        if _field_score(f) <= -50:  # technical/mail noise — never worth a slot
+            continue
+        chosen.append(f["name"])
     return tuple(chosen)
 
 _OP_TO_ODOO = {
@@ -110,7 +167,12 @@ class OdooReadBackend:
         """Shape of any readable model. Curated CRM targets keep their hand-tuned projection; ANY other
         model the instance provisions is discovered live from `fields_get` and given a derived lean
         projection — so reads cover every Odoo module, not just CRM. A model the instance does not
-        expose (empty/None schema) returns None → a clean refusal upstream, never a guess."""
+        expose (empty/None schema) returns None → a clean refusal upstream, never a guess. A model
+        outside the operator's enabled module scope is undiscoverable too (Phase 5)."""
+        from odoo_crm_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
+
+        if not governance.module_enabled(target):
+            return None
         fields = _TARGET_FIELDS.get(target)
         if fields is None:
             field_meta = self._client.schema(target)

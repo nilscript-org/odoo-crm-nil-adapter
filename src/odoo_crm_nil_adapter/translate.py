@@ -58,6 +58,9 @@ class WriteVerb:
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
     dedup_keys: tuple[str, ...] = ()
     method: str | None = None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
+    # for op="method": the inverse method that reverses it (action_post→button_draft). When set, the
+    # effect is COMPENSABLE — ROLLBACK previews+runs the inverse — instead of IRREVERSIBLE.
+    reverse_method: str | None = None
     # NIL arg keys this verb can actually write/use. When declared, PROPOSE flags any provided arg
     # outside this set as `ignored` — so an unwritable field (e.g. country) is never silently accepted.
     supported_args: tuple[str, ...] = ()
@@ -159,6 +162,67 @@ def _to_native_log_note(args: dict[str, Any]) -> dict[str, Any]:
     """log_note carries only the chatter `body`; `contact_id` is the record id (used by the edge).
     `.get` (not `[]`) keeps to_native crash-free if a malformed COMMIT bypasses PROPOSE validation."""
     return {"body": args.get("body", "")}
+
+
+# ── semantic verbs (Phase 6): curated sugar over the generic plane for the highest-value flows.
+# Capability comes from the universal plane (resource.* CRUD + resource.method); these add clean args,
+# bilingual approval previews, and a precise per-verb tier. Representative set across module groups —
+# the long tail stays on the generic plane (the "don't hand-write a thousand verbs" discipline).
+def _to_native_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo customer invoice (`account.move`, move_type=out_invoice). Lines are the Odoo
+    one2many write form [(0, 0, {…})]; the hidden move_type is supplied so the agent never sees it."""
+    doc: dict[str, Any] = {"move_type": "out_invoice"}
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("invoice_date"):
+        doc["invoice_date"] = args["invoice_date"]
+    lines = args.get("lines") or []
+    if lines:
+        doc["invoice_line_ids"] = [
+            (0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)
+        ]
+    return doc
+
+
+def _invoice_line(ln: dict[str, Any]) -> dict[str, Any]:
+    """One invoice line. `product_id` (when given) lets Odoo derive the income account/taxes so the
+    invoice is POSTABLE; name/quantity/price_unit are the manual fallback."""
+    line: dict[str, Any] = {
+        "name": ln.get("name", ""),
+        "quantity": _maybe_float(ln.get("quantity", 1)),
+        "price_unit": _maybe_float(ln.get("price_unit", 0)),
+    }
+    if ln.get("product_id"):
+        line["product_id"] = _maybe_int(ln["product_id"])
+    if ln.get("account_id"):  # explicit income/expense account (when no product drives it)
+        line["account_id"] = _maybe_int(ln["account_id"])
+    return line
+
+
+def _to_native_method_only(_args: dict[str, Any]) -> dict[str, Any]:
+    """A workflow-method verb (validate / confirm) writes no fields — the record id is the first
+    required arg, consumed by the edge; the method itself drives the state transition in Odoo."""
+    return {}
+
+
+def _to_native_register_payment(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo `account.payment` (a customer/supplier payment record). Defaults to an
+    inbound customer payment; partner_type is derived from payment_type so the record is valid."""
+    ptype = args.get("payment_type", "inbound")
+    doc: dict[str, Any] = {
+        "payment_type": ptype,
+        "partner_type": "customer" if ptype == "inbound" else "supplier",
+        "amount": _maybe_float(args.get("amount", 0)),
+    }
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("journal_id"):
+        doc["journal_id"] = _maybe_int(args["journal_id"])
+    if args.get("date"):
+        doc["date"] = args["date"]
+    if args.get("ref"):
+        doc["ref"] = args["ref"]
+    return doc
 
 
 # ── crm.* read-through verbs (fresh business truth, no side effects) ──────────────────────────
@@ -314,6 +378,82 @@ WRITE_VERBS: dict[str, WriteVerb] = {
         },
         entity_type="contact",
     ),
+    # ── semantic verbs across module groups (Phase 6) ─────────────────────────────────────────────
+    "account.create_invoice": WriteVerb(
+        verb="account.create_invoice",
+        tier="HIGH",  # a financial document — owner-reviewed, never MEDIUM-auto like a CRM note
+        doctype="account.move",
+        op="create",
+        required=("partner_id",),
+        to_native=_to_native_create_invoice,
+        preview=lambda a: {
+            "en": f"Create a customer invoice for partner {a.get('partner_id', '')}"
+            + (f" ({len(a['lines'])} line(s))" if a.get("lines") else ""),
+            "ar": f"إنشاء فاتورة عميل للعميل {a.get('partner_id', '')}"
+            + (f" ({len(a['lines'])} بند)" if a.get("lines") else ""),
+        },
+        entity_type="invoice",
+        supported_args=("partner_id", "invoice_date", "lines"),
+    ),
+    "stock.validate_picking": WriteVerb(
+        verb="stock.validate_picking",
+        tier="HIGH",
+        doctype="stock.picking",
+        op="method",
+        method="button_validate",
+        required=("picking_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Validate stock transfer {a.get('picking_id', '')} (commit the moves)",
+            "ar": f"اعتماد إذن الصرف {a.get('picking_id', '')} (تثبيت الحركات)",
+        },
+        entity_type="picking",
+    ),
+    "sale.confirm_order": WriteVerb(
+        verb="sale.confirm_order",
+        tier="HIGH",
+        doctype="sale.order",
+        op="method",
+        method="action_confirm",
+        required=("order_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Confirm sales order {a.get('order_id', '')}",
+            "ar": f"تأكيد أمر البيع {a.get('order_id', '')}",
+        },
+        entity_type="sale_order",
+    ),
+    "account.post_invoice": WriteVerb(
+        verb="account.post_invoice",
+        tier="HIGH",
+        doctype="account.move",
+        op="method",
+        method="action_post",
+        reverse_method="button_draft",  # COMPENSABLE: ROLLBACK resets the invoice to draft
+        required=("invoice_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Post invoice {a.get('invoice_id', '')} (commit it to the books)",
+            "ar": f"ترحيل الفاتورة {a.get('invoice_id', '')} (تثبيتها في الدفاتر)",
+        },
+        entity_type="invoice",
+    ),
+    "account.register_payment": WriteVerb(
+        verb="account.register_payment",
+        tier="HIGH",  # money movement — owner-reviewed
+        doctype="account.payment",
+        op="create",
+        required=("partner_id", "amount"),
+        to_native=_to_native_register_payment,
+        preview=lambda a: {
+            "en": f"Register a {a.get('payment_type', 'inbound')} payment of {a.get('amount', '')}"
+            + f" for partner {a.get('partner_id', '')}",
+            "ar": f"تسجيل دفعة ({a.get('payment_type', 'inbound')}) بمبلغ {a.get('amount', '')}"
+            + f" للطرف {a.get('partner_id', '')}",
+        },
+        entity_type="payment",
+        supported_args=("partner_id", "amount", "payment_type", "journal_id", "date", "ref"),
+    ),
 }
 
 
@@ -345,15 +485,19 @@ from nilscript.dataplane import (  # noqa: E402
 
 from odoo_crm_nil_adapter.read_plane import build_read_plane  # noqa: E402
 
+import weakref  # noqa: E402
+
 _READ_REFUSALS = (ResultTooLarge, InvalidFilter, CapabilityUnsupported, BulkApprovalRequired)
-_PLANES: dict[int, Any] = {}
+# Keyed by the client OBJECT (WeakKeyDictionary), not id(client): id() is reused after GC, which would
+# hand a fresh client a stale plane bound to a dead backend. Weak keys are GC-safe and collision-free.
+_PLANES: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 def _plane(client: SystemClient) -> Any:
-    plane = _PLANES.get(id(client))
+    plane = _PLANES.get(client)
     if plane is None:
         plane = build_read_plane(client)
-        _PLANES[id(client)] = plane
+        _PLANES[client] = plane
     return plane
 
 
@@ -362,11 +506,19 @@ def _refusal(exc: Exception) -> dict[str, Any]:
             "message": getattr(exc, "message", str(exc))}
 
 
+# Default to an EMPTY grant (`()`), so the ReadPlane redacts every field classified sensitive
+# (salary / VAT / IBAN / credit on financial & HR models) unless the caller explicitly `reveal`s it.
+# `None` would mean "unrestricted" and leak those by default — discovery must never do that.
+def _grant(args: dict[str, Any]) -> tuple[str, ...]:
+    reveal = args.get("reveal")
+    return tuple(reveal) if reveal else ()
+
+
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).search(
             args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
-            limit=int(args.get("limit") or 50), cursor=args.get("cursor"),
+            limit=int(args.get("limit") or 50), cursor=args.get("cursor"), grant_fields=_grant(args),
         )
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -381,7 +533,8 @@ def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]
 
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"))
+        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"),
+                                 grant_fields=_grant(args))
         return rec if rec is not None else {"found": False, "id": args.get("id")}
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -410,14 +563,14 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         return _refusal(exc)
 
 
-_RESOLVERS: dict[int, Any] = {}
+_RESOLVERS: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 def _resolver(client: SystemClient) -> Any:
-    r = _RESOLVERS.get(id(client))
+    r = _RESOLVERS.get(client)
     if r is None:
         r = IntentResolver(_plane(client), IdentityResolver())
-        _RESOLVERS[id(client)] = r
+        _RESOLVERS[client] = r
     return r
 
 

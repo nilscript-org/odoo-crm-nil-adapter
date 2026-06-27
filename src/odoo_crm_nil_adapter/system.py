@@ -10,8 +10,13 @@ passed in by the runner from the environment — this module never reads or hard
 
 from __future__ import annotations
 
+import time
 import xmlrpc.client
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
+
+# Transport statuses worth retrying — Odoo rate-limits (429) and transient gateway faults (5xx). An
+# application Fault (bad args, access error) is NOT here: it is terminal and must surface immediately.
+_RETRYABLE_HTTP: frozenset[int] = frozenset({429, 502, 503, 504})
 
 
 class SystemError(RuntimeError):
@@ -130,15 +135,38 @@ def _field_meta(name: str, meta: dict[str, Any]) -> dict[str, Any]:
 class RealSystemClient:
     """Talk to Odoo via the XML-RPC External API — the only I/O in the adapter."""
 
-    def __init__(self, base_url: str, *, db: str, login: str, api_key: str) -> None:
+    def __init__(self, base_url: str, *, db: str, login: str, api_key: str,
+                 max_retries: int = 3, backoff: float = 0.5, min_interval: float = 0.0,
+                 sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic) -> None:
         self._url = base_url.rstrip("/")
         self._db = db
         self._login = login
         self._key = api_key
         self._uid: int | None = None
         self._fields_cache: dict[str, list[dict[str, Any]] | None] = {}
+        # Durability (the adapter's slice — the "429 flood" lesson): retry transient transport faults
+        # with exponential backoff, and optionally throttle to a minimum inter-call interval so a burst
+        # of governed writes never hammers Odoo. Orchestration-level durability (resume across crashes,
+        # per-tenant queues) is the separate Temporal plan; this keeps a SINGLE call resilient.
+        self._max_retries = max_retries
+        self._backoff = backoff
+        self._min_interval = min_interval
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last_call: float = 0.0
         self._common = xmlrpc.client.ServerProxy(f"{self._url}/xmlrpc/2/common", allow_none=True)
         self._models = xmlrpc.client.ServerProxy(f"{self._url}/xmlrpc/2/object", allow_none=True)
+
+    def _throttle(self) -> None:
+        """Hold each upstream call to at least `min_interval` apart (off when 0) — a simple governor so
+        a bulk of approved writes can't burst-trip Odoo's rate limiter."""
+        if self._min_interval <= 0:
+            return
+        wait = self._min_interval - (self._monotonic() - self._last_call)
+        if wait > 0:
+            self._sleep(wait)
+        self._last_call = self._monotonic()
 
     # ── auth + low-level call ────────────────────────────────────────────────────────────────
     def _auth(self) -> int:
@@ -155,13 +183,24 @@ class RealSystemClient:
 
     def _kw(self, model: str, method: str, args: list[Any], kw: dict[str, Any] | None = None) -> Any:
         uid = self._auth()
-        try:
-            return self._models.execute_kw(self._db, uid, self._key, model, method, args, kw or {})
-        except xmlrpc.client.Fault as fault:
-            tail = fault.faultString.strip().splitlines()[-1] if fault.faultString else "fault"
-            raise SystemError(f"odoo {model}.{method}: {tail}") from fault
-        except Exception as exc:  # noqa: BLE001
-            raise SystemError(f"odoo {model}.{method} transport error: {exc}") from exc
+        for attempt in range(self._max_retries + 1):
+            self._throttle()
+            try:
+                return self._models.execute_kw(self._db, uid, self._key, model, method, args, kw or {})
+            except xmlrpc.client.Fault as fault:  # application error — terminal, never retried
+                tail = fault.faultString.strip().splitlines()[-1] if fault.faultString else "fault"
+                raise SystemError(f"odoo {model}.{method}: {tail}") from fault
+            except xmlrpc.client.ProtocolError as pe:  # transport status — retry the rate-limit/gateway ones
+                if pe.errcode in _RETRYABLE_HTTP and attempt < self._max_retries:
+                    self._sleep(self._backoff * (2 ** attempt))
+                    continue
+                raise SystemError(f"odoo {model}.{method} transport error: HTTP {pe.errcode}") from pe
+            except Exception as exc:  # noqa: BLE001 — other transient transport faults: retry, then surface
+                if attempt < self._max_retries:
+                    self._sleep(self._backoff * (2 ** attempt))
+                    continue
+                raise SystemError(f"odoo {model}.{method} transport error: {exc}") from exc
+        raise SystemError(f"odoo {model}.{method}: exhausted {self._max_retries} retries")  # unreachable guard
 
     def _clean(self, doc: dict[str, Any]) -> dict[str, Any]:
         """Strip keys that must not be written: `id` and any None-valued field."""
