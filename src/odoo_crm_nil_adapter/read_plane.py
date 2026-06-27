@@ -34,6 +34,16 @@ _TARGET_FIELDS: dict[str, tuple[str, ...]] = {
     "crm.stage": ("id", "name", "sequence"),
     "crm.team": ("id", "name"),
     "res.country": ("id", "name", "code"),
+    # Accounting (hand-tuned — better than the generic ranker for the highest-value finance models).
+    "account.move": ("id", "name", "ref", "state", "move_type", "partner_id", "invoice_date",
+                     "invoice_date_due", "amount_total", "amount_residual", "currency_id", "journal_id"),
+    "account.payment": ("id", "name", "state", "payment_type", "partner_id", "amount", "currency_id",
+                        "journal_id", "date", "ref"),
+    "account.move.line": ("id", "name", "move_id", "account_id", "partner_id", "debit", "credit",
+                          "balance", "date", "quantity", "price_unit"),
+    "account.journal": ("id", "name", "code", "type", "currency_id", "company_id"),
+    "account.account": ("id", "name", "code", "account_type", "reconcile", "currency_id"),
+    "account.tax": ("id", "name", "amount", "amount_type", "type_tax_use", "company_id"),
 }
 _SENSITIVE: dict[str, frozenset[str]] = {
     "res.partner": frozenset({"credit_limit", "vat"}),

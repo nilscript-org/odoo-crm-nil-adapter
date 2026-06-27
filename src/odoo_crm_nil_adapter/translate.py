@@ -58,6 +58,9 @@ class WriteVerb:
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
     dedup_keys: tuple[str, ...] = ()
     method: str | None = None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
+    # for op="method": the inverse method that reverses it (action_post→button_draft). When set, the
+    # effect is COMPENSABLE — ROLLBACK previews+runs the inverse — instead of IRREVERSIBLE.
+    reverse_method: str | None = None
     # NIL arg keys this verb can actually write/use. When declared, PROPOSE flags any provided arg
     # outside this set as `ignored` — so an unwritable field (e.g. country) is never silently accepted.
     supported_args: tuple[str, ...] = ()
@@ -176,17 +179,50 @@ def _to_native_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
     lines = args.get("lines") or []
     if lines:
         doc["invoice_line_ids"] = [
-            (0, 0, {"name": ln.get("name", ""), "quantity": _maybe_float(ln.get("quantity", 1)),
-                    "price_unit": _maybe_float(ln.get("price_unit", 0))})
-            for ln in lines if isinstance(ln, dict)
+            (0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)
         ]
     return doc
+
+
+def _invoice_line(ln: dict[str, Any]) -> dict[str, Any]:
+    """One invoice line. `product_id` (when given) lets Odoo derive the income account/taxes so the
+    invoice is POSTABLE; name/quantity/price_unit are the manual fallback."""
+    line: dict[str, Any] = {
+        "name": ln.get("name", ""),
+        "quantity": _maybe_float(ln.get("quantity", 1)),
+        "price_unit": _maybe_float(ln.get("price_unit", 0)),
+    }
+    if ln.get("product_id"):
+        line["product_id"] = _maybe_int(ln["product_id"])
+    if ln.get("account_id"):  # explicit income/expense account (when no product drives it)
+        line["account_id"] = _maybe_int(ln["account_id"])
+    return line
 
 
 def _to_native_method_only(_args: dict[str, Any]) -> dict[str, Any]:
     """A workflow-method verb (validate / confirm) writes no fields — the record id is the first
     required arg, consumed by the edge; the method itself drives the state transition in Odoo."""
     return {}
+
+
+def _to_native_register_payment(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo `account.payment` (a customer/supplier payment record). Defaults to an
+    inbound customer payment; partner_type is derived from payment_type so the record is valid."""
+    ptype = args.get("payment_type", "inbound")
+    doc: dict[str, Any] = {
+        "payment_type": ptype,
+        "partner_type": "customer" if ptype == "inbound" else "supplier",
+        "amount": _maybe_float(args.get("amount", 0)),
+    }
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("journal_id"):
+        doc["journal_id"] = _maybe_int(args["journal_id"])
+    if args.get("date"):
+        doc["date"] = args["date"]
+    if args.get("ref"):
+        doc["ref"] = args["ref"]
+    return doc
 
 
 # ── crm.* read-through verbs (fresh business truth, no side effects) ──────────────────────────
@@ -386,6 +422,37 @@ WRITE_VERBS: dict[str, WriteVerb] = {
             "ar": f"تأكيد أمر البيع {a.get('order_id', '')}",
         },
         entity_type="sale_order",
+    ),
+    "account.post_invoice": WriteVerb(
+        verb="account.post_invoice",
+        tier="HIGH",
+        doctype="account.move",
+        op="method",
+        method="action_post",
+        reverse_method="button_draft",  # COMPENSABLE: ROLLBACK resets the invoice to draft
+        required=("invoice_id",),
+        to_native=_to_native_method_only,
+        preview=lambda a: {
+            "en": f"Post invoice {a.get('invoice_id', '')} (commit it to the books)",
+            "ar": f"ترحيل الفاتورة {a.get('invoice_id', '')} (تثبيتها في الدفاتر)",
+        },
+        entity_type="invoice",
+    ),
+    "account.register_payment": WriteVerb(
+        verb="account.register_payment",
+        tier="HIGH",  # money movement — owner-reviewed
+        doctype="account.payment",
+        op="create",
+        required=("partner_id", "amount"),
+        to_native=_to_native_register_payment,
+        preview=lambda a: {
+            "en": f"Register a {a.get('payment_type', 'inbound')} payment of {a.get('amount', '')}"
+            + f" for partner {a.get('partner_id', '')}",
+            "ar": f"تسجيل دفعة ({a.get('payment_type', 'inbound')}) بمبلغ {a.get('amount', '')}"
+            + f" للطرف {a.get('partner_id', '')}",
+        },
+        entity_type="payment",
+        supported_args=("partner_id", "amount", "payment_type", "journal_id", "date", "ref"),
     ),
 }
 

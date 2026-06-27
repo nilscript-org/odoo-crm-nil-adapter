@@ -261,5 +261,56 @@ def test_semantic_confirm_order_invokes_action_confirm() -> None:
 
 def test_semantic_verbs_advertised_in_describe() -> None:
     verbs = _client(FakeSystem()).get("/nil/v0.1/describe").json()["verbs"]
-    for v in ("account.create_invoice", "stock.validate_picking", "sale.confirm_order"):
+    for v in ("account.create_invoice", "stock.validate_picking", "sale.confirm_order",
+              "account.post_invoice", "account.register_payment"):
         assert v in verbs
+
+
+def _rb(client: TestClient, token: str) -> dict:
+    return client.post("/nil/v0.1/rollback", json={"nil": "0.1", "grant": "g", "workspace": "w",
+                       "body": {"compensation_token": token}}).json()["body"]
+
+
+def test_post_invoice_is_compensable_and_rolls_back_to_draft() -> None:
+    sys = FakeSystem()
+    sys.docs["account.move"] = [{"id": 1, "name": "INV/1", "state": "draft"}]
+    client = _client(sys)
+    body = _propose(client, "account.post_invoice", {"invoice_id": 1})
+    assert body["outcome"] == "proposal" and body["tier"] == "HIGH", body
+    status = _commit(client, body["id"])
+    assert ("account.move", "1", "action_post", {}) in sys.method_calls
+    comp = status["result"]["compensation"]
+    assert comp["reversibility"] == "COMPENSABLE", comp
+    rb = _rb(client, comp["token"])
+    assert rb["resolved"]["method"] == "button_draft", rb
+    _commit(client, rb["id"])
+    assert ("account.move", "1", "button_draft", {}) in sys.method_calls  # un-posted
+
+
+def test_register_payment_creates_account_payment() -> None:
+    sys = FakeSystem()
+    client = _client(sys)
+    body = _propose(client, "account.register_payment", {"partner_id": 7, "amount": 500})
+    assert body["outcome"] == "proposal" and body["tier"] == "HIGH", body
+    assert _commit(client, body["id"])["state"] == "executed"
+    pay = sys.docs.get("account.payment", [])
+    assert pay and pay[0]["payment_type"] == "inbound" and pay[0]["partner_type"] == "customer"
+
+
+def test_env_grants_persist_and_enable_a_tenant() -> None:
+    import os
+    governance.reset_policy()
+    assert governance.write_tier("account.move", "create", tenant="ws_acme") is None  # before
+    os.environ["NIL_TENANT_GRANTS"] = (
+        '{"ws_acme":{"writes":[{"model":"account.move","op":"create","tier":"HIGH"}],'
+        '"methods":[{"model":"account.move","method":"action_post","tier":"HIGH","reverse":"button_draft"}]}}'
+    )
+    try:
+        applied = governance.load_grants_from_env()
+        assert applied == 2
+        assert governance.write_tier("account.move", "create", tenant="ws_acme") == "HIGH"
+        assert governance.method_reverse("account.move", "action_post", tenant="ws_acme") == "button_draft"
+        assert governance.write_tier("account.move", "create", tenant="ws_other") is None  # isolated
+    finally:
+        del os.environ["NIL_TENANT_GRANTS"]
+        governance.reset_policy()

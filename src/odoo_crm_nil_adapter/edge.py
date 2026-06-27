@@ -192,6 +192,14 @@ def _resolve_option(options: list[dict[str, Any]], value: Any) -> Any:
     return hits[0]
 
 
+def _is_x2many_commands(value: Any) -> bool:
+    """True for an Odoo x2many write payload — a list of command tuples like [(0, 0, {...})] / (6, 0,
+    [ids]). These are NOT scalar references and must NOT be run through reference/option resolution
+    (doing so treats '(0, 0, {...})' as a name to look up → spurious refusal / 500). Lines are passed
+    through to the backend verbatim."""
+    return isinstance(value, (list, tuple)) and any(isinstance(el, (list, tuple)) for el in value)
+
+
 def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) -> dict[str, Any]:
     """Schema-driven resolution of every written field to the value the backend actually accepts —
     a selection value → its stored key (B), a many2one value → the referenced record id (C). Driven
@@ -202,7 +210,7 @@ def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) 
     meta_by_field = {f.get("name"): f for f in (client.schema(doctype) or [])}
     resolved = dict(native)
     for field, value in native.items():
-        if value in (None, ""):
+        if value in (None, "") or _is_x2many_commands(value):  # lines pass through verbatim
             continue
         meta = meta_by_field.get(field) or {}
         # D (multi-value): a list/tuple value resolves element-by-element — many2many/tag fields
@@ -333,7 +341,7 @@ def _choice_gate(client: SystemClient, doctype: str, native: dict[str, Any],
     agent; the kernel/adapter only guarantees the chosen value is real. Mirrors _resolve_writes."""
     meta_by_field = {f.get("name"): f for f in (client.schema(doctype) or [])}
     for field, value in native.items():
-        if value in (None, ""):
+        if value in (None, "") or _is_x2many_commands(value):  # x2many lines aren't scalar references
             continue
         meta = meta_by_field.get(field) or {}
         for v in (value if isinstance(value, (list, tuple)) else [value]):
@@ -389,6 +397,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
     app = FastAPI(title="odoo-crm-nil-adapter shim", version="0.1.0")
     state = ShimState()
     apply_transport_quirks(client)  # manifest-driven: e.g. drop Expect: 100-continue (plan §4.4)
+    governance.load_grants_from_env()  # persist per-tenant grants from config (onboarding), not runtime
 
     def _auth(authorization: str | None) -> None:
         if bearer is None:  # permissive dev wiring behind a trusted gateway
@@ -698,6 +707,11 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 else:  # any granted workflow method (action_post / button_validate / action_confirm / …)
                     client.call_method(verb.doctype, record_id, verb.method or "", {})
                 created = {"name": record_id}
+                # A method verb that declares an inverse is COMPENSABLE: mint a reversal that ROLLBACK
+                # runs (reuses the generic resource.method reversal path), e.g. post_invoice→button_draft.
+                if verb.reverse_method:
+                    comp_override = {"resource_method": True, "target": verb.doctype, "id": record_id,
+                                     "method": verb.reverse_method, "tier": verb.tier}
             else:  # op == "create"
                 created = client.create(verb.doctype, native)  # the real write
         except (SystemError, NotImplementedError) as exc:

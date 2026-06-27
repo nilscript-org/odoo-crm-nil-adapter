@@ -21,6 +21,8 @@ editing this table (or a per-tenant grant), never loosening a hardcoded check el
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 
 from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
@@ -107,6 +109,31 @@ def set_enabled_modules(modules: set[str] | None) -> None:
     undiscoverable AND unwritable."""
     global _ENABLED_MODULES
     _ENABLED_MODULES = set(modules) if modules is not None else None
+
+
+def load_grants_from_env(var: str = "NIL_TENANT_GRANTS") -> int:
+    """Persist per-tenant grants from a config var (PERSISTENCE: survives restart, set by onboarding).
+    JSON shape:
+      {"ws_acme": {"writes":  [{"model":"account.move","op":"create","tier":"HIGH"}],
+                   "methods": [{"model":"account.move","method":"action_post","tier":"HIGH",
+                                "reverse":"button_draft"}]}}
+    Returns the count of grants applied (0 if the var is unset/malformed — fail-safe, never raises)."""
+    raw = os.environ.get(var)
+    if not raw:
+        return 0
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return 0
+    n = 0
+    for tenant, spec in (data or {}).items():
+        for w in spec.get("writes", []):
+            grant_write(tenant, w["model"], w["op"], w.get("tier", "MEDIUM"))
+            n += 1
+        for m in spec.get("methods", []):
+            grant_method(tenant, m["model"], m["method"], m.get("tier", "MEDIUM"), reverse=m.get("reverse"))
+            n += 1
+    return n
 
 
 # ── resolution ─────────────────────────────────────────────────────────────────────────────────────
