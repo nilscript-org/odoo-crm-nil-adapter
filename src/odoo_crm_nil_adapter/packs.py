@@ -18,6 +18,9 @@ class ModulePack:
     query_verbs: tuple = ()   # tuple[QueryVerb, ...] — same
     projections: dict = field(default_factory=dict)
     sensitive: dict = field(default_factory=dict)
+    # Per-model tier overrides: {(model, op): tier}. When set, overrides the default _CRUD_TIERS
+    # for specific (model, op) combos in this pack — e.g. purchase.order create is HIGH not MEDIUM.
+    write_tier_overrides: dict = field(default_factory=dict)
 
 
 def _make_crm_pack() -> ModulePack:
@@ -112,6 +115,28 @@ def _make_inventory_pack() -> ModulePack:
     )
 
 
+def _make_purchasing_pack() -> ModulePack:
+    from odoo_crm_nil_adapter.translate import PURCHASE_CREATE_ORDER, PURCHASE_CONFIRM_ORDER  # noqa: PLC0415
+    return ModulePack(
+        name="purchasing",
+        model_prefixes=("purchase.", "uom."),
+        write_targets=("purchase.order",),
+        method_grants=(("purchase.order", "button_confirm", "HIGH", "button_cancel"),),
+        write_verbs=(PURCHASE_CREATE_ORDER, PURCHASE_CONFIRM_ORDER),
+        query_verbs=(),
+        projections={
+            "purchase.order": ("id", "name", "partner_id", "date_order", "date_planned",
+                               "state", "origin", "currency_id", "amount_total"),
+            "purchase.order.line": ("id", "name", "order_id", "product_id", "product_qty",
+                                    "product_uom", "price_unit", "date_planned"),
+            "product.product": ("id", "default_code", "name", "barcode", "uom_id",
+                                "uom_po_id", "list_price", "standard_price"),
+            "stock.quant": ("id", "product_id", "location_id", "quantity"),
+        },
+        sensitive={},
+    )
+
+
 # PACKS is populated lazily on first access to avoid import-time circular dependency.
 # translate.py defines verb constants, then at the bottom calls _init_packs() which populates
 # this module's PACKS tuple.
@@ -129,6 +154,7 @@ def _init_packs() -> None:
         _make_finance_pack(),
         _make_sales_pack(),
         _make_inventory_pack(),
+        _make_purchasing_pack(),
     )
     _packs_initialized = True
 
@@ -159,6 +185,14 @@ def all_write_targets() -> frozenset:
     for p in enabled_packs():
         targets.update(p.write_targets)
     return frozenset(targets)
+
+
+def all_write_tier_overrides() -> dict:
+    """Merged per-(model,op) tier overrides from all enabled packs."""
+    out: dict = {}
+    for p in enabled_packs():
+        out.update(p.write_tier_overrides)
+    return out
 
 
 def module_models() -> dict[str, tuple[str, ...]]:

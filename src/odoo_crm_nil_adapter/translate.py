@@ -380,6 +380,50 @@ CRM_LIST_COUNTRIES = QueryVerb(verb="crm.list_countries", run=_run_list_countrie
 CRM_GET_CONTACT_BY_PHONE = QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone)
 
 
+# ── purchasing verb constants ────────────────────────────────────────────────────────────────────
+def _to_native_create_purchase_order(args: dict[str, Any]) -> dict[str, Any]:
+    doc: dict[str, Any] = {}
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("date_order"):
+        doc["date_order"] = args["date_order"]
+    if args.get("origin"):
+        doc["origin"] = args["origin"]
+    lines = args.get("lines") or []
+    if lines:
+        doc["order_line"] = [
+            (0, 0, {
+                "product_id": _maybe_int(ln.get("product_id")),
+                "product_qty": _maybe_float(ln.get("product_qty", 1)),
+                "product_uom": _maybe_int(ln.get("product_uom", 1)),
+                "price_unit": _maybe_float(ln.get("price_unit", 0)),
+                **({"taxes_id": [(6, 0, ln["taxes_id"])]} if ln.get("taxes_id") else {}),
+                **({"date_planned": ln["date_planned"]} if ln.get("date_planned") else {}),
+            })
+            for ln in lines if isinstance(ln, dict)
+        ]
+    return doc
+
+
+PURCHASE_CREATE_ORDER = WriteVerb(
+    verb="purchase.create_order", tier="MEDIUM", doctype="purchase.order", op="create",
+    required=("partner_id",), to_native=_to_native_create_purchase_order,
+    preview=lambda a: {
+        "en": f"Create purchase order for partner {a.get('partner_id', '')}",
+        "ar": f"إنشاء أمر شراء للمورد {a.get('partner_id', '')}",
+    }, entity_type="purchase_order",
+    supported_args=("partner_id", "date_order", "origin", "lines"),
+)
+PURCHASE_CONFIRM_ORDER = WriteVerb(
+    verb="purchase.confirm_order", tier="HIGH", doctype="purchase.order", op="method",
+    method="button_confirm", reverse_method="button_cancel", required=("order_id",),
+    to_native=_to_native_method_only,
+    preview=lambda a: {
+        "en": f"Confirm purchase order {a.get('order_id', '')}",
+        "ar": f"تأكيد أمر الشراء {a.get('order_id', '')}",
+    }, entity_type="purchase_order",
+)
+
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
 # These delegate to the shared `ReadPlane` (projection + byte-cap-refuse + capability fallback + read
 # authz + export/bulk gating). The edge dispatches them through QUERY_VERBS like any read verb; engine
