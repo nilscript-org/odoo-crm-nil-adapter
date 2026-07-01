@@ -23,24 +23,10 @@ class ModulePack:
 def _make_crm_pack() -> ModulePack:
     """Build the CRM pack after translate.py verb constants are defined (avoids circular import)."""
     from odoo_crm_nil_adapter.translate import (  # noqa: PLC0415
-        WRITE_VERBS as _WV,
-        QUERY_VERBS as _QV,
-    )
-    # Pull verb objects from the pre-packs literal dicts built in translate.py.
-    # These exist at the module level BEFORE the bottom-of-file aggregation runs.
-    write_verbs = tuple(
-        v for k, v in _WV.items()
-        if k in (
-            "crm.create_lead", "crm.create_contact", "crm.update_contact", "crm.log_note",
-            "crm.update_lead_stage", "crm.delete_lead", "crm.delete_contact",
-        )
-    )
-    query_verbs = tuple(
-        v for k, v in _QV.items()
-        if k in (
-            "crm.list_leads", "crm.list_contacts", "crm.list_stages",
-            "crm.list_countries", "crm.get_contact_by_phone",
-        )
+        CRM_CREATE_LEAD, CRM_CREATE_CONTACT, CRM_UPDATE_CONTACT, CRM_LOG_NOTE,
+        CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
+        CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
+        CRM_GET_CONTACT_BY_PHONE,
     )
     return ModulePack(
         name="crm",
@@ -53,8 +39,14 @@ def _make_crm_pack() -> ModulePack:
             ("res.partner", "message_post", "MEDIUM", None),
             ("crm.lead", "message_post", "MEDIUM", None),
         ),
-        write_verbs=write_verbs,
-        query_verbs=query_verbs,
+        write_verbs=(
+            CRM_CREATE_LEAD, CRM_CREATE_CONTACT, CRM_UPDATE_CONTACT, CRM_LOG_NOTE,
+            CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
+        ),
+        query_verbs=(
+            CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
+            CRM_GET_CONTACT_BY_PHONE,
+        ),
         projections={
             "res.partner": ("id", "name", "phone", "email"),
             "crm.lead": ("id", "name", "contact_name", "email_from", "phone", "stage_id", "expected_revenue"),
@@ -67,17 +59,15 @@ def _make_crm_pack() -> ModulePack:
 
 
 def _make_finance_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import WRITE_VERBS as _WV  # noqa: PLC0415
-    write_verbs = tuple(
-        v for k, v in _WV.items()
-        if k in ("account.create_invoice", "account.post_invoice", "account.register_payment")
+    from odoo_crm_nil_adapter.translate import (  # noqa: PLC0415
+        ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT,
     )
     return ModulePack(
         name="finance",
         model_prefixes=("account.",),
         write_targets=(),  # finance writes stay grant-only — not in default skeleton
         method_grants=(),
-        write_verbs=write_verbs,
+        write_verbs=(ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT),
         query_verbs=(),
         projections={
             "account.move": ("id", "name", "ref", "state", "move_type", "partner_id", "invoice_date",
@@ -95,14 +85,13 @@ def _make_finance_pack() -> ModulePack:
 
 
 def _make_sales_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import WRITE_VERBS as _WV  # noqa: PLC0415
-    write_verbs = tuple(v for k, v in _WV.items() if k == "sale.confirm_order")
+    from odoo_crm_nil_adapter.translate import SALE_CONFIRM_ORDER  # noqa: PLC0415
     return ModulePack(
         name="sales",
         model_prefixes=("sale.",),
         write_targets=(),
         method_grants=(),
-        write_verbs=write_verbs,
+        write_verbs=(SALE_CONFIRM_ORDER,),
         query_verbs=(),
         projections={},
         sensitive={},
@@ -110,14 +99,13 @@ def _make_sales_pack() -> ModulePack:
 
 
 def _make_inventory_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import WRITE_VERBS as _WV  # noqa: PLC0415
-    write_verbs = tuple(v for k, v in _WV.items() if k == "stock.validate_picking")
+    from odoo_crm_nil_adapter.translate import STOCK_VALIDATE_PICKING  # noqa: PLC0415
     return ModulePack(
         name="inventory",
         model_prefixes=("stock.", "product."),
         write_targets=(),
         method_grants=(),
-        write_verbs=write_verbs,
+        write_verbs=(STOCK_VALIDATE_PICKING,),
         query_verbs=(),
         projections={},
         sensitive={},

@@ -217,3 +217,16 @@ def build_read_plane(client: SystemClient) -> ReadPlane:
     """Wire a ReadPlane over Odoo with an export store (PII-at-rest, tenant-scoped, TTL'd)."""
     export_dir = Path(os.environ.get("NIL_EXPORT_DIR", "/tmp/nil-exports"))
     return ReadPlane(OdooReadBackend(client), export_store=ExportStore(root=export_dir))
+
+
+# Derive projections and sensitivity from pack registry — overrides the hardcoded tables above.
+# This import is safe here: translate.py imports read_plane mid-file (before verb constants),
+# packs.py imports verb CONSTANTS from translate (defined before this import runs in translate),
+# so the load order is: translate (partial) → read_plane → packs → back to translate bottom.
+try:
+    from odoo_crm_nil_adapter import packs as _packs_rp  # noqa: PLC0415
+    _packs_rp._init_packs()
+    _TARGET_FIELDS = _packs_rp.all_projections()
+    _SENSITIVE = _packs_rp.all_sensitive()
+except (ImportError, AttributeError):
+    pass  # bootstrapping fallback — hardcoded tables above remain active

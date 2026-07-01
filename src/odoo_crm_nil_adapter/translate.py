@@ -261,123 +261,123 @@ def _safe_search(client: SystemClient, domain: list[list[Any]]) -> list[dict[str
 
 # ── write verb constants (referenced by packs.py; aggregated into WRITE_VERBS at module bottom) ──
 CRM_CREATE_LEAD = WriteVerb(
-    verb=”crm.create_lead”, tier=”MEDIUM”, doctype=”crm.lead”, op=”create”,
-    required=(“name”,), to_native=_to_native_create_lead,
+    verb="crm.create_lead", tier="MEDIUM", doctype="crm.lead", op="create",
+    required=("name",), to_native=_to_native_create_lead,
     preview=lambda a: {
-        “en”: f”Create CRM opportunity “{a.get('name', '')}””
-        + (f” for {a['contact_name']}” if a.get(“contact_name”) else “”),
-        “ar”: f”إنشاء فرصة بيعية «{a.get('name', '')}»”
-        + (f” للعميل {a['contact_name']}” if a.get(“contact_name”) else “”),
-    }, entity_type=”lead”,
+        "en": f'Create CRM opportunity “{a.get("name", "")}”'
+        + (f' for {a["contact_name"]}' if a.get("contact_name") else ""),
+        "ar": f'إنشاء فرصة بيعية «{a.get("name", "")}»'
+        + (f' للعميل {a["contact_name"]}' if a.get("contact_name") else ""),
+    }, entity_type="lead",
 )
 CRM_CREATE_CONTACT = WriteVerb(
-    verb=”crm.create_contact”, tier=”MEDIUM”, doctype=”res.partner”, op=”upsert”,
-    required=(“name”,), to_native=_to_native_create_contact,
+    verb="crm.create_contact", tier="MEDIUM", doctype="res.partner", op="upsert",
+    required=("name",), to_native=_to_native_create_contact,
     preview=lambda a: {
-        “en”: f”Create or update contact “{a.get('name', '')}””
-        + (f” <{a['email']}>” if a.get(“email”) else “”),
-        “ar”: f”إنشاء أو تحديث جهة اتصال «{a.get('name', '')}»”
-        + (f” <{a['email']}>” if a.get(“email”) else “”),
-    }, entity_type=”contact”, dedup_keys=(“email”, “phone”),
+        "en": f'Create or update contact “{a.get("name", "")}”'
+        + (f' <{a["email"]}>' if a.get("email") else ""),
+        "ar": f'إنشاء أو تحديث جهة اتصال «{a.get("name", "")}»'
+        + (f' <{a["email"]}>' if a.get("email") else ""),
+    }, entity_type="contact", dedup_keys=("email", "phone"),
 )
 CRM_UPDATE_CONTACT = WriteVerb(
-    verb=”crm.update_contact”, tier=”MEDIUM”, doctype=”res.partner”, op=”update”,
-    required=(“contact_id”,), to_native=_to_native_update_contact,
+    verb="crm.update_contact", tier="MEDIUM", doctype="res.partner", op="update",
+    required=("contact_id",), to_native=_to_native_update_contact,
     preview=lambda a: {
-        “en”: f”Update contact {a.get('contact_id', '')}”
-        + (f” → {a['email']}” if a.get(“email”) else “”),
-        “ar”: f”تحديث جهة الاتصال {a.get('contact_id', '')}”
-        + (f” ← {a['email']}” if a.get(“email”) else “”),
-    }, entity_type=”contact”,
-    supported_args=(“contact_id”, “name”, “phone”, “email”, “comment”, “company”, “country”),
-    references=((“country”, “country_id”, “res.country”),),
+        "en": f"Update contact {a.get('contact_id', '')}"
+        + (f" → {a['email']}" if a.get("email") else ""),
+        "ar": f"تحديث جهة الاتصال {a.get('contact_id', '')}"
+        + (f" ← {a['email']}" if a.get("email") else ""),
+    }, entity_type="contact",
+    supported_args=("contact_id", "name", "phone", "email", "comment", "company", "country"),
+    references=(("country", "country_id", "res.country"),),
 )
 CRM_LOG_NOTE = WriteVerb(
-    verb=”crm.log_note”, tier=”MEDIUM”, doctype=”res.partner”, op=”method”,
-    method=”message_post”, required=(“contact_id”, “body”), to_native=_to_native_log_note,
+    verb="crm.log_note", tier="MEDIUM", doctype="res.partner", op="method",
+    method="message_post", required=("contact_id", "body"), to_native=_to_native_log_note,
     preview=lambda a: {
-        “en”: f”Log a note on contact {a.get('contact_id', '')}: “{a.get('body', '')}””,
-        “ar”: f”تسجيل ملاحظة على جهة الاتصال {a.get('contact_id', '')}: «{a.get('body', '')}»”,
-    }, entity_type=”contact”,
+        "en": f'Log a note on contact {a.get("contact_id", "")}: "{a.get("body", "")}"',
+        "ar": f'تسجيل ملاحظة على جهة الاتصال {a.get("contact_id", "")}: «{a.get("body", "")}»',
+    }, entity_type="contact",
 )
 CRM_UPDATE_LEAD_STAGE = WriteVerb(
-    verb=”crm.update_lead_stage”, tier=”MEDIUM”, doctype=”crm.lead”, op=”update”,
-    required=(“lead_id”, “stage_id”), to_native=_to_native_update_lead_stage,
+    verb="crm.update_lead_stage", tier="MEDIUM", doctype="crm.lead", op="update",
+    required=("lead_id", "stage_id"), to_native=_to_native_update_lead_stage,
     preview=lambda a: {
-        “en”: f”Move lead {a.get('lead_id', '')} to stage {a.get('stage_id', '')}”,
-        “ar”: f”نقل الفرصة {a.get('lead_id', '')} إلى المرحلة {a.get('stage_id', '')}”,
-    }, entity_type=”lead”,
+        "en": f"Move lead {a.get('lead_id', '')} to stage {a.get('stage_id', '')}",
+        "ar": f"نقل الفرصة {a.get('lead_id', '')} إلى المرحلة {a.get('stage_id', '')}",
+    }, entity_type="lead",
 )
 CRM_DELETE_LEAD = WriteVerb(
-    verb=”crm.delete_lead”, tier=”HIGH”, doctype=”crm.lead”, op=”delete”,
-    required=(“lead_id”,), to_native=_to_native_delete,
+    verb="crm.delete_lead", tier="HIGH", doctype="crm.lead", op="delete",
+    required=("lead_id",), to_native=_to_native_delete,
     preview=lambda a: {
-        “en”: f”Delete CRM lead {a.get('lead_id', '')}”,
-        “ar”: f”حذف الفرصة البيعية {a.get('lead_id', '')}”,
-    }, entity_type=”lead”,
+        "en": f"Delete CRM lead {a.get('lead_id', '')}",
+        "ar": f"حذف الفرصة البيعية {a.get('lead_id', '')}",
+    }, entity_type="lead",
 )
 CRM_DELETE_CONTACT = WriteVerb(
-    verb=”crm.delete_contact”, tier=”HIGH”, doctype=”res.partner”, op=”delete”,
-    required=(“contact_id”,), to_native=_to_native_delete,
+    verb="crm.delete_contact", tier="HIGH", doctype="res.partner", op="delete",
+    required=("contact_id",), to_native=_to_native_delete,
     preview=lambda a: {
-        “en”: f”Delete contact {a.get('contact_id', '')}”,
-        “ar”: f”حذف جهة الاتصال {a.get('contact_id', '')}”,
-    }, entity_type=”contact”,
+        "en": f"Delete contact {a.get('contact_id', '')}",
+        "ar": f"حذف جهة الاتصال {a.get('contact_id', '')}",
+    }, entity_type="contact",
 )
 # ── semantic verbs across module groups (Phase 6) ─────────────────────────────────────────────────
 ACCOUNT_CREATE_INVOICE = WriteVerb(
-    verb=”account.create_invoice”, tier=”HIGH”, doctype=”account.move”, op=”create”,
-    required=(“partner_id”,), to_native=_to_native_create_invoice,
+    verb="account.create_invoice", tier="HIGH", doctype="account.move", op="create",
+    required=("partner_id",), to_native=_to_native_create_invoice,
     preview=lambda a: {
-        “en”: f”Create a customer invoice for partner {a.get('partner_id', '')}”
-        + (f” ({len(a['lines'])} line(s))” if a.get(“lines”) else “”),
-        “ar”: f”إنشاء فاتورة عميل للعميل {a.get('partner_id', '')}”
-        + (f” ({len(a['lines'])} بند)” if a.get(“lines”) else “”),
-    }, entity_type=”invoice”, supported_args=(“partner_id”, “invoice_date”, “lines”),
+        "en": f"Create a customer invoice for partner {a.get('partner_id', '')}"
+        + (f" ({len(a['lines'])} line(s))" if a.get("lines") else ""),
+        "ar": f"إنشاء فاتورة عميل للعميل {a.get('partner_id', '')}"
+        + (f" ({len(a['lines'])} بند)" if a.get("lines") else ""),
+    }, entity_type="invoice", supported_args=("partner_id", "invoice_date", "lines"),
 )
 STOCK_VALIDATE_PICKING = WriteVerb(
-    verb=”stock.validate_picking”, tier=”HIGH”, doctype=”stock.picking”, op=”method”,
-    method=”button_validate”, required=(“picking_id”,), to_native=_to_native_method_only,
+    verb="stock.validate_picking", tier="HIGH", doctype="stock.picking", op="method",
+    method="button_validate", required=("picking_id",), to_native=_to_native_method_only,
     preview=lambda a: {
-        “en”: f”Validate stock transfer {a.get('picking_id', '')} (commit the moves)”,
-        “ar”: f”اعتماد إذن الصرف {a.get('picking_id', '')} (تثبيت الحركات)”,
-    }, entity_type=”picking”,
+        "en": f"Validate stock transfer {a.get('picking_id', '')} (commit the moves)",
+        "ar": f"اعتماد إذن الصرف {a.get('picking_id', '')} (تثبيت الحركات)",
+    }, entity_type="picking",
 )
 SALE_CONFIRM_ORDER = WriteVerb(
-    verb=”sale.confirm_order”, tier=”HIGH”, doctype=”sale.order”, op=”method”,
-    method=”action_confirm”, required=(“order_id”,), to_native=_to_native_method_only,
+    verb="sale.confirm_order", tier="HIGH", doctype="sale.order", op="method",
+    method="action_confirm", required=("order_id",), to_native=_to_native_method_only,
     preview=lambda a: {
-        “en”: f”Confirm sales order {a.get('order_id', '')}”,
-        “ar”: f”تأكيد أمر البيع {a.get('order_id', '')}”,
-    }, entity_type=”sale_order”,
+        "en": f"Confirm sales order {a.get('order_id', '')}",
+        "ar": f"تأكيد أمر البيع {a.get('order_id', '')}",
+    }, entity_type="sale_order",
 )
 ACCOUNT_POST_INVOICE = WriteVerb(
-    verb=”account.post_invoice”, tier=”HIGH”, doctype=”account.move”, op=”method”,
-    method=”action_post”, reverse_method=”button_draft”, required=(“invoice_id”,),
+    verb="account.post_invoice", tier="HIGH", doctype="account.move", op="method",
+    method="action_post", reverse_method="button_draft", required=("invoice_id",),
     to_native=_to_native_method_only,
     preview=lambda a: {
-        “en”: f”Post invoice {a.get('invoice_id', '')} (commit it to the books)”,
-        “ar”: f”ترحيل الفاتورة {a.get('invoice_id', '')} (تثبيتها في الدفاتر)”,
-    }, entity_type=”invoice”,
+        "en": f"Post invoice {a.get('invoice_id', '')} (commit it to the books)",
+        "ar": f"ترحيل الفاتورة {a.get('invoice_id', '')} (تثبيتها في الدفاتر)",
+    }, entity_type="invoice",
 )
 ACCOUNT_REGISTER_PAYMENT = WriteVerb(
-    verb=”account.register_payment”, tier=”HIGH”, doctype=”account.payment”, op=”create”,
-    required=(“partner_id”, “amount”), to_native=_to_native_register_payment,
+    verb="account.register_payment", tier="HIGH", doctype="account.payment", op="create",
+    required=("partner_id", "amount"), to_native=_to_native_register_payment,
     preview=lambda a: {
-        “en”: f”Register a {a.get('payment_type', 'inbound')} payment of {a.get('amount', '')}”
-        + f” for partner {a.get('partner_id', '')}”,
-        “ar”: f”تسجيل دفعة ({a.get('payment_type', 'inbound')}) بمبلغ {a.get('amount', '')}”
-        + f” للطرف {a.get('partner_id', '')}”,
-    }, entity_type=”payment”,
-    supported_args=(“partner_id”, “amount”, “payment_type”, “journal_id”, “date”, “ref”),
+        "en": f"Register a {a.get('payment_type', 'inbound')} payment of {a.get('amount', '')}"
+        + f" for partner {a.get('partner_id', '')}",
+        "ar": f"تسجيل دفعة ({a.get('payment_type', 'inbound')}) بمبلغ {a.get('amount', '')}"
+        + f" للطرف {a.get('partner_id', '')}",
+    }, entity_type="payment",
+    supported_args=("partner_id", "amount", "payment_type", "journal_id", "date", "ref"),
 )
 
 # ── crm.* query verb constants ────────────────────────────────────────────────────────────────────
-CRM_LIST_LEADS = QueryVerb(verb=”crm.list_leads”, run=_run_list_leads)
-CRM_LIST_CONTACTS = QueryVerb(verb=”crm.list_contacts”, run=_run_list_contacts)
-CRM_LIST_STAGES = QueryVerb(verb=”crm.list_stages”, run=_run_list_stages)
-CRM_LIST_COUNTRIES = QueryVerb(verb=”crm.list_countries”, run=_run_list_countries)
-CRM_GET_CONTACT_BY_PHONE = QueryVerb(verb=”crm.get_contact_by_phone”, run=_run_get_contact_by_phone)
+CRM_LIST_LEADS = QueryVerb(verb="crm.list_leads", run=_run_list_leads)
+CRM_LIST_CONTACTS = QueryVerb(verb="crm.list_contacts", run=_run_list_contacts)
+CRM_LIST_STAGES = QueryVerb(verb="crm.list_stages", run=_run_list_stages)
+CRM_LIST_COUNTRIES = QueryVerb(verb="crm.list_countries", run=_run_list_countries)
+CRM_GET_CONTACT_BY_PHONE = QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone)
 
 
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
