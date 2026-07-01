@@ -594,14 +594,30 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
     return {"outcome": "result", "value": outcome.value}
 
 
-QUERY_VERBS.update({
+_NIL_QUERY_VERBS: dict[str, QueryVerb] = {
     "nil.intent": QueryVerb(verb="nil.intent", run=_run_nil_intent),
     "nil.search": QueryVerb(verb="nil.search", run=_run_nil_search),
     "nil.count": QueryVerb(verb="nil.count", run=_run_nil_count),
     "nil.get": QueryVerb(verb="nil.get", run=_run_nil_get),
     "nil.aggregate": QueryVerb(verb="nil.aggregate", run=_run_nil_aggregate),
     "nil.export": QueryVerb(verb="nil.export", run=_run_nil_export),
-})
+}
+QUERY_VERBS.update(_NIL_QUERY_VERBS)
+
+# ── pack registry initialisation (must run after all verb constants are defined) ─────────────────
+# packs.py imports WriteVerb/QueryVerb + reads WRITE_VERBS/QUERY_VERBS at _init_packs() call time.
+# Governance is NOT imported here — governance imports DECLARED_TARGETS from this module, so
+# importing it here would cycle. The pack aggregators (all_write_verbs etc.) import governance
+# lazily and are only called AFTER this module finishes loading.
+from odoo_crm_nil_adapter import packs as _packs_mod  # noqa: E402
+_packs_mod._init_packs()
+
+# Reassign the public API to pack-aggregated values (behavior-preserving: all packs enabled by default,
+# so the aggregate equals the former literal set). DECLARED_TARGETS stays a frozenset; governance.py
+# imports it at its own load time (after translate finishes) so no cycle occurs here.
+DECLARED_TARGETS = _packs_mod.all_write_targets()
+WRITE_VERBS = {**_packs_mod.all_write_verbs()}
+QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:
