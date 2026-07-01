@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from odoo_crm_nil_adapter.system import SystemClient, SystemError
+from odoo_nil_adapter.system import SystemClient, SystemError
 
 Bilingual = dict[str, str]
 
@@ -441,7 +441,7 @@ from nilscript.dataplane import (  # noqa: E402
     ResultTooLarge,
 )
 
-from odoo_crm_nil_adapter.read_plane import build_read_plane  # noqa: E402
+from odoo_nil_adapter.read_plane import build_read_plane  # noqa: E402
 
 import weakref  # noqa: E402
 
@@ -565,7 +565,7 @@ _NIL_QUERY_VERBS: dict[str, QueryVerb] = {
 # Governance is NOT imported here — governance imports DECLARED_TARGETS from this module, so
 # importing it here would cycle. The pack aggregators (all_write_verbs etc.) import governance
 # lazily and are only called AFTER this module finishes loading.
-from odoo_crm_nil_adapter import packs as _packs_mod  # noqa: E402
+from odoo_nil_adapter import packs as _packs_mod  # noqa: E402
 _packs_mod._init_packs()
 
 # Reassign the public API to pack-aggregated values (behavior-preserving: all packs enabled by default,

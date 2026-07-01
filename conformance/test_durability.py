@@ -9,7 +9,7 @@ import xmlrpc.client
 
 import pytest
 
-from odoo_crm_nil_adapter.system import RealSystemClient, SystemError
+from odoo_nil_adapter.system import RealSystemClient, SystemError
 
 
 class _FlakyProxy:

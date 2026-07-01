@@ -7,8 +7,8 @@ the domain shape FakeSystem interprets here is the exact `search_read` domain Re
 
 from __future__ import annotations
 
-from odoo_crm_nil_adapter.system import FakeSystem, SystemError
-from odoo_crm_nil_adapter.translate import _run_get_contact_by_phone
+from odoo_nil_adapter.system import FakeSystem, SystemError
+from odoo_nil_adapter.translate import _run_get_contact_by_phone
 
 
 class _PickyFake(FakeSystem):

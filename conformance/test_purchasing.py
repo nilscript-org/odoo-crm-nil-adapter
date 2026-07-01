@@ -1,5 +1,5 @@
 # conformance/test_purchasing.py
-from odoo_crm_nil_adapter import packs, translate, governance
+from odoo_nil_adapter import packs, translate, governance
 
 
 def test_purchase_create_order_shapes_x2many_order_line():

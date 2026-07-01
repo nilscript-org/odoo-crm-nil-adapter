@@ -70,7 +70,7 @@ class MethodGrant:
 # (translate.py late-imports packs at its bottom; packs.py imports verb constants from translate;
 # governance must NOT import DECLARED_TARGETS at module level or the cycle breaks.)
 def _get_declared_targets() -> frozenset[str]:
-    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS  # lazy
+    from odoo_nil_adapter.translate import DECLARED_TARGETS  # lazy
     return DECLARED_TARGETS
 
 
@@ -80,7 +80,7 @@ def _get_default_write() -> dict[tuple[str, str], str]:
 
 def _get_default_method() -> dict[tuple[str, str], MethodGrant]:
     """Default method allow-list (default-deny). Derived from enabled pack method_grants."""
-    from odoo_crm_nil_adapter import packs as _p  # noqa: PLC0415
+    from odoo_nil_adapter import packs as _p  # noqa: PLC0415
     return _p.default_methods()
 
 # ── mutable policy state (per-tenant grants + operator module scope) ──────────────────────────────
@@ -145,7 +145,7 @@ def module_enabled(target: str) -> bool:
     """Is this model within the operator-enabled module scope? True when no scope is set."""
     if _ENABLED_MODULES is None:
         return True
-    from odoo_crm_nil_adapter import packs as _p  # noqa: PLC0415
+    from odoo_nil_adapter import packs as _p  # noqa: PLC0415
     live_models = {**_p.module_models(), **_MODULE_MODELS}
     for group in _ENABLED_MODULES:
         if any(target == p.rstrip(".") or target.startswith(p) for p in live_models.get(group, ())):

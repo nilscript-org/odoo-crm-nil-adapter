@@ -8,15 +8,15 @@
     export NIL_EVENTS_WEBHOOK=...          # optional: control-plane ingest URL for EVENTs
     export NIL_EVENTS_SECRET=...           # optional: HMAC secret for the webhook
 
-    uvicorn odoo_crm_nil_adapter.run_live:build_app --factory --host 0.0.0.0 --port 8099
+    uvicorn odoo_nil_adapter.run_live:build_app --factory --host 0.0.0.0 --port 8099
 """
 
 from __future__ import annotations
 
 import os
 
-from odoo_crm_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
-from odoo_crm_nil_adapter.system import RealSystemClient
+from odoo_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
+from odoo_nil_adapter.system import RealSystemClient
 
 
 def _require(name: str) -> str:

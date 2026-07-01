@@ -1,5 +1,5 @@
 # conformance/test_governance_packs.py
-from odoo_crm_nil_adapter import governance, packs
+from odoo_nil_adapter import governance, packs
 
 
 def test_write_tier_crm_lead():

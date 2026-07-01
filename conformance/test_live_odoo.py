@@ -17,8 +17,8 @@ import os
 import pytest
 from fastapi.testclient import TestClient
 
-from odoo_crm_nil_adapter.edge import CapturingEmitter, create_app
-from odoo_crm_nil_adapter.system import RealSystemClient
+from odoo_nil_adapter.edge import CapturingEmitter, create_app
+from odoo_nil_adapter.system import RealSystemClient
 
 _ENV = ("ODOO_URL", "ODOO_DB", "ODOO_LOGIN", "ODOO_API_KEY")
 _HAVE_CREDS = all(os.environ.get(k) for k in _ENV)

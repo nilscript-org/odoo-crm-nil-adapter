@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from odoo_crm_nil_adapter.edge import CapturingEmitter, create_app
-from odoo_crm_nil_adapter.system import FakeSystem
+from odoo_nil_adapter.edge import CapturingEmitter, create_app
+from odoo_nil_adapter.system import FakeSystem
 
 
 def _seeded() -> FakeSystem:

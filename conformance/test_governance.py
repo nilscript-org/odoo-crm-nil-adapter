@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from odoo_crm_nil_adapter import governance as g
+from odoo_nil_adapter import governance as g
 
 
 @pytest.fixture(autouse=True)

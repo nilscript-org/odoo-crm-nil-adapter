@@ -22,12 +22,12 @@ from nilscript.dataplane import (
     TargetSchema,
 )
 
-from odoo_crm_nil_adapter.system import SystemClient
+from odoo_nil_adapter.system import SystemClient
 
 # Curated lean projections per target — derived from pack projections at first access.
 # Keeps `_TARGET_FIELDS` as the public name so describe_target() and tests reference it normally.
 def _load_target_fields() -> dict[str, tuple[str, ...]]:
-    from odoo_crm_nil_adapter import packs  # noqa: PLC0415 (lazy: avoid import cycle with translate)
+    from odoo_nil_adapter import packs  # noqa: PLC0415 (lazy: avoid import cycle with translate)
     return packs.all_projections()
 
 
@@ -35,7 +35,7 @@ _TARGET_FIELDS: dict[str, tuple[str, ...]] = _load_target_fields()
 
 
 def _load_sensitive() -> dict[str, frozenset[str]]:
-    from odoo_crm_nil_adapter import packs  # noqa: PLC0415
+    from odoo_nil_adapter import packs  # noqa: PLC0415
     return packs.all_sensitive()
 
 
@@ -161,7 +161,7 @@ class OdooReadBackend:
         projection — so reads cover every Odoo module, not just CRM. A model the instance does not
         expose (empty/None schema) returns None → a clean refusal upstream, never a guess. A model
         outside the operator's enabled module scope is undiscoverable too (Phase 5)."""
-        from odoo_crm_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
+        from odoo_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
 
         if not governance.module_enabled(target):
             return None
@@ -224,7 +224,7 @@ def build_read_plane(client: SystemClient) -> ReadPlane:
 # packs.py imports verb CONSTANTS from translate (defined before this import runs in translate),
 # so the load order is: translate (partial) → read_plane → packs → back to translate bottom.
 try:
-    from odoo_crm_nil_adapter import packs as _packs_rp  # noqa: PLC0415
+    from odoo_nil_adapter import packs as _packs_rp  # noqa: PLC0415
     _packs_rp._init_packs()
     _TARGET_FIELDS = _packs_rp.all_projections()
     _SENSITIVE = _packs_rp.all_sensitive()

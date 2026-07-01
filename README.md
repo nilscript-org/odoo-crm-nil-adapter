@@ -1,4 +1,4 @@
-# odoo-crm-nil-adapter
+# odoo-nil-adapter
 
 **A NIL governed-action adapter for Odoo CRM.** It speaks the NIL contract (propose -> approve ->
 commit, skeleton-bounded, earned reversibility): an agent proposes intent, the deterministic kernel
@@ -54,7 +54,7 @@ environment.
 
 ```bash
 export $(grep -v '^#' .env | xargs)    # load .env
-uvicorn odoo_crm_nil_adapter.run_live:build_app --factory --host 0.0.0.0 --port 8099
+uvicorn odoo_nil_adapter.run_live:build_app --factory --host 0.0.0.0 --port 8099
 # discovery handshake:
 curl -s localhost:8099/nil/v0.1/describe | python -m json.tool
 ```

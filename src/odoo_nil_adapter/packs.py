@@ -25,7 +25,7 @@ class ModulePack:
 
 def _make_crm_pack() -> ModulePack:
     """Build the CRM pack after translate.py verb constants are defined (avoids circular import)."""
-    from odoo_crm_nil_adapter.translate import (  # noqa: PLC0415
+    from odoo_nil_adapter.translate import (  # noqa: PLC0415
         CRM_CREATE_LEAD, CRM_CREATE_CONTACT, CRM_UPDATE_CONTACT, CRM_LOG_NOTE,
         CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
         CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
@@ -62,7 +62,7 @@ def _make_crm_pack() -> ModulePack:
 
 
 def _make_finance_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import (  # noqa: PLC0415
+    from odoo_nil_adapter.translate import (  # noqa: PLC0415
         ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT,
     )
     return ModulePack(
@@ -88,7 +88,7 @@ def _make_finance_pack() -> ModulePack:
 
 
 def _make_sales_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import SALE_CONFIRM_ORDER  # noqa: PLC0415
+    from odoo_nil_adapter.translate import SALE_CONFIRM_ORDER  # noqa: PLC0415
     return ModulePack(
         name="sales",
         model_prefixes=("sale.",),
@@ -102,7 +102,7 @@ def _make_sales_pack() -> ModulePack:
 
 
 def _make_inventory_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import STOCK_VALIDATE_PICKING  # noqa: PLC0415
+    from odoo_nil_adapter.translate import STOCK_VALIDATE_PICKING  # noqa: PLC0415
     return ModulePack(
         name="inventory",
         model_prefixes=("stock.", "product."),
@@ -116,7 +116,7 @@ def _make_inventory_pack() -> ModulePack:
 
 
 def _make_purchasing_pack() -> ModulePack:
-    from odoo_crm_nil_adapter.translate import PURCHASE_CREATE_ORDER, PURCHASE_CONFIRM_ORDER  # noqa: PLC0415
+    from odoo_nil_adapter.translate import PURCHASE_CREATE_ORDER, PURCHASE_CONFIRM_ORDER  # noqa: PLC0415
     return ModulePack(
         name="purchasing",
         model_prefixes=("purchase.", "uom."),
@@ -160,7 +160,7 @@ def _init_packs() -> None:
 
 
 def enabled_packs() -> tuple[ModulePack, ...]:
-    from odoo_crm_nil_adapter import governance  # noqa: PLC0415
+    from odoo_nil_adapter import governance  # noqa: PLC0415
     return tuple(p for p in PACKS if governance.module_enabled(p.name))
 
 
@@ -202,7 +202,7 @@ def module_models() -> dict[str, tuple[str, ...]]:
 
 def default_methods() -> dict:
     """Build a {(model, method): MethodGrant} dict from enabled packs' method_grants."""
-    from odoo_crm_nil_adapter.governance import MethodGrant  # noqa: PLC0415
+    from odoo_nil_adapter.governance import MethodGrant  # noqa: PLC0415
     out: dict = {}
     for p in enabled_packs():
         for (model, method, tier, reverse) in p.method_grants:

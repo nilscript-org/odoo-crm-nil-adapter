@@ -18,12 +18,12 @@ from uuid import uuid4
 
 from fastapi import Body, FastAPI, Header, HTTPException, Response
 
-from odoo_crm_nil_adapter import governance
-from odoo_crm_nil_adapter.compensation import COMPENSATIONS, compensate
-from odoo_crm_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
-from odoo_crm_nil_adapter.state import ShimState
-from odoo_crm_nil_adapter.system import SystemClient, SystemError
-from odoo_crm_nil_adapter.translate import (
+from odoo_nil_adapter import governance
+from odoo_nil_adapter.compensation import COMPENSATIONS, compensate
+from odoo_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
+from odoo_nil_adapter.state import ShimState
+from odoo_nil_adapter.system import SystemClient, SystemError
+from odoo_nil_adapter.translate import (
     QUERY_VERBS,
     RESOURCE_VERBS,
     WRITE_VERBS,
@@ -394,7 +394,7 @@ def _label(row: dict[str, Any]) -> str:
 
 
 def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | None) -> FastAPI:
-    app = FastAPI(title="odoo-crm-nil-adapter shim", version="0.1.0")
+    app = FastAPI(title="odoo-nil-adapter shim", version="0.1.0")
     state = ShimState()
     apply_transport_quirks(client)  # manifest-driven: e.g. drop Expect: 100-continue (plan §4.4)
     governance.load_grants_from_env()  # persist per-tenant grants from config (onboarding), not runtime

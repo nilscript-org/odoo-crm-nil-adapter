@@ -1,5 +1,5 @@
 # conformance/test_packs.py
-from odoo_crm_nil_adapter import packs, translate
+from odoo_nil_adapter import packs, translate
 
 
 def test_registry_exposes_crm_pack():
@@ -24,13 +24,13 @@ def test_finance_and_inventory_packs_present():
 
 
 def test_governance_module_models_from_packs():
-    from odoo_crm_nil_adapter import governance
+    from odoo_nil_adapter import governance
     assert governance.model_class("account.move") == "financial"
     # inventory prefixes come from the pack
     assert governance.module_enabled("stock.picking") is True
 
 
 def test_read_projection_from_pack():
-    from odoo_crm_nil_adapter import read_plane
+    from odoo_nil_adapter import read_plane
     assert read_plane._TARGET_FIELDS["account.move"][0] == "id"
     assert "amount_total" in read_plane._TARGET_FIELDS["account.move"]

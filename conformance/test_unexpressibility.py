@@ -19,9 +19,9 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from odoo_crm_nil_adapter.edge import CapturingEmitter, create_app
-from odoo_crm_nil_adapter.system import FakeSystem
-from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
+from odoo_nil_adapter.edge import CapturingEmitter, create_app
+from odoo_nil_adapter.system import FakeSystem
+from odoo_nil_adapter.translate import DECLARED_TARGETS
 
 # ── Corpora (fixed, seedless — deterministic) ────────────────────────────────────────────────
 SYNTHETIC = [f"crm.zzx_{i:04d}" for i in range(50)]  # well-formed, undeclared verb names

@@ -10,10 +10,10 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from odoo_crm_nil_adapter.compensation import COMPENSATIONS
-from odoo_crm_nil_adapter.edge import CapturingEmitter, create_app
-from odoo_crm_nil_adapter.system import FakeSystem
-from odoo_crm_nil_adapter.translate import WRITE_VERBS
+from odoo_nil_adapter.compensation import COMPENSATIONS
+from odoo_nil_adapter.edge import CapturingEmitter, create_app
+from odoo_nil_adapter.system import FakeSystem
+from odoo_nil_adapter.translate import WRITE_VERBS
 
 
 def _env(verb: str, args: dict) -> dict:
@@ -476,7 +476,7 @@ def test_resource_update_refuses_unknown_selection_value_at_propose() -> None:
 def test_schema_extracts_selection_options_relation_and_readonly() -> None:
     # P1 — the resolver needs to know HOW to write each field. schema() must surface a selection's
     # option list (enum), a many2one's relation (comodel), and the readonly flag — from fields_get.
-    from odoo_crm_nil_adapter.system import RealSystemClient
+    from odoo_nil_adapter.system import RealSystemClient
 
     c = RealSystemClient("http://x", db="d", login="l", api_key="k")
     fake_fields_get = {
@@ -529,7 +529,7 @@ def test_propose_flags_unsupported_args_as_ignored() -> None:
 def test_resource_create_on_undeclared_target_is_refused_with_zero_effect() -> None:
     # The REAL attack surface: resource.* against a provisioned-but-UNDECLARED model. A CRM adapter
     # wired to a full Odoo must NOT let an agent reach accounting/HR — advertised ≡ committable.
-    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
+    from odoo_nil_adapter.translate import DECLARED_TARGETS
     assert "account.payment" not in DECLARED_TARGETS  # sanity: it is genuinely undeclared
     sys = FakeSystem()  # FakeSystem.exists() is True for ANY target — i.e. "fully provisioned"
     client = TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
@@ -563,7 +563,7 @@ def test_resource_read_on_undeclared_target_is_refused() -> None:
 
 def test_describe_advertises_committable_set_equals_declared() -> None:
     # advertised ≡ committable: describe targets are EXACTLY DECLARED_TARGETS, and resource.* is listed.
-    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
+    from odoo_nil_adapter.translate import DECLARED_TARGETS
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
 
     d = client.get("/nil/v0.1/describe").json()
