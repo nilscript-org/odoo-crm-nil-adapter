@@ -25,8 +25,6 @@ import json
 import os
 from dataclasses import dataclass
 
-from odoo_crm_nil_adapter.translate import DECLARED_TARGETS
-
 # ── model classification (drives sensitivity + destructive escalation) ────────────────────────────
 _CLASS_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("financial", ("account.",)),
@@ -68,16 +66,22 @@ class MethodGrant:
     reverse: str | None = None  # the inverse method (post→button_draft, confirm→action_cancel), or None
 
 
-# The shipped writable skeleton — generic resource.* CRUD on the CRM domain, as a tier table. Moving it
-# off a frozenset makes it widenable data and a single seam the method/scope policy shares.
-_DEFAULT_WRITE: dict[tuple[str, str], str] = {
-    (m, op): tier for m in DECLARED_TARGETS for op, tier in _CRUD_TIERS.items()
-}
-# Default method allow-list (default-deny). message_post (append a chatter note) is broadly safe.
-_DEFAULT_METHOD: dict[tuple[str, str], MethodGrant] = {
-    ("res.partner", "message_post"): MethodGrant("MEDIUM"),
-    ("crm.lead", "message_post"): MethodGrant("MEDIUM"),
-}
+# Lazy getters — computed on first call to avoid a circular import.
+# (translate.py late-imports packs at its bottom; packs.py imports verb constants from translate;
+# governance must NOT import DECLARED_TARGETS at module level or the cycle breaks.)
+def _get_declared_targets() -> frozenset[str]:
+    from odoo_crm_nil_adapter.translate import DECLARED_TARGETS  # lazy
+    return DECLARED_TARGETS
+
+
+def _get_default_write() -> dict[tuple[str, str], str]:
+    return {(m, op): tier for m in _get_declared_targets() for op, tier in _CRUD_TIERS.items()}
+
+
+def _get_default_method() -> dict[tuple[str, str], MethodGrant]:
+    """Default method allow-list (default-deny). Derived from enabled pack method_grants."""
+    from odoo_crm_nil_adapter import packs as _p  # noqa: PLC0415
+    return _p.default_methods()
 
 # ── mutable policy state (per-tenant grants + operator module scope) ──────────────────────────────
 # Thin seams for onboarding/SaaS — populated by the operator or a future provisioning call. Empty by
@@ -141,8 +145,10 @@ def module_enabled(target: str) -> bool:
     """Is this model within the operator-enabled module scope? True when no scope is set."""
     if _ENABLED_MODULES is None:
         return True
+    from odoo_crm_nil_adapter import packs as _p  # noqa: PLC0415
+    live_models = {**_p.module_models(), **_MODULE_MODELS}
     for group in _ENABLED_MODULES:
-        if any(target == p.rstrip(".") or target.startswith(p) for p in _MODULE_MODELS.get(group, ())):
+        if any(target == p.rstrip(".") or target.startswith(p) for p in live_models.get(group, ())):
             return True
     return False
 
@@ -160,14 +166,14 @@ def write_tier(target: str, op: str, *, tenant: str | None = None) -> str | None
     first, then the shipped skeleton; an out-of-scope model is denied even if granted."""
     if not module_enabled(target):
         return None
-    grant = (_TENANT_WRITE.get(tenant or "", {}).get((target, op))) or _DEFAULT_WRITE.get((target, op))
+    grant = (_TENANT_WRITE.get(tenant or "", {}).get((target, op))) or _get_default_write().get((target, op))
     if grant is None:
         return None
     return _escalate(target, op, grant)
 
 
 def _method_grant(target: str, method: str, tenant: str | None) -> MethodGrant | None:
-    return (_TENANT_METHOD.get(tenant or "", {}).get((target, method))) or _DEFAULT_METHOD.get((target, method))
+    return (_TENANT_METHOD.get(tenant or "", {}).get((target, method))) or _get_default_method().get((target, method))
 
 
 def method_tier(target: str, method: str, *, tenant: str | None = None) -> str | None:
@@ -189,9 +195,9 @@ def reads_allowed_raw(target: str) -> bool:
     """Legacy raw `resource.read` (whole-record list, NOT projected) stays bounded to the writable
     skeleton — universal reads flow through the projected, sensitivity-gated `nil.*` plane, so
     relaxing discovery never exposes a raw salary/VAT dump via the old list endpoint."""
-    return module_enabled(target) and target in DECLARED_TARGETS
+    return module_enabled(target) and target in _get_declared_targets()
 
 
 def writable_targets() -> list[str]:
     """The committable WRITE skeleton describe() advertises (in-scope granted models)."""
-    return sorted({m for (m, _op) in _DEFAULT_WRITE if module_enabled(m)})
+    return sorted({m for (m, _op) in _get_default_write() if module_enabled(m)})

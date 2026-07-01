@@ -24,30 +24,22 @@ from nilscript.dataplane import (
 
 from odoo_crm_nil_adapter.system import SystemClient
 
-# Curated lean projections per CRM target — what an agent actually needs, never the whole record.
-# (id is always retained by projection.) Widen deliberately as real flows need more fields.
-_TARGET_FIELDS: dict[str, tuple[str, ...]] = {
-    # Lean set guaranteed to exist on every res.partner (company_name/country_id are not universally
-    # present — a projection must never name a field the model lacks, or search_read 500s).
-    "res.partner": ("id", "name", "phone", "email"),
-    "crm.lead": ("id", "name", "contact_name", "email_from", "phone", "stage_id", "expected_revenue"),
-    "crm.stage": ("id", "name", "sequence"),
-    "crm.team": ("id", "name"),
-    "res.country": ("id", "name", "code"),
-    # Accounting (hand-tuned — better than the generic ranker for the highest-value finance models).
-    "account.move": ("id", "name", "ref", "state", "move_type", "partner_id", "invoice_date",
-                     "invoice_date_due", "amount_total", "amount_residual", "currency_id", "journal_id"),
-    "account.payment": ("id", "name", "state", "payment_type", "partner_id", "amount", "currency_id",
-                        "journal_id", "date", "ref"),
-    "account.move.line": ("id", "name", "move_id", "account_id", "partner_id", "debit", "credit",
-                          "balance", "date", "quantity", "price_unit"),
-    "account.journal": ("id", "name", "code", "type", "currency_id", "company_id"),
-    "account.account": ("id", "name", "code", "account_type", "reconcile", "currency_id"),
-    "account.tax": ("id", "name", "amount", "amount_type", "type_tax_use", "company_id"),
-}
-_SENSITIVE: dict[str, frozenset[str]] = {
-    "res.partner": frozenset({"credit_limit", "vat"}),
-}
+# Curated lean projections per target — derived from pack projections at first access.
+# Keeps `_TARGET_FIELDS` as the public name so describe_target() and tests reference it normally.
+def _load_target_fields() -> dict[str, tuple[str, ...]]:
+    from odoo_crm_nil_adapter import packs  # noqa: PLC0415 (lazy: avoid import cycle with translate)
+    return packs.all_projections()
+
+
+_TARGET_FIELDS: dict[str, tuple[str, ...]] = _load_target_fields()
+
+
+def _load_sensitive() -> dict[str, frozenset[str]]:
+    from odoo_crm_nil_adapter import packs  # noqa: PLC0415
+    return packs.all_sensitive()
+
+
+_SENSITIVE: dict[str, frozenset[str]] = _load_sensitive()
 # Odoo speaks all of these server-side via search_read / search_count / read_group.
 _ODOO_CAPS = Capabilities(server_filter=True, server_sort=True, server_paginate=True, server_aggregate=True)
 
