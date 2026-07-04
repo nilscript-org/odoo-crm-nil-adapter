@@ -259,6 +259,54 @@ def _safe_search(client: SystemClient, domain: list[list[Any]]) -> list[dict[str
         return []
 
 
+# Contact card fields a comms flow needs: the human name plus every channel we can reach (email +
+# phone/mobile). `phone_sanitized` is Odoo's normalized form, useful for correlating an inbound WA
+# number. Odoo has no native "whatsapp" field, so `phone`/`mobile` ARE the WhatsApp reach.
+_CONTACT_FIELDS = ("id", "name", "email", "phone", "mobile", "phone_sanitized")
+
+
+def _run_find_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a client by free text (name / email / phone) → their contact card WITH email + phone.
+    Powers 'send email to client X' in chat, and correlates an inbound reply back to a known contact.
+
+    Matches the query against each human-facing field separately and unions the hits (deduped by id,
+    first-match order) — a backend-agnostic OR that needs no polish-notation domain support. A blank
+    query lists recent contacts. Any field the model lacks degrades to skipped — a lookup never 500s."""
+    q = str(args.get("query", "")).strip()
+    if not q:
+        try:
+            rows = client.search("res.partner", [], fields=_CONTACT_FIELDS, limit=10)
+        except SystemError:
+            rows = []
+        return {"target": "res.partner", "count": len(rows), "items": rows}
+    seen: dict[Any, dict[str, Any]] = {}
+    for field in ("name", "email", "phone"):
+        try:
+            hits = client.search("res.partner", [[field, "ilike", q]], fields=_CONTACT_FIELDS, limit=10)
+        except SystemError:
+            continue
+        for row in hits:
+            seen.setdefault(row.get("id"), row)
+    items = list(seen.values())[:10]
+    return {"target": "res.partner", "count": len(items), "items": items}
+
+
+def _run_get_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    """Fetch ONE contact by id → its full channel card (email + phone). Resolves the awaited client's
+    channel before a send and hydrates a decision card. A missing/non-numeric id or absent record is a
+    valid empty read, never an error."""
+    cid = str(args.get("contact_id", "")).strip()
+    try:
+        pid = int(cid)
+    except ValueError:
+        return {"target": "res.partner", "found": False, "item": None}
+    try:
+        rows = client.search("res.partner", [["id", "=", pid]], fields=_CONTACT_FIELDS, limit=1)
+    except SystemError:
+        rows = []
+    return {"target": "res.partner", "found": bool(rows), "item": rows[0] if rows else None}
+
+
 # ── write verb constants (referenced by packs.py; aggregated into WRITE_VERBS at module bottom) ──
 CRM_CREATE_LEAD = WriteVerb(
     verb="crm.create_lead", tier="MEDIUM", doctype="crm.lead", op="create",
@@ -378,6 +426,8 @@ CRM_LIST_CONTACTS = QueryVerb(verb="crm.list_contacts", run=_run_list_contacts)
 CRM_LIST_STAGES = QueryVerb(verb="crm.list_stages", run=_run_list_stages)
 CRM_LIST_COUNTRIES = QueryVerb(verb="crm.list_countries", run=_run_list_countries)
 CRM_GET_CONTACT_BY_PHONE = QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone)
+CRM_FIND_CONTACT = QueryVerb(verb="crm.find_contact", run=_run_find_contact)
+CRM_GET_CONTACT = QueryVerb(verb="crm.get_contact", run=_run_get_contact)
 
 
 # ── purchasing verb constants ────────────────────────────────────────────────────────────────────

@@ -29,7 +29,7 @@ def _make_crm_pack() -> ModulePack:
         CRM_CREATE_LEAD, CRM_CREATE_CONTACT, CRM_UPDATE_CONTACT, CRM_LOG_NOTE,
         CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
         CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
-        CRM_GET_CONTACT_BY_PHONE,
+        CRM_GET_CONTACT_BY_PHONE, CRM_FIND_CONTACT, CRM_GET_CONTACT,
     )
     return ModulePack(
         name="crm",
@@ -48,7 +48,7 @@ def _make_crm_pack() -> ModulePack:
         ),
         query_verbs=(
             CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
-            CRM_GET_CONTACT_BY_PHONE,
+            CRM_GET_CONTACT_BY_PHONE, CRM_FIND_CONTACT, CRM_GET_CONTACT,
         ),
         projections={
             "res.partner": ("id", "name", "phone", "email"),
