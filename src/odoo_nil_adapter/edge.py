@@ -23,6 +23,7 @@ from odoo_nil_adapter.compensation import COMPENSATIONS, compensate
 from odoo_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
 from odoo_nil_adapter.state import ShimState
 from odoo_nil_adapter.system import SystemClient, SystemError
+from odoo_nil_adapter.tenant_routing import bind_tenant
 from odoo_nil_adapter.translate import (
     QUERY_VERBS,
     RESOURCE_VERBS,
@@ -47,6 +48,55 @@ def _resource_phrase(op: str, target: str, args: dict[str, Any]) -> tuple[str, s
     if op == "update":
         return f"Update {target}/{rid} → {data}", f"تحديث {target}/{rid}"
     return f"Delete {target}/{rid}", f"حذف {target}/{rid}"
+
+
+# An agent may name an entity in generic terms (client, customer, vendor) rather than the exact Odoo
+# model. We resolve it to whatever THIS adapter actually DECLARES (its writable model set) — never a
+# hardcoded per-backend table. A noun maps to a concept; a concept matches any declared model whose
+# name carries one of the concept's words. So `customer` → `res.partner` (carries "partner"), while an
+# exact model like `res.partner` passes straight through. Identical logic ships in every adapter; here
+# it feeds ONLY the generic resource.* spine (nil.* reads already resolve `about` via the IntentResolver).
+_NOUN_CONCEPT = {
+    "client": "client", "customer": "client", "contact": "client", "partner": "client",
+    "res.partner": "client", "company": "client", "account": "client", "party": "client",
+    "invoice": "invoice", "bill": "invoice", "account.move": "invoice",
+    "product": "product", "item": "product", "product.product": "product",
+    "supplier": "supplier", "vendor": "supplier",
+    "payment": "payment", "purchase": "purchase", "purchase_invoice": "purchase",
+}
+_CONCEPT_WORDS = {
+    "client": ("client", "customer", "partner", "contact", "party"),
+    "invoice": ("invoice", "bill", "move"),
+    "product": ("product", "item"),
+    "supplier": ("supplier", "vendor"),
+    "payment": ("payment",),
+    "purchase": ("purchase",),
+}
+
+
+def _resolve_target(name: Any) -> Any:
+    """Normalize an entity noun to a DECLARED Odoo model — generic, driven by this adapter's own
+    writable targets: exact (case-insensitive), singular↔plural, concept synonym, then substring. An
+    unrecognized value is returned unchanged (governance still refuses it downstream)."""
+    if not isinstance(name, str) or not name:
+        return name
+    declared = sorted(governance.writable_targets())
+    if name in declared:
+        return name
+    low = name.strip().lower()
+    for d in declared:  # case-insensitive exact, then singular↔plural
+        dl = d.lower()
+        if dl == low or dl == low + "s" or low == dl + "s":
+            return d
+    concept = _NOUN_CONCEPT.get(low)  # concept synonym → a declared model that carries the concept
+    if concept:
+        for d in declared:
+            if any(w in d.lower() for w in _CONCEPT_WORDS.get(concept, ())):
+                return d
+    for d in declared:  # last resort: substring either way
+        if low in d.lower() or d.lower() in low:
+            return d
+    return name
 
 
 _ID_FIELDS = ("code", "name", "slug", "title", "sku", "email")
@@ -413,11 +463,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         verb_name = body.get("verb")
         args = body.get("args", {}) or {}
         tenant = env.get("workspace") or None  # the per-tenant grant scope (SaaS); None = shipped skeleton
+        bind_tenant(tenant)  # route this request's backend calls to THIS workspace's vault creds
         # Generic op=method (universal workflow actions): call a governed model method on a record —
         # action_post, button_validate, action_confirm, … — with NO per-action verb. Gated by the
         # method allow-list (default-deny), so an unlisted/financial method is unexpressible.
         if verb_name == "resource.method":
-            target, method, rid = args.get("target"), args.get("method"), args.get("id")
+            target, method, rid = _resolve_target(args.get("target")), args.get("method"), args.get("id")
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
             if not method:
@@ -432,7 +483,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 return _refusal(env, "UPSTREAM_UNAVAILABLE",
                                 f"backend target '{target}' is not provisioned on this system")
             pid = uuid4().hex[:16]
-            state.proposals[pid] = {"verb": verb_name, "args": args, "resource_method": True, "tier": tier}
+            # Persist the RESOLVED target so COMMIT — which reads stored args.target to call the
+            # governed method — hits the real model, not the raw noun the agent used.
+            state.proposals[pid] = {"verb": verb_name, "args": {**args, "target": target}, "resource_method": True, "tier": tier}
             return _envelope("PROPOSAL", env, {
                 "outcome": "proposal", "id": pid, "verb": verb_name, "tier": tier,
                 "preview": {"en": f"Call {method} on {target}/{rid}",
@@ -443,7 +496,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             op = verb_name.split(".", 1)[1]
             if op not in ("create", "update", "delete"):
                 return _refusal(env, "UNKNOWN_VERB", f"unknown resource op: {op}")
-            target = args.get("target")
+            target = _resolve_target(args.get("target"))
             if not target:
                 return _refusal(env, "INVALID_ARGS", "missing required arg: target", field="target")
             # Skeleton bound (advertised ≡ committable): the WRITE ceiling is governance policy, not the
@@ -466,7 +519,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 if gate is not None:
                     return gate
             pid = uuid4().hex[:16]
-            state.proposals[pid] = {"verb": verb_name, "args": args, "resource": True}
+            # Persist the RESOLVED target so COMMIT — which reads stored args.target for the CRUD
+            # write — hits the real model, not the raw noun the agent used.
+            state.proposals[pid] = {"verb": verb_name, "args": {**args, "target": target}, "resource": True}
             # State-witness (TOCTOU): bind the proposal to the SSOT values it previewed, so a COMMIT
             # after a delayed approval against a changed world fails closed instead of writing stale.
             if op == "update":
@@ -566,6 +621,7 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             # inverse (action_post→button_draft, action_confirm→action_cancel) is COMPENSABLE — we mint a
             # token that calls the inverse on ROLLBACK; one with no inverse stays honestly IRREVERSIBLE.
             tenant = env.get("workspace") or None
+            bind_tenant(tenant)  # route this request's backend calls to THIS workspace's vault creds
             reverse = governance.method_reverse(target, method, tenant=tenant)
             if reverse:
                 tok = uuid4().hex[:16]
@@ -772,11 +828,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
     @app.post("/nil/v0.1/query")
     def query(env: dict[str, Any] = Body(...), authorization: str | None = Header(None)) -> dict[str, Any]:
         _auth(authorization)
+        bind_tenant(env.get("workspace") or None)  # route reads to THIS workspace's vault creds
         body = env.get("body", {})
         # Generic resource.read (universal): list/inspect any provisioned target, optional field match.
         if body.get("verb") == "resource.read":
             qargs = body.get("args", {}) or {}
-            target = qargs.get("target")
+            target = _resolve_target(qargs.get("target"))
             # The LEGACY raw read (whole-record list) stays bounded to the writable skeleton — pulling
             # raw salaries/payments from an arbitrary model would re-open the 590 KB flood AND leak
             # sensitive fields. Universal, projected, sensitivity-gated reads flow through nil.* instead.
@@ -877,7 +934,10 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # (Reads are universal via nil.* and not enumerated here — discovery is per-model, on demand.)
         targets: dict[str, Any] = {}
         for t in governance.writable_targets():
-            s = client.schema(t)  # the live skeleton: field list, or None if not provisioned
+            try:
+                s = client.schema(t)  # live skeleton — needs a bound tenant's creds
+            except Exception:  # noqa: BLE001 — multi-tenant: no tenant bound on the bare handshake,
+                s = None       # so the live shape is unknown here; verbs (the conformance surface) still stand
             targets[t] = {"exists": s is not None, "fields": s or []}
         return {
             "nil": NIL,

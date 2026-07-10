@@ -17,6 +17,7 @@ import os
 
 from odoo_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
 from odoo_nil_adapter.system import RealSystemClient
+from odoo_nil_adapter.tenant_routing import build_from_env as _tenant_client_from_env
 
 
 def _require(name: str) -> str:
@@ -27,12 +28,18 @@ def _require(name: str) -> str:
 
 
 def build_app():
-    client = RealSystemClient(
-        _require("ODOO_URL"),
-        db=_require("ODOO_DB"),
-        login=_require("ODOO_LOGIN"),
-        api_key=_require("ODOO_API_KEY"),
-    )
+    # SaaS multi-tenant mode (preferred): NIL_REGISTRY_URL set ⇒ one shim serves every tenant,
+    # resolving each workspace's Odoo creds from the control-plane vault per request. No boot creds,
+    # so /describe answers immediately and the connect probe succeeds before any tenant is provisioned.
+    # Single-tenant fallback: ODOO_* env creds (legacy / local dev) when no registry is configured.
+    client = _tenant_client_from_env()
+    if client is None:
+        client = RealSystemClient(
+            _require("ODOO_URL"),
+            db=_require("ODOO_DB"),
+            login=_require("ODOO_LOGIN"),
+            api_key=_require("ODOO_API_KEY"),
+        )
     webhook = os.environ.get("NIL_EVENTS_WEBHOOK")
     emitter = (
         HttpEventEmitter(webhook, os.environ.get("NIL_EVENTS_SECRET", ""))
