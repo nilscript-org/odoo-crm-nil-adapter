@@ -598,6 +598,11 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
     @app.post("/nil/v0.1/commit")
     def commit(env: dict[str, Any] = Body(...), authorization: str | None = Header(None)) -> dict[str, Any]:
         _auth(authorization)
+        # Bind the tenant at the TOP of the handler: each request runs in a fresh ContextVar
+        # context, so the bind done at PROPOSE does not carry over — without this, the generic
+        # create/update/delete commit path hit the vault resolver tenant-less and every write
+        # failed "no workspace in the request" (while the run still reported completed).
+        bind_tenant(env.get("workspace") or None)
         body = env.get("body", {})
         key = body.get("idempotency_key", "")
         if key in state.ledger:  # retried COMMIT — replay, no second write
