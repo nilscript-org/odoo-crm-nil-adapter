@@ -103,8 +103,9 @@ class VaultResolvingClient:
         *,
         fields: tuple[str, ...] | None = None,
         limit: int = 50,
+        order: str | None = None,
     ) -> list[dict[str, Any]]:
-        return self._real().search(target, domain, fields=fields, limit=limit)
+        return self._real().search(target, domain, fields=fields, limit=limit, order=order)
 
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         return self._real().update(target, record_id, doc)
