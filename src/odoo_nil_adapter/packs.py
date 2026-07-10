@@ -30,6 +30,7 @@ def _make_crm_pack() -> ModulePack:
         CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
         CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
         CRM_GET_CONTACT_BY_PHONE, CRM_FIND_CONTACT, CRM_GET_CONTACT,
+        WOSOOL_CREATE_CLIENT,
     )
     return ModulePack(
         name="crm",
@@ -45,6 +46,7 @@ def _make_crm_pack() -> ModulePack:
         write_verbs=(
             CRM_CREATE_LEAD, CRM_CREATE_CONTACT, CRM_UPDATE_CONTACT, CRM_LOG_NOTE,
             CRM_UPDATE_LEAD_STAGE, CRM_DELETE_LEAD, CRM_DELETE_CONTACT,
+            WOSOOL_CREATE_CLIENT,  # canonical Wosool vocabulary (baseline catalog)
         ),
         query_verbs=(
             CRM_LIST_LEADS, CRM_LIST_CONTACTS, CRM_LIST_STAGES, CRM_LIST_COUNTRIES,
@@ -64,13 +66,19 @@ def _make_crm_pack() -> ModulePack:
 def _make_finance_pack() -> ModulePack:
     from odoo_nil_adapter.translate import (  # noqa: PLC0415
         ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT,
+        WOSOOL_CREATE_INVOICE, WOSOOL_RECORD_PAYMENT, WOSOOL_CREATE_PURCHASE_INVOICE,
     )
     return ModulePack(
         name="finance",
         model_prefixes=("account.",),
         write_targets=(),  # finance writes stay grant-only — not in default skeleton
         method_grants=(),
-        write_verbs=(ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT),
+        write_verbs=(
+            ACCOUNT_CREATE_INVOICE, ACCOUNT_POST_INVOICE, ACCOUNT_REGISTER_PAYMENT,
+            # canonical Wosool vocabulary (baseline catalog): services/commerce/procurement
+            # names mapped to the real Odoo documents (out_invoice / payment / in_invoice)
+            WOSOOL_CREATE_INVOICE, WOSOOL_RECORD_PAYMENT, WOSOOL_CREATE_PURCHASE_INVOICE,
+        ),
         query_verbs=(),
         projections={
             "account.move": ("id", "name", "ref", "state", "move_type", "partner_id", "invoice_date",
@@ -102,13 +110,15 @@ def _make_sales_pack() -> ModulePack:
 
 
 def _make_inventory_pack() -> ModulePack:
-    from odoo_nil_adapter.translate import STOCK_VALIDATE_PICKING  # noqa: PLC0415
+    from odoo_nil_adapter.translate import (  # noqa: PLC0415
+        STOCK_VALIDATE_PICKING, WOSOOL_CREATE_PRODUCT,
+    )
     return ModulePack(
         name="inventory",
         model_prefixes=("stock.", "product."),
         write_targets=(),
         method_grants=(),
-        write_verbs=(STOCK_VALIDATE_PICKING,),
+        write_verbs=(STOCK_VALIDATE_PICKING, WOSOOL_CREATE_PRODUCT),
         query_verbs=(),
         projections={},
         sensitive={},

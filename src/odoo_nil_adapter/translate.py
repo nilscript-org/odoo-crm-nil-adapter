@@ -420,6 +420,132 @@ ACCOUNT_REGISTER_PAYMENT = WriteVerb(
     supported_args=("partner_id", "amount", "payment_type", "journal_id", "date", "ref"),
 )
 
+# ── the CANONICAL Wosool verb vocabulary (SSOT plan Phase E) ──────────────────────────────────────
+# The baseline capability catalog is backend-agnostic: its cycles call ONE canonical verb set
+# (crm.create_client, services.create_invoice, commerce.record_payment, commerce.create_product,
+# procurement.create_purchase_invoice) so the identical bundle serves workspace #1 and #10,000.
+# Each adapter DECLARES those canonical verbs and maps them internally to its native op + arg
+# transform — the catalog never learns backend names. These are first-class WriteVerbs (declared in
+# describe, routed, tiered, previewed), not string aliases: an alias alone cannot fix arg shapes.
+def _to_native_services_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
+    """Canonical {client_id, currency, description, amount?, lines?} → Odoo customer invoice
+    (`account.move`, out_invoice). `description` becomes a single invoice line when no explicit
+    lines are given; `currency` is resolved to `currency_id` by the reference resolver."""
+    doc: dict[str, Any] = {"move_type": "out_invoice"}
+    if args.get("client_id"):
+        doc["partner_id"] = _maybe_int(args["client_id"])
+    if args.get("invoice_date"):
+        doc["invoice_date"] = args["invoice_date"]
+    lines = args.get("lines") or []
+    if lines:
+        doc["invoice_line_ids"] = [(0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)]
+    elif args.get("description"):
+        doc["invoice_line_ids"] = [(0, 0, {
+            "name": str(args["description"]),
+            "quantity": 1,
+            "price_unit": _maybe_float(args.get("amount", 0)),
+        })]
+    return doc
+
+
+def _to_native_commerce_record_payment(args: dict[str, Any]) -> dict[str, Any]:
+    """Canonical {invoice_id, amount, partner_id?, date?} → Odoo `account.payment` (inbound
+    customer payment). The invoice reference travels in `ref` so the human trail ties the payment
+    to its invoice; reconciliation stays an Odoo-side act."""
+    doc: dict[str, Any] = {
+        "payment_type": "inbound",
+        "partner_type": "customer",
+        "amount": _maybe_float(args.get("amount", 0)),
+    }
+    if args.get("invoice_id"):
+        doc["ref"] = f"invoice {args['invoice_id']}"
+    if args.get("partner_id"):
+        doc["partner_id"] = _maybe_int(args["partner_id"])
+    if args.get("journal_id"):
+        doc["journal_id"] = _maybe_int(args["journal_id"])
+    if args.get("date"):
+        doc["date"] = args["date"]
+    return doc
+
+
+def _to_native_commerce_create_product(args: dict[str, Any]) -> dict[str, Any]:
+    """Canonical {name, price, sku} → Odoo `product.product`."""
+    doc: dict[str, Any] = {"name": args.get("name", "")}
+    if args.get("price") is not None:
+        doc["list_price"] = _maybe_float(args["price"])
+    if args.get("sku"):
+        doc["default_code"] = args["sku"]
+    return doc
+
+
+def _to_native_procurement_create_purchase_invoice(args: dict[str, Any]) -> dict[str, Any]:
+    """Canonical {supplier_id, currency, invoice_date?, lines?} → Odoo VENDOR BILL
+    (`account.move`, in_invoice) — the purchase invoice in Odoo's vocabulary."""
+    doc: dict[str, Any] = {"move_type": "in_invoice"}
+    if args.get("supplier_id"):
+        doc["partner_id"] = _maybe_int(args["supplier_id"])
+    if args.get("invoice_date"):
+        doc["invoice_date"] = args["invoice_date"]
+    lines = args.get("lines") or []
+    if lines:
+        doc["invoice_line_ids"] = [(0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)]
+    return doc
+
+
+WOSOOL_CREATE_CLIENT = WriteVerb(
+    verb="crm.create_client", tier="MEDIUM", doctype="res.partner", op="upsert",
+    required=("name",), to_native=_to_native_create_contact,
+    preview=lambda a: {
+        "en": f'Create or update client “{a.get("name", "")}”'
+        + (f' <{a["email"]}>' if a.get("email") else ""),
+        "ar": f'إنشاء أو تحديث العميل «{a.get("name", "")}»'
+        + (f' <{a["email"]}>' if a.get("email") else ""),
+    }, entity_type="contact", dedup_keys=("email", "phone"),
+    supported_args=("name", "phone", "email", "company", "is_company"),
+)
+WOSOOL_CREATE_INVOICE = WriteVerb(
+    verb="services.create_invoice", tier="HIGH", doctype="account.move", op="create",
+    required=("client_id",), to_native=_to_native_services_create_invoice,
+    preview=lambda a: {
+        "en": f"Create a customer invoice for client {a.get('client_id', '')}"
+        + (f' — “{a["description"]}”' if a.get("description") else ""),
+        "ar": f"إنشاء فاتورة للعميل {a.get('client_id', '')}"
+        + (f' — «{a["description"]}»' if a.get("description") else ""),
+    }, entity_type="invoice",
+    supported_args=("client_id", "currency", "description", "amount", "invoice_date", "lines"),
+    references=(("currency", "currency_id", "res.currency"),),
+)
+WOSOOL_RECORD_PAYMENT = WriteVerb(
+    verb="commerce.record_payment", tier="HIGH", doctype="account.payment", op="create",
+    required=("invoice_id", "amount"), to_native=_to_native_commerce_record_payment,
+    preview=lambda a: {
+        "en": f"Record a payment of {a.get('amount', '')} against invoice {a.get('invoice_id', '')}",
+        "ar": f"تسجيل دفعة بمبلغ {a.get('amount', '')} على الفاتورة {a.get('invoice_id', '')}",
+    }, entity_type="payment",
+    supported_args=("invoice_id", "amount", "partner_id", "journal_id", "date"),
+)
+WOSOOL_CREATE_PRODUCT = WriteVerb(
+    verb="commerce.create_product", tier="MEDIUM", doctype="product.product", op="create",
+    required=("name",), to_native=_to_native_commerce_create_product,
+    preview=lambda a: {
+        "en": f'Create product “{a.get("name", "")}”'
+        + (f" at {a['price']}" if a.get("price") is not None else ""),
+        "ar": f'إنشاء منتج «{a.get("name", "")}»'
+        + (f" بسعر {a['price']}" if a.get("price") is not None else ""),
+    }, entity_type="product",
+    supported_args=("name", "price", "sku"),
+)
+WOSOOL_CREATE_PURCHASE_INVOICE = WriteVerb(
+    verb="procurement.create_purchase_invoice", tier="HIGH", doctype="account.move", op="create",
+    required=("supplier_id",), to_native=_to_native_procurement_create_purchase_invoice,
+    preview=lambda a: {
+        "en": f"Record a purchase invoice (vendor bill) from supplier {a.get('supplier_id', '')}",
+        "ar": f"تسجيل فاتورة مشتريات من المورد {a.get('supplier_id', '')}",
+    }, entity_type="invoice",
+    supported_args=("supplier_id", "currency", "invoice_date", "lines"),
+    references=(("currency", "currency_id", "res.currency"),),
+)
+
 # ── crm.* query verb constants ────────────────────────────────────────────────────────────────────
 CRM_LIST_LEADS = QueryVerb(verb="crm.list_leads", run=_run_list_leads)
 CRM_LIST_CONTACTS = QueryVerb(verb="crm.list_contacts", run=_run_list_contacts)

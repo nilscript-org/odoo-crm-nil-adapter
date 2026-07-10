@@ -26,6 +26,8 @@ COMPENSATIONS: dict[str, dict[str, Any]] = {
     # — delete the freshly created record. The MATCHED sub-case is reversed by a before-image restore
     # the edge synthesizes inline (comp_override), so it never reaches this verb-mapped delete.
     "crm.create_contact": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
+    # canonical Wosool vocabulary: same res.partner upsert as create_contact, same reversal.
+    "crm.create_client": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
     "crm.update_contact": {"reversibility": "COMPENSABLE", "strategy": "before_image"},
 }
 
