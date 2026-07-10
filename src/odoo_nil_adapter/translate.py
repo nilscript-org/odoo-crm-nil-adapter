@@ -263,6 +263,23 @@ def _safe_search(client: SystemClient, domain: list[list[Any]]) -> list[dict[str
 # phone/mobile). `phone_sanitized` is Odoo's normalized form, useful for correlating an inbound WA
 # number. Odoo has no native "whatsapp" field, so `phone`/`mobile` ARE the WhatsApp reach.
 _CONTACT_FIELDS = ("id", "name", "email", "phone", "mobile", "phone_sanitized")
+# The universally-valid subset: Odoo 18 REMOVED res.partner.mobile, and phone_sanitized needs the
+# phone_validation module — asking search_read for a missing field faults the WHOLE call.
+_CONTACT_FIELDS_BASE = ("id", "name", "email", "phone")
+
+
+def _search_contact_cards(
+    client: SystemClient, domain: list[list[Any]], *, limit: int = 10
+) -> list[dict[str, Any]]:
+    """res.partner search projected to the contact card, DEGRADING to the universal base set when
+    this Odoo build lacks the optional channel fields. Without the fallback, every projected
+    lookup (find_contact / get_contact) silently returned empty against Odoo 18 tenants — the
+    per-field SystemError catch upstream read as 'no match' (proven live: ValueError: Invalid
+    field 'mobile' on 'res.partner')."""
+    try:
+        return client.search("res.partner", domain, fields=_CONTACT_FIELDS, limit=limit)
+    except SystemError:
+        return client.search("res.partner", domain, fields=_CONTACT_FIELDS_BASE, limit=limit)
 
 
 def _run_find_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
@@ -275,14 +292,14 @@ def _run_find_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, A
     q = str(args.get("query", "")).strip()
     if not q:
         try:
-            rows = client.search("res.partner", [], fields=_CONTACT_FIELDS, limit=10)
+            rows = _search_contact_cards(client, [])
         except SystemError:
             rows = []
         return {"target": "res.partner", "count": len(rows), "items": rows}
     seen: dict[Any, dict[str, Any]] = {}
     for field in ("name", "email", "phone"):
         try:
-            hits = client.search("res.partner", [[field, "ilike", q]], fields=_CONTACT_FIELDS, limit=10)
+            hits = _search_contact_cards(client, [[field, "ilike", q]])
         except SystemError:
             continue
         for row in hits:
@@ -301,7 +318,7 @@ def _run_get_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, An
     except ValueError:
         return {"target": "res.partner", "found": False, "item": None}
     try:
-        rows = client.search("res.partner", [["id", "=", pid]], fields=_CONTACT_FIELDS, limit=1)
+        rows = _search_contact_cards(client, [["id", "=", pid]], limit=1)
     except SystemError:
         rows = []
     return {"target": "res.partner", "found": bool(rows), "item": rows[0] if rows else None}
