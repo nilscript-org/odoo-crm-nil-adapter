@@ -771,6 +771,26 @@ WRITE_VERBS = {**_packs_mod.all_write_verbs()}
 QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 
 
+# The business RESOURCES Odoo can be the system of record for, and the native model it spells each as
+# (Wave A). Odoo already serves the universal read plane, so every resource here is readable; the ones
+# with write verbs are fully ownable.
+#
+# Deliberately NOT declared: `PurchaseInvoice` and `Supplier`. Odoo spells a purchase invoice as
+# `account.move` — the SAME model as a customer invoice — and a supplier as `res.partner`, the same
+# model as a customer. Those are not two resources to Odoo; they are one model wearing two hats. If we
+# declared them, a native target would denote two different resources and routing would have to guess
+# which one a call meant. It would guess wrong eventually, silently, and in the ledger. So Odoo simply
+# does not claim to be the system of record for things it cannot tell apart.
+RESOURCES: dict[str, str] = {
+    "Customer": "res.partner",
+    "Lead": "crm.lead",
+    "Invoice": "account.move",
+    "Payment": "account.payment",
+    "Product": "product.product",
+    "PurchaseOrder": "purchase.order",
+}
+
+
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:
     # The SSOT entity id MUST be the backend's real record key, so a compensating delete (ROLLBACK)
     # targets the record itself — never a human attribute that can collide or change.

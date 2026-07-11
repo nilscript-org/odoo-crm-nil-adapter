@@ -27,6 +27,7 @@ from odoo_nil_adapter.tenant_routing import bind_tenant
 from odoo_nil_adapter.translate import (
     QUERY_VERBS,
     RESOURCE_VERBS,
+    RESOURCES,
     WRITE_VERBS,
     entity_ref,
 )
@@ -956,6 +957,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                  "required": list(v.required)}
                 for _, v in sorted(WRITE_VERBS.items())
             ],
+            # The RESOURCES this backend can be the system of record for, and the native model it
+            # spells each as (Wave A). Authority names the resource; the adapter keeps its vocabulary.
+            "resources": RESOURCES,
             "targets": targets,
         }
 
