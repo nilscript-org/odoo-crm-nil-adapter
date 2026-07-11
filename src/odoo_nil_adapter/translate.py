@@ -456,9 +456,11 @@ def _to_native_services_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
     lines = args.get("lines") or []
     if lines:
         doc["invoice_line_ids"] = [(0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)]
-    elif args.get("description"):
+    elif args.get("description") or args.get("amount") is not None:
+        # Plan B5: an amount with no description must STILL produce the priced line — a line-less
+        # invoice is rejected on post, and dropping the money silently was the live failure.
         doc["invoice_line_ids"] = [(0, 0, {
-            "name": str(args["description"]),
+            "name": str(args.get("description") or "Service"),
             "quantity": 1,
             "price_unit": _maybe_float(args.get("amount", 0)),
         })]
