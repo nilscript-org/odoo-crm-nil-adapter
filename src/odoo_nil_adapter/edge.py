@@ -948,6 +948,14 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             "nil": NIL,
             "system": SYSTEM,
             "verbs": list(RESOURCE_VERBS) + sorted(WRITE_VERBS) + sorted(QUERY_VERBS),
+            # Contract conformance (plan C1): the DECLARED per-verb arg surface, so the control
+            # plane can check a capability's cycle provides every arg this backend requires —
+            # CONTRACT_MISMATCH at readiness instead of a silent failure after approval.
+            "verb_details": [
+                {"verb": v.verb, "tier": v.tier, "target": v.doctype,
+                 "required": list(v.required)}
+                for _, v in sorted(WRITE_VERBS.items())
+            ],
             "targets": targets,
         }
 
