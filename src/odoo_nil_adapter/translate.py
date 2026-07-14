@@ -23,7 +23,10 @@ Bilingual = dict[str, str]
 # They are declared here so static analysis finds the names; actual values assigned at end of file.
 
 RESOURCE_VERBS: tuple[str, ...] = (
-    "resource.create", "resource.read", "resource.update", "resource.delete",
+    "resource.create",
+    "resource.read",
+    "resource.update",
+    "resource.delete",
     "resource.method",  # generic governed workflow-method invocation (action_post, button_validate, …)
 )
 
@@ -43,7 +46,9 @@ class WriteVerb:
     # for op="upsert": native fields probed (in order) to find an existing record before writing —
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
     dedup_keys: tuple[str, ...] = ()
-    method: str | None = None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
+    method: str | None = (
+        None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
+    )
     # for op="method": the inverse method that reverses it (action_post→button_draft). When set, the
     # effect is COMPENSABLE — ROLLBACK previews+runs the inverse — instead of IRREVERSIBLE.
     reverse_method: str | None = None
@@ -55,9 +60,26 @@ class WriteVerb:
     # resolved id into `native_field` — never the raw string (a relational field rejects text). The
     # supported_args list still gates acceptance; references only declares HOW the value is resolved.
     references: tuple[tuple[str, str, str], ...] = ()
+    # DECLARED NUMERIC PRECONDITIONS: args that must parse to a number STRICTLY GREATER THAN ZERO for
+    # the effect to be computable at all. A landed cost over a received quantity of zero is not a cost
+    # of zero — it is not a cost. Without this the verb translated to an EMPTY doc, the edge wrote it,
+    # and the shim reported `executed` / `claim: success` for a cost it had never set. Declared here,
+    # refused at PROPOSE: "I wrote it" and "I could not compute it" must never be the same answer.
+    positive: tuple[str, ...] = ()
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
+
+    def nonpositive(self, args: dict[str, Any]) -> list[str]:
+        """Declared `positive` args that are absent, non-numeric, or <= 0 — the uncomputable set."""
+        out: list[str] = []
+        for f in self.positive:
+            try:
+                if float(args[f]) <= 0:
+                    out.append(f)
+            except (KeyError, TypeError, ValueError):
+                out.append(f)
+        return out
 
 
 @dataclass(frozen=True)
@@ -85,7 +107,10 @@ def _maybe_float(value: Any) -> Any:
 # ── crm.* → Odoo field maps (pure; never raise on odd input) ─────────────────────────────────
 def _to_native_create_lead(args: dict[str, Any]) -> dict[str, Any]:
     """NIL args → an Odoo `crm.lead` (an opportunity in the CRM pipeline)."""
-    doc: dict[str, Any] = {"name": args["name"], "type": args.get("lead_type", "opportunity")}
+    doc: dict[str, Any] = {
+        "name": args["name"],
+        "type": args.get("lead_type", "opportunity"),
+    }
     for nil_key, odoo_key in (
         ("contact_name", "contact_name"),
         ("email", "email_from"),
@@ -104,7 +129,11 @@ def _to_native_create_lead(args: dict[str, Any]) -> dict[str, Any]:
 def _to_native_create_contact(args: dict[str, Any]) -> dict[str, Any]:
     """NIL args → an Odoo `res.partner` (a CRM contact / customer)."""
     doc: dict[str, Any] = {"name": args["name"]}
-    for nil_key, odoo_key in (("email", "email"), ("phone", "phone"), ("company", "company_name")):
+    for nil_key, odoo_key in (
+        ("email", "email"),
+        ("phone", "phone"),
+        ("company", "company_name"),
+    ):
         if args.get(nil_key):
             doc[odoo_key] = args[nil_key]
     if args.get("is_company") is not None:
@@ -180,7 +209,9 @@ def _invoice_line(ln: dict[str, Any]) -> dict[str, Any]:
     }
     if ln.get("product_id"):
         line["product_id"] = _maybe_int(ln["product_id"])
-    if ln.get("account_id"):  # explicit income/expense account (when no product drives it)
+    if ln.get(
+        "account_id"
+    ):  # explicit income/expense account (when no product drives it)
         line["account_id"] = _maybe_int(ln["account_id"])
     return line
 
@@ -233,11 +264,15 @@ def _run_list_countries(client: SystemClient, args: dict[str, Any]) -> dict[str,
     reference resolver: the value the agent picks here is what update_contact's `country` resolves."""
     match = str(args.get("match", "")).strip()
     domain = ["|", ["name", "ilike", match], ["code", "ilike", match]] if match else []
-    rows = client.search("res.country", domain, fields=("id", "name", "code"), limit=300)
+    rows = client.search(
+        "res.country", domain, fields=("id", "name", "code"), limit=300
+    )
     return {"target": "res.country", "count": len(rows), "items": rows}
 
 
-def _run_get_contact_by_phone(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+def _run_get_contact_by_phone(
+    client: SystemClient, args: dict[str, Any]
+) -> dict[str, Any]:
     """Hot-path identity lookup: the WhatsApp entry point IS a phone number. Indexed exact match on
     `phone`, falling back to Odoo's normalized `phone_sanitized` (handles formatting differences) —
     never a full-scan via list_contacts. An unmatched number is a valid empty read, not an error."""
@@ -245,7 +280,9 @@ def _run_get_contact_by_phone(client: SystemClient, args: dict[str, Any]) -> dic
     if not phone:
         return {"target": "res.partner", "count": 0, "items": []}
     rows = _safe_search(client, [["phone", "=", phone]])
-    if not rows:  # the stored value may be formatted differently than the inbound number
+    if (
+        not rows
+    ):  # the stored value may be formatted differently than the inbound number
         rows = _safe_search(client, [["phone_sanitized", "=", phone]])
     return {"target": "res.partner", "count": len(rows), "items": rows}
 
@@ -279,7 +316,9 @@ def _search_contact_cards(
     try:
         return client.search("res.partner", domain, fields=_CONTACT_FIELDS, limit=limit)
     except SystemError:
-        return client.search("res.partner", domain, fields=_CONTACT_FIELDS_BASE, limit=limit)
+        return client.search(
+            "res.partner", domain, fields=_CONTACT_FIELDS_BASE, limit=limit
+        )
 
 
 def _run_find_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
@@ -321,121 +360,207 @@ def _run_get_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, An
         rows = _search_contact_cards(client, [["id", "=", pid]], limit=1)
     except SystemError:
         rows = []
-    return {"target": "res.partner", "found": bool(rows), "item": rows[0] if rows else None}
+    return {
+        "target": "res.partner",
+        "found": bool(rows),
+        "item": rows[0] if rows else None,
+    }
 
 
 # ── write verb constants (referenced by packs.py; aggregated into WRITE_VERBS at module bottom) ──
 CRM_CREATE_LEAD = WriteVerb(
-    verb="crm.create_lead", tier="MEDIUM", doctype="crm.lead", op="create",
-    required=("name",), to_native=_to_native_create_lead,
+    verb="crm.create_lead",
+    tier="MEDIUM",
+    doctype="crm.lead",
+    op="create",
+    required=("name",),
+    to_native=_to_native_create_lead,
     preview=lambda a: {
-        "en": f'Create CRM opportunity “{a.get("name", "")}”'
-        + (f' for {a["contact_name"]}' if a.get("contact_name") else ""),
-        "ar": f'إنشاء فرصة بيعية «{a.get("name", "")}»'
-        + (f' للعميل {a["contact_name"]}' if a.get("contact_name") else ""),
-    }, entity_type="lead",
+        "en": f"Create CRM opportunity “{a.get('name', '')}”"
+        + (f" for {a['contact_name']}" if a.get("contact_name") else ""),
+        "ar": f"إنشاء فرصة بيعية «{a.get('name', '')}»"
+        + (f" للعميل {a['contact_name']}" if a.get("contact_name") else ""),
+    },
+    entity_type="lead",
 )
 CRM_CREATE_CONTACT = WriteVerb(
-    verb="crm.create_contact", tier="MEDIUM", doctype="res.partner", op="upsert",
-    required=("name",), to_native=_to_native_create_contact,
+    verb="crm.create_contact",
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="upsert",
+    required=("name",),
+    to_native=_to_native_create_contact,
     preview=lambda a: {
-        "en": f'Create or update contact “{a.get("name", "")}”'
-        + (f' <{a["email"]}>' if a.get("email") else ""),
-        "ar": f'إنشاء أو تحديث جهة اتصال «{a.get("name", "")}»'
-        + (f' <{a["email"]}>' if a.get("email") else ""),
-    }, entity_type="contact", dedup_keys=("email", "phone"),
+        "en": f"Create or update contact “{a.get('name', '')}”"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+        "ar": f"إنشاء أو تحديث جهة اتصال «{a.get('name', '')}»"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+    },
+    entity_type="contact",
+    dedup_keys=("email", "phone"),
 )
 CRM_UPDATE_CONTACT = WriteVerb(
-    verb="crm.update_contact", tier="MEDIUM", doctype="res.partner", op="update",
-    required=("contact_id",), to_native=_to_native_update_contact,
+    verb="crm.update_contact",
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="update",
+    required=("contact_id",),
+    to_native=_to_native_update_contact,
     preview=lambda a: {
         "en": f"Update contact {a.get('contact_id', '')}"
         + (f" → {a['email']}" if a.get("email") else ""),
         "ar": f"تحديث جهة الاتصال {a.get('contact_id', '')}"
         + (f" ← {a['email']}" if a.get("email") else ""),
-    }, entity_type="contact",
-    supported_args=("contact_id", "name", "phone", "email", "comment", "company", "country"),
+    },
+    entity_type="contact",
+    supported_args=(
+        "contact_id",
+        "name",
+        "phone",
+        "email",
+        "comment",
+        "company",
+        "country",
+    ),
     references=(("country", "country_id", "res.country"),),
 )
 CRM_LOG_NOTE = WriteVerb(
-    verb="crm.log_note", tier="MEDIUM", doctype="res.partner", op="method",
-    method="message_post", required=("contact_id", "body"), to_native=_to_native_log_note,
+    verb="crm.log_note",
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="method",
+    method="message_post",
+    required=("contact_id", "body"),
+    to_native=_to_native_log_note,
     preview=lambda a: {
         "en": f'Log a note on contact {a.get("contact_id", "")}: "{a.get("body", "")}"',
-        "ar": f'تسجيل ملاحظة على جهة الاتصال {a.get("contact_id", "")}: «{a.get("body", "")}»',
-    }, entity_type="contact",
+        "ar": f"تسجيل ملاحظة على جهة الاتصال {a.get('contact_id', '')}: «{a.get('body', '')}»",
+    },
+    entity_type="contact",
 )
 CRM_UPDATE_LEAD_STAGE = WriteVerb(
-    verb="crm.update_lead_stage", tier="MEDIUM", doctype="crm.lead", op="update",
-    required=("lead_id", "stage_id"), to_native=_to_native_update_lead_stage,
+    verb="crm.update_lead_stage",
+    tier="MEDIUM",
+    doctype="crm.lead",
+    op="update",
+    required=("lead_id", "stage_id"),
+    to_native=_to_native_update_lead_stage,
     preview=lambda a: {
         "en": f"Move lead {a.get('lead_id', '')} to stage {a.get('stage_id', '')}",
         "ar": f"نقل الفرصة {a.get('lead_id', '')} إلى المرحلة {a.get('stage_id', '')}",
-    }, entity_type="lead",
+    },
+    entity_type="lead",
 )
 CRM_DELETE_LEAD = WriteVerb(
-    verb="crm.delete_lead", tier="HIGH", doctype="crm.lead", op="delete",
-    required=("lead_id",), to_native=_to_native_delete,
+    verb="crm.delete_lead",
+    tier="HIGH",
+    doctype="crm.lead",
+    op="delete",
+    required=("lead_id",),
+    to_native=_to_native_delete,
     preview=lambda a: {
         "en": f"Delete CRM lead {a.get('lead_id', '')}",
         "ar": f"حذف الفرصة البيعية {a.get('lead_id', '')}",
-    }, entity_type="lead",
+    },
+    entity_type="lead",
 )
 CRM_DELETE_CONTACT = WriteVerb(
-    verb="crm.delete_contact", tier="HIGH", doctype="res.partner", op="delete",
-    required=("contact_id",), to_native=_to_native_delete,
+    verb="crm.delete_contact",
+    tier="HIGH",
+    doctype="res.partner",
+    op="delete",
+    required=("contact_id",),
+    to_native=_to_native_delete,
     preview=lambda a: {
         "en": f"Delete contact {a.get('contact_id', '')}",
         "ar": f"حذف جهة الاتصال {a.get('contact_id', '')}",
-    }, entity_type="contact",
+    },
+    entity_type="contact",
 )
 # ── semantic verbs across module groups (Phase 6) ─────────────────────────────────────────────────
 ACCOUNT_CREATE_INVOICE = WriteVerb(
-    verb="account.create_invoice", tier="HIGH", doctype="account.move", op="create",
-    required=("partner_id",), to_native=_to_native_create_invoice,
+    verb="account.create_invoice",
+    tier="HIGH",
+    doctype="account.move",
+    op="create",
+    required=("partner_id",),
+    to_native=_to_native_create_invoice,
     preview=lambda a: {
         "en": f"Create a customer invoice for partner {a.get('partner_id', '')}"
         + (f" ({len(a['lines'])} line(s))" if a.get("lines") else ""),
         "ar": f"إنشاء فاتورة عميل للعميل {a.get('partner_id', '')}"
         + (f" ({len(a['lines'])} بند)" if a.get("lines") else ""),
-    }, entity_type="invoice", supported_args=("partner_id", "invoice_date", "lines"),
+    },
+    entity_type="invoice",
+    supported_args=("partner_id", "invoice_date", "lines"),
 )
 STOCK_VALIDATE_PICKING = WriteVerb(
-    verb="stock.validate_picking", tier="HIGH", doctype="stock.picking", op="method",
-    method="button_validate", required=("picking_id",), to_native=_to_native_method_only,
+    verb="stock.validate_picking",
+    tier="HIGH",
+    doctype="stock.picking",
+    op="method",
+    method="button_validate",
+    required=("picking_id",),
+    to_native=_to_native_method_only,
     preview=lambda a: {
         "en": f"Validate stock transfer {a.get('picking_id', '')} (commit the moves)",
         "ar": f"اعتماد إذن الصرف {a.get('picking_id', '')} (تثبيت الحركات)",
-    }, entity_type="picking",
+    },
+    entity_type="picking",
 )
 SALE_CONFIRM_ORDER = WriteVerb(
-    verb="sale.confirm_order", tier="HIGH", doctype="sale.order", op="method",
-    method="action_confirm", required=("order_id",), to_native=_to_native_method_only,
+    verb="sale.confirm_order",
+    tier="HIGH",
+    doctype="sale.order",
+    op="method",
+    method="action_confirm",
+    required=("order_id",),
+    to_native=_to_native_method_only,
     preview=lambda a: {
         "en": f"Confirm sales order {a.get('order_id', '')}",
         "ar": f"تأكيد أمر البيع {a.get('order_id', '')}",
-    }, entity_type="sale_order",
+    },
+    entity_type="sale_order",
 )
 ACCOUNT_POST_INVOICE = WriteVerb(
-    verb="account.post_invoice", tier="HIGH", doctype="account.move", op="method",
-    method="action_post", reverse_method="button_draft", required=("invoice_id",),
+    verb="account.post_invoice",
+    tier="HIGH",
+    doctype="account.move",
+    op="method",
+    method="action_post",
+    reverse_method="button_draft",
+    required=("invoice_id",),
     to_native=_to_native_method_only,
     preview=lambda a: {
         "en": f"Post invoice {a.get('invoice_id', '')} (commit it to the books)",
         "ar": f"ترحيل الفاتورة {a.get('invoice_id', '')} (تثبيتها في الدفاتر)",
-    }, entity_type="invoice",
+    },
+    entity_type="invoice",
 )
 ACCOUNT_REGISTER_PAYMENT = WriteVerb(
-    verb="account.register_payment", tier="HIGH", doctype="account.payment", op="create",
-    required=("partner_id", "amount"), to_native=_to_native_register_payment,
+    verb="account.register_payment",
+    tier="HIGH",
+    doctype="account.payment",
+    op="create",
+    required=("partner_id", "amount"),
+    to_native=_to_native_register_payment,
     preview=lambda a: {
         "en": f"Register a {a.get('payment_type', 'inbound')} payment of {a.get('amount', '')}"
         + f" for partner {a.get('partner_id', '')}",
         "ar": f"تسجيل دفعة ({a.get('payment_type', 'inbound')}) بمبلغ {a.get('amount', '')}"
         + f" للطرف {a.get('partner_id', '')}",
-    }, entity_type="payment",
-    supported_args=("partner_id", "amount", "payment_type", "journal_id", "date", "ref"),
+    },
+    entity_type="payment",
+    supported_args=(
+        "partner_id",
+        "amount",
+        "payment_type",
+        "journal_id",
+        "date",
+        "ref",
+    ),
 )
+
 
 # ── the CANONICAL Wosool verb vocabulary (SSOT plan Phase E) ──────────────────────────────────────
 # The baseline capability catalog is backend-agnostic: its cycles call ONE canonical verb set
@@ -455,15 +580,23 @@ def _to_native_services_create_invoice(args: dict[str, Any]) -> dict[str, Any]:
         doc["invoice_date"] = args["invoice_date"]
     lines = args.get("lines") or []
     if lines:
-        doc["invoice_line_ids"] = [(0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)]
+        doc["invoice_line_ids"] = [
+            (0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)
+        ]
     elif args.get("description") or args.get("amount") is not None:
         # Plan B5: an amount with no description must STILL produce the priced line — a line-less
         # invoice is rejected on post, and dropping the money silently was the live failure.
-        doc["invoice_line_ids"] = [(0, 0, {
-            "name": str(args.get("description") or "Service"),
-            "quantity": 1,
-            "price_unit": _maybe_float(args.get("amount", 0)),
-        })]
+        doc["invoice_line_ids"] = [
+            (
+                0,
+                0,
+                {
+                    "name": str(args.get("description") or "Service"),
+                    "quantity": 1,
+                    "price_unit": _maybe_float(args.get("amount", 0)),
+                },
+            )
+        ]
     return doc
 
 
@@ -497,7 +630,35 @@ def _to_native_commerce_create_product(args: dict[str, Any]) -> dict[str, Any]:
     return doc
 
 
-def _to_native_procurement_create_purchase_invoice(args: dict[str, Any]) -> dict[str, Any]:
+def _to_native_set_landed_cost(args: dict[str, Any]) -> dict[str, Any]:
+    """M9: landed cost per unit → Odoo `product.product.standard_price`.
+
+    The arithmetic is on data we already hold (the PO subtotal + freight + insurance + duties, over
+    the quantity received). The adapter computes it, never the model.
+
+    An uncomputable landed cost is REFUSED, not degraded. This function used to return `{}` when the
+    quantity was absent or zero — an EMPTY write. The edge dutifully wrote nothing, read nothing back
+    (`fields_written` was falsy, so the read-after-write branch was skipped) and reported
+    `claim: success, verified: true`. The platform announced it had set a cost it had not set, and
+    Finance would have found out from the ledger, a month later. The premise is declared on the verb
+    (`positive=("po_amount", "qty")`) and enforced at PROPOSE; this raise is the backstop for a caller
+    that reaches the translation directly, and surfaces as an honest terminal failure."""
+    qty = _maybe_float(args.get("qty") or 0)
+    if not qty or qty <= 0:
+        raise SystemError(
+            "landed cost is undefined without a positive received quantity (qty > 0)"
+        )
+    po_amount = _maybe_float(args.get("po_amount") or 0)
+    freight = _maybe_float(args.get("freight") or 0)
+    insurance = _maybe_float(args.get("insurance") or 0)
+    duties = _maybe_float(args.get("duties") or 0)
+    per_unit = (po_amount + freight + insurance + duties) / qty
+    return {"standard_price": round(per_unit, 4)}
+
+
+def _to_native_procurement_create_purchase_invoice(
+    args: dict[str, Any],
+) -> dict[str, Any]:
     """Canonical {supplier_id, currency, invoice_date?, lines?} → Odoo VENDOR BILL
     (`account.move`, in_invoice) — the purchase invoice in Odoo's vocabulary."""
     doc: dict[str, Any] = {"move_type": "in_invoice"}
@@ -507,60 +668,126 @@ def _to_native_procurement_create_purchase_invoice(args: dict[str, Any]) -> dict
         doc["invoice_date"] = args["invoice_date"]
     lines = args.get("lines") or []
     if lines:
-        doc["invoice_line_ids"] = [(0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)]
+        doc["invoice_line_ids"] = [
+            (0, 0, _invoice_line(ln)) for ln in lines if isinstance(ln, dict)
+        ]
     return doc
 
 
 WOSOOL_CREATE_CLIENT = WriteVerb(
-    verb="crm.create_client", tier="MEDIUM", doctype="res.partner", op="upsert",
-    required=("name",), to_native=_to_native_create_contact,
+    verb="crm.create_client",
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="upsert",
+    required=("name",),
+    to_native=_to_native_create_contact,
     preview=lambda a: {
-        "en": f'Create or update client “{a.get("name", "")}”'
-        + (f' <{a["email"]}>' if a.get("email") else ""),
-        "ar": f'إنشاء أو تحديث العميل «{a.get("name", "")}»'
-        + (f' <{a["email"]}>' if a.get("email") else ""),
-    }, entity_type="contact", dedup_keys=("email", "phone"),
+        "en": f"Create or update client “{a.get('name', '')}”"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+        "ar": f"إنشاء أو تحديث العميل «{a.get('name', '')}»"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+    },
+    entity_type="contact",
+    dedup_keys=("email", "phone"),
     supported_args=("name", "phone", "email", "company", "is_company"),
 )
 WOSOOL_CREATE_INVOICE = WriteVerb(
-    verb="services.create_invoice", tier="HIGH", doctype="account.move", op="create",
-    required=("client_id",), to_native=_to_native_services_create_invoice,
+    verb="services.create_invoice",
+    tier="HIGH",
+    doctype="account.move",
+    op="create",
+    required=("client_id",),
+    to_native=_to_native_services_create_invoice,
     preview=lambda a: {
         "en": f"Create a customer invoice for client {a.get('client_id', '')}"
-        + (f' — “{a["description"]}”' if a.get("description") else ""),
+        + (f" — “{a['description']}”" if a.get("description") else ""),
         "ar": f"إنشاء فاتورة للعميل {a.get('client_id', '')}"
-        + (f' — «{a["description"]}»' if a.get("description") else ""),
-    }, entity_type="invoice",
-    supported_args=("client_id", "currency", "description", "amount", "invoice_date", "lines"),
+        + (f" — «{a['description']}»" if a.get("description") else ""),
+    },
+    entity_type="invoice",
+    supported_args=(
+        "client_id",
+        "currency",
+        "description",
+        "amount",
+        "invoice_date",
+        "lines",
+    ),
     references=(("currency", "currency_id", "res.currency"),),
 )
 WOSOOL_RECORD_PAYMENT = WriteVerb(
-    verb="commerce.record_payment", tier="HIGH", doctype="account.payment", op="create",
-    required=("invoice_id", "amount"), to_native=_to_native_commerce_record_payment,
+    verb="commerce.record_payment",
+    tier="HIGH",
+    doctype="account.payment",
+    op="create",
+    required=("invoice_id", "amount"),
+    to_native=_to_native_commerce_record_payment,
     preview=lambda a: {
         "en": f"Record a payment of {a.get('amount', '')} against invoice {a.get('invoice_id', '')}",
         "ar": f"تسجيل دفعة بمبلغ {a.get('amount', '')} على الفاتورة {a.get('invoice_id', '')}",
-    }, entity_type="payment",
+    },
+    entity_type="payment",
     supported_args=("invoice_id", "amount", "partner_id", "journal_id", "date"),
 )
 WOSOOL_CREATE_PRODUCT = WriteVerb(
-    verb="commerce.create_product", tier="MEDIUM", doctype="product.product", op="create",
-    required=("name",), to_native=_to_native_commerce_create_product,
+    verb="commerce.create_product",
+    tier="MEDIUM",
+    doctype="product.product",
+    op="create",
+    required=("name",),
+    to_native=_to_native_commerce_create_product,
     preview=lambda a: {
-        "en": f'Create product “{a.get("name", "")}”'
+        "en": f"Create product “{a.get('name', '')}”"
         + (f" at {a['price']}" if a.get("price") is not None else ""),
-        "ar": f'إنشاء منتج «{a.get("name", "")}»'
+        "ar": f"إنشاء منتج «{a.get('name', '')}»"
         + (f" بسعر {a['price']}" if a.get("price") is not None else ""),
-    }, entity_type="product",
+    },
+    entity_type="product",
     supported_args=("name", "price", "sku"),
 )
+WOSOOL_SET_LANDED_COST = WriteVerb(
+    # M9: landed cost per unit — arithmetic on data we already hold, written back to Odoo's SSOT.
+    # The adapter does the arithmetic (never the model); the per-unit cost = (PO subtotal + freight +
+    # insurance + duties) / quantity received lands on the product's `standard_price` — the cost of
+    # goods Finance reads. op="update": we mutate an existing product, not mint one.
+    verb="commerce.set_landed_cost",
+    tier="HIGH",
+    doctype="product.product",
+    op="update",
+    # The PO amount and the received quantity are REQUIRED, and both must be positive: this verb is
+    # arithmetic, and there is no landed cost without them. (It required only `product_id` before, so
+    # a cycle could call it with nothing to compute and be told it had succeeded.) The Daftara binding
+    # of this same capability declares the identical contract — two bindings, one contract.
+    required=("product_id", "po_amount", "qty"),
+    positive=("po_amount", "qty"),
+    to_native=_to_native_set_landed_cost,
+    preview=lambda a: {
+        "en": f"Set landed cost on product {a.get('product_id', '')}",
+        "ar": f"تحديد تكلفة الوصول للمنتج {a.get('product_id', '')}",
+    },
+    entity_type="product",
+    supported_args=(
+        "product_id",
+        "po_amount",
+        "freight",
+        "insurance",
+        "duties",
+        "qty",
+        "sku",
+    ),
+)
 WOSOOL_CREATE_PURCHASE_INVOICE = WriteVerb(
-    verb="procurement.create_purchase_invoice", tier="HIGH", doctype="account.move", op="create",
-    required=("supplier_id",), to_native=_to_native_procurement_create_purchase_invoice,
+    verb="procurement.create_purchase_invoice",
+    tier="HIGH",
+    doctype="account.move",
+    op="create",
+    required=("supplier_id",),
+    to_native=_to_native_procurement_create_purchase_invoice,
     preview=lambda a: {
         "en": f"Record a purchase invoice (vendor bill) from supplier {a.get('supplier_id', '')}",
         "ar": f"تسجيل فاتورة مشتريات من المورد {a.get('supplier_id', '')}",
-    }, entity_type="invoice",
+    },
+    entity_type="invoice",
     supported_args=("supplier_id", "currency", "invoice_date", "lines"),
     references=(("currency", "currency_id", "res.currency"),),
 )
@@ -570,7 +797,9 @@ CRM_LIST_LEADS = QueryVerb(verb="crm.list_leads", run=_run_list_leads)
 CRM_LIST_CONTACTS = QueryVerb(verb="crm.list_contacts", run=_run_list_contacts)
 CRM_LIST_STAGES = QueryVerb(verb="crm.list_stages", run=_run_list_stages)
 CRM_LIST_COUNTRIES = QueryVerb(verb="crm.list_countries", run=_run_list_countries)
-CRM_GET_CONTACT_BY_PHONE = QueryVerb(verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone)
+CRM_GET_CONTACT_BY_PHONE = QueryVerb(
+    verb="crm.get_contact_by_phone", run=_run_get_contact_by_phone
+)
 CRM_FIND_CONTACT = QueryVerb(verb="crm.find_contact", run=_run_find_contact)
 CRM_GET_CONTACT = QueryVerb(verb="crm.get_contact", run=_run_get_contact)
 
@@ -587,36 +816,83 @@ def _to_native_create_purchase_order(args: dict[str, Any]) -> dict[str, Any]:
     lines = args.get("lines") or []
     if lines:
         doc["order_line"] = [
-            (0, 0, {
-                "product_id": _maybe_int(ln.get("product_id")),
-                "product_qty": _maybe_float(ln.get("product_qty", 1)),
-                "product_uom": _maybe_int(ln.get("product_uom", 1)),
-                "price_unit": _maybe_float(ln.get("price_unit", 0)),
-                **({"taxes_id": [(6, 0, ln["taxes_id"])]} if ln.get("taxes_id") else {}),
-                **({"date_planned": ln["date_planned"]} if ln.get("date_planned") else {}),
-            })
-            for ln in lines if isinstance(ln, dict)
+            (
+                0,
+                0,
+                {
+                    "product_id": _maybe_int(ln.get("product_id")),
+                    "product_qty": _maybe_float(ln.get("product_qty", 1)),
+                    "product_uom": _maybe_int(ln.get("product_uom", 1)),
+                    "price_unit": _maybe_float(ln.get("price_unit", 0)),
+                    **(
+                        {"taxes_id": [(6, 0, ln["taxes_id"])]}
+                        if ln.get("taxes_id")
+                        else {}
+                    ),
+                    **(
+                        {"date_planned": ln["date_planned"]}
+                        if ln.get("date_planned")
+                        else {}
+                    ),
+                },
+            )
+            for ln in lines
+            if isinstance(ln, dict)
         ]
     return doc
 
 
 PURCHASE_CREATE_ORDER = WriteVerb(
-    verb="purchase.create_order", tier="MEDIUM", doctype="purchase.order", op="create",
-    required=("partner_id",), to_native=_to_native_create_purchase_order,
+    verb="purchase.create_order",
+    tier="MEDIUM",
+    doctype="purchase.order",
+    op="create",
+    required=("partner_id",),
+    to_native=_to_native_create_purchase_order,
     preview=lambda a: {
         "en": f"Create purchase order for partner {a.get('partner_id', '')}",
         "ar": f"إنشاء أمر شراء للمورد {a.get('partner_id', '')}",
-    }, entity_type="purchase_order",
+    },
+    entity_type="purchase_order",
     supported_args=("partner_id", "date_order", "origin", "lines"),
 )
+PURCHASE_DELETE_ORDER = WriteVerb(
+    # The INVERSE of purchase.create_order — and the reason the dual PO can be a saga at all.
+    #
+    # `purchase.create_order` was declared IRREVERSIBLE (absent from COMPENSATIONS), which meant the
+    # M8 definition of done — "refusing the Daftara leg compensates per envelope" — was not merely
+    # unproven, it was IMPOSSIBLE: there was nothing to compensate the Odoo leg WITH. A purchase order
+    # that this verb created is a DRAFT (confirming it is a separate, HIGH-tier verb), and a draft PO
+    # unlinks cleanly in Odoo. If the world has moved on and the order was confirmed or received,
+    # Odoo REFUSES the unlink — and the edge reports that refusal as a terminal failure rather than
+    # swallowing it, which is exactly the behaviour a compensation must have.
+    verb="purchase.delete_order",
+    tier="HIGH",  # deleting is HIGH in this adapter, as every other delete verb is
+    doctype="purchase.order",
+    op="delete",
+    required=("order_id",),
+    to_native=lambda _a: {},
+    preview=lambda a: {
+        "en": f"Delete purchase order {a.get('order_id', '')}",
+        "ar": f"حذف أمر الشراء {a.get('order_id', '')}",
+    },
+    entity_type="purchase_order",
+    supported_args=("order_id",),
+)
 PURCHASE_CONFIRM_ORDER = WriteVerb(
-    verb="purchase.confirm_order", tier="HIGH", doctype="purchase.order", op="method",
-    method="button_confirm", reverse_method="button_cancel", required=("order_id",),
+    verb="purchase.confirm_order",
+    tier="HIGH",
+    doctype="purchase.order",
+    op="method",
+    method="button_confirm",
+    reverse_method="button_cancel",
+    required=("order_id",),
     to_native=_to_native_method_only,
     preview=lambda a: {
         "en": f"Confirm purchase order {a.get('order_id', '')}",
         "ar": f"تأكيد أمر الشراء {a.get('order_id', '')}",
-    }, entity_type="purchase_order",
+    },
+    entity_type="purchase_order",
 )
 
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
@@ -640,7 +916,12 @@ from odoo_nil_adapter.read_plane import build_read_plane  # noqa: E402
 
 import weakref  # noqa: E402
 
-_READ_REFUSALS = (ResultTooLarge, InvalidFilter, CapabilityUnsupported, BulkApprovalRequired)
+_READ_REFUSALS = (
+    ResultTooLarge,
+    InvalidFilter,
+    CapabilityUnsupported,
+    BulkApprovalRequired,
+)
 # Keyed by the client OBJECT (WeakKeyDictionary), not id(client): id() is reused after GC, which would
 # hand a fresh client a stale plane bound to a dead backend. Weak keys are GC-safe and collision-free.
 _PLANES: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
@@ -655,8 +936,11 @@ def _plane(client: SystemClient) -> Any:
 
 
 def _refusal(exc: Exception) -> dict[str, Any]:
-    return {"outcome": "refused", "code": getattr(exc, "code", "ERROR"),
-            "message": getattr(exc, "message", str(exc))}
+    return {
+        "outcome": "refused",
+        "code": getattr(exc, "code", "ERROR"),
+        "message": getattr(exc, "message", str(exc)),
+    }
 
 
 # Default to an EMPTY grant (`()`), so the ReadPlane redacts every field classified sensitive
@@ -670,8 +954,12 @@ def _grant(args: dict[str, Any]) -> tuple[str, ...]:
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).search(
-            args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
-            limit=int(args.get("limit") or 50), cursor=args.get("cursor"), grant_fields=_grant(args),
+            args["target"],
+            filter=args.get("filter") or [],
+            fields=args.get("fields"),
+            limit=int(args.get("limit") or 50),
+            cursor=args.get("cursor"),
+            grant_fields=_grant(args),
         )
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -686,8 +974,12 @@ def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]
 
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        rec = _plane(client).get(args["target"], record_id=args.get("id"), fields=args.get("fields"),
-                                 grant_fields=_grant(args))
+        rec = _plane(client).get(
+            args["target"],
+            record_id=args.get("id"),
+            fields=args.get("fields"),
+            grant_fields=_grant(args),
+        )
         return rec if rec is not None else {"found": False, "id": args.get("id")}
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -696,8 +988,10 @@ def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
 def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).aggregate(
-            args["target"], filter=args.get("filter") or [],
-            group_by=args["group_by"], metrics=tuple(args.get("metrics") or ("count",)),
+            args["target"],
+            filter=args.get("filter") or [],
+            group_by=args["group_by"],
+            metrics=tuple(args.get("metrics") or ("count",)),
         )
     except _READ_REFUSALS as exc:
         return _refusal(exc)
@@ -706,12 +1000,21 @@ def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, 
 def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         handle = _plane(client).export(
-            args["target"], filter=args.get("filter") or [], fields=args.get("fields"),
-            tenant=str(args.get("tenant") or "default"), now=datetime.now(UTC),
+            args["target"],
+            filter=args.get("filter") or [],
+            fields=args.get("fields"),
+            tenant=str(args.get("tenant") or "default"),
+            now=datetime.now(UTC),
             approved=bool(args.get("approved")),
         )
-        return {"handle": handle.handle, "format": handle.format, "rows": handle.rows,
-                "bytes": handle.bytes, "schema": handle.schema, "expires_at": handle.expires_at.isoformat()}
+        return {
+            "handle": handle.handle,
+            "format": handle.format,
+            "rows": handle.rows,
+            "bytes": handle.bytes,
+            "schema": handle.schema,
+            "expires_at": handle.expires_at.isoformat(),
+        }
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -734,11 +1037,19 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         Binding(attr=b.get("attr"), rel=b.get("rel"), value=b.get("value"))
         for b in (args.get("where") or [])
     )
-    intent = Intent(about=args.get("about", ""), where=where, seek=args.get("seek", "all"),
-                    by=args.get("by"), limit=int(args.get("limit") or 50), cursor=args.get("cursor"))
+    intent = Intent(
+        about=args.get("about", ""),
+        where=where,
+        seek=args.get("seek", "all"),
+        by=args.get("by"),
+        limit=int(args.get("limit") or 50),
+        cursor=args.get("cursor"),
+    )
     try:
         outcome = _resolver(client).resolve(intent)
-    except SystemError as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
+    except (
+        SystemError
+    ) as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "UPSTREAM_ERROR", "message": str(exc)}
     except Exception as exc:  # noqa: BLE001 — any resolution fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "INTENT_ERROR", "message": str(exc)}
@@ -761,6 +1072,7 @@ _NIL_QUERY_VERBS: dict[str, QueryVerb] = {
 # importing it here would cycle. The pack aggregators (all_write_verbs etc.) import governance
 # lazily and are only called AFTER this module finishes loading.
 from odoo_nil_adapter import packs as _packs_mod  # noqa: E402
+
 _packs_mod._init_packs()
 
 # Reassign the public API to pack-aggregated values (behavior-preserving: all packs enabled by default,

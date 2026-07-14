@@ -6,55 +6,303 @@
     "kind": "odoo",
     "transport": "xmlrpc-2",
     "server_version": "saas~19.3",
-    "models": ["crm.lead", "res.partner", "crm.stage"]
+    "models": [
+      "crm.lead",
+      "res.partner",
+      "crm.stage"
+    ]
   },
   "verbs": {
-    "crm.create_lead": {
-      "doctype": "crm.lead",
+    "account.create_invoice": {
+      "doctype": "account.move",
+      "op": "create",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "partner_id"
+      ],
+      "hidden_requirements": []
+    },
+    "account.post_invoice": {
+      "doctype": "account.move",
+      "op": "method",
+      "tier": "HIGH",
+      "reversibility": "COMPENSABLE",
+      "required": [
+        "invoice_id"
+      ],
+      "hidden_requirements": [],
+      "method": "action_post",
+      "compensation": {
+        "verb": "resource.method",
+        "arg_map": {
+          "target": "account.move",
+          "id": "$.result.entity.id",
+          "method": "button_draft"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "account.register_payment": {
+      "doctype": "account.payment",
+      "op": "create",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "partner_id",
+        "amount"
+      ],
+      "hidden_requirements": []
+    },
+    "commerce.create_product": {
+      "doctype": "product.product",
+      "op": "create",
+      "tier": "MEDIUM",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "name"
+      ],
+      "hidden_requirements": []
+    },
+    "commerce.record_payment": {
+      "doctype": "account.payment",
+      "op": "create",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "invoice_id",
+        "amount"
+      ],
+      "hidden_requirements": []
+    },
+    "commerce.set_landed_cost": {
+      "doctype": "product.product",
+      "op": "update",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "product_id",
+        "po_amount",
+        "qty"
+      ],
+      "hidden_requirements": []
+    },
+    "crm.create_client": {
+      "doctype": "res.partner",
+      "op": "upsert",
       "tier": "MEDIUM",
       "reversibility": "REVERSIBLE",
-      "hidden_requirements": []
+      "required": [
+        "name"
+      ],
+      "hidden_requirements": [],
+      "dedup_keys": [
+        "email",
+        "phone"
+      ],
+      "compensation": {
+        "verb": "crm.delete_contact",
+        "arg_map": {
+          "id": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
     },
     "crm.create_contact": {
       "doctype": "res.partner",
       "op": "upsert",
       "tier": "MEDIUM",
-      "reversibility": "CONDITIONAL",
-      "dedup_keys": ["email", "phone"],
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "name"
+      ],
+      "hidden_requirements": [],
+      "dedup_keys": [
+        "email",
+        "phone"
+      ],
+      "compensation": {
+        "verb": "crm.delete_contact",
+        "arg_map": {
+          "id": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "crm.create_lead": {
+      "doctype": "crm.lead",
+      "op": "create",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "name"
+      ],
+      "hidden_requirements": [],
+      "compensation": {
+        "verb": "crm.delete_lead",
+        "arg_map": {
+          "id": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "crm.delete_contact": {
+      "doctype": "res.partner",
+      "op": "delete",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "contact_id"
+      ],
       "hidden_requirements": []
+    },
+    "crm.delete_lead": {
+      "doctype": "crm.lead",
+      "op": "delete",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "lead_id"
+      ],
+      "hidden_requirements": []
+    },
+    "crm.log_note": {
+      "doctype": "res.partner",
+      "op": "method",
+      "tier": "MEDIUM",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "contact_id",
+        "body"
+      ],
+      "hidden_requirements": [],
+      "method": "message_post"
     },
     "crm.update_contact": {
       "doctype": "res.partner",
       "op": "update",
       "tier": "MEDIUM",
       "reversibility": "COMPENSABLE",
-      "hidden_requirements": []
-    },
-    "crm.log_note": {
-      "doctype": "res.partner",
-      "op": "method",
-      "method": "message_post",
-      "tier": "MEDIUM",
-      "reversibility": "IRREVERSIBLE",
-      "hidden_requirements": []
+      "required": [
+        "contact_id"
+      ],
+      "hidden_requirements": [],
+      "compensation": {
+        "verb": "resource.update",
+        "arg_map": {
+          "target": "res.partner",
+          "id": "$.result.entity.id",
+          "data": "$.before_image"
+        },
+        "tier": "MEDIUM",
+        "window": "P30D"
+      }
     },
     "crm.update_lead_stage": {
       "doctype": "crm.lead",
+      "op": "update",
       "tier": "MEDIUM",
       "reversibility": "IRREVERSIBLE",
+      "required": [
+        "lead_id",
+        "stage_id"
+      ],
       "hidden_requirements": []
     },
-    "crm.delete_lead": {
-      "doctype": "crm.lead",
+    "procurement.create_purchase_invoice": {
+      "doctype": "account.move",
+      "op": "create",
       "tier": "HIGH",
       "reversibility": "IRREVERSIBLE",
+      "required": [
+        "supplier_id"
+      ],
       "hidden_requirements": []
     },
-    "crm.delete_contact": {
-      "doctype": "res.partner",
+    "purchase.confirm_order": {
+      "doctype": "purchase.order",
+      "op": "method",
+      "tier": "HIGH",
+      "reversibility": "COMPENSABLE",
+      "required": [
+        "order_id"
+      ],
+      "hidden_requirements": [],
+      "method": "button_confirm",
+      "compensation": {
+        "verb": "resource.method",
+        "arg_map": {
+          "target": "purchase.order",
+          "id": "$.result.entity.id",
+          "method": "button_cancel"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "purchase.create_order": {
+      "doctype": "purchase.order",
+      "op": "create",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "partner_id"
+      ],
+      "hidden_requirements": [],
+      "compensation": {
+        "verb": "purchase.delete_order",
+        "arg_map": {
+          "id": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "purchase.delete_order": {
+      "doctype": "purchase.order",
+      "op": "delete",
       "tier": "HIGH",
       "reversibility": "IRREVERSIBLE",
+      "required": [
+        "order_id"
+      ],
       "hidden_requirements": []
+    },
+    "sale.confirm_order": {
+      "doctype": "sale.order",
+      "op": "method",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "order_id"
+      ],
+      "hidden_requirements": [],
+      "method": "action_confirm"
+    },
+    "services.create_invoice": {
+      "doctype": "account.move",
+      "op": "create",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "client_id"
+      ],
+      "hidden_requirements": []
+    },
+    "stock.validate_picking": {
+      "doctype": "stock.picking",
+      "op": "method",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "picking_id"
+      ],
+      "hidden_requirements": [],
+      "method": "button_validate"
     }
   },
   "transport_quirks": []

@@ -1,0 +1,73 @@
+name: conformance
+
+# The three conformance gates. This repo had NONE of them wired: the offline suite was only ever run
+# by hand, and `manifest validate` had never run at all — which is exactly why the committed
+# requirements-manifest.json was structurally INVALID (a `reversibility: "CONDITIONAL"` that is not a
+# tier; REVERSIBLE verbs with no compensation block) and listed 7 of 21 verbs. A gate nobody runs is
+# a gate that does not exist.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      shim_url:
+        description: "Base URL of a running shim, for the opt-in LIVE gate"
+        required: false
+        default: ""
+      live_verb:
+        description: "A write verb to exercise live, e.g. purchase.create_order"
+        required: false
+        default: ""
+
+jobs:
+  # Gate 1 — the offline proof (FakeSystem; no live Odoo needed). The adapter's read plane binds to
+  # `nilscript.dataplane`, so the kernel must be installed; it is not on PyPI yet.
+  offline:
+    name: offline proof (FakeSystem)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the nilscript kernel (the read plane's engine)
+        run: pip install "nilscript[sdk] @ git+https://github.com/nilscript-org/nilscript.git"
+      - name: Install the shim
+        run: pip install -e ".[dev]"
+      - name: Conformance proof — every write verb reaches `executed`, every reversal RUNS
+        run: pytest -q conformance
+
+  # Gate 2 — manifest honesty. The committed requirements-manifest.json must be structurally valid.
+  # `test_manifest_declares_every_write_verb_and_agrees_with_the_code` (gate 1) keeps it COMPLETE;
+  # this keeps it VALID.
+  manifest:
+    name: manifest validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the nilscript CLI
+        run: pip install "nilscript[cli] @ git+https://github.com/nilscript-org/nilscript.git"
+      - name: Validate the requirements manifest
+        run: nilscript manifest validate requirements-manifest.json
+
+  # Gate 3 — the LIVE proof. Opt-in via "Run workflow" with a shim_url + a verb, because it needs a
+  # reachable Odoo. conformance-test runs ONE verb per call (including its rollback-honesty rows).
+  live:
+    name: live conformance (opt-in)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.shim_url != '' && inputs.live_verb != ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the shim and the nilscript CLI
+        run: |
+          pip install -e ".[dev]"
+          pip install "nilscript[cli] @ git+https://github.com/nilscript-org/nilscript.git"
+      - name: Live conformance for one verb (incl. its rollback-honesty tier)
+        run: nilscript conformance-test --url "${{ inputs.shim_url }}" --verb "${{ inputs.live_verb }}"

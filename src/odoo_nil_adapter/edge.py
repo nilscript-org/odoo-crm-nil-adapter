@@ -556,6 +556,15 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         missing = verb.missing(args)
         if missing:
             return _refusal(env, "INVALID_ARGS", f"missing required arg: {missing[0]}", field=missing[0])
+        # An effect whose arithmetic is undefined is not a small effect — it is NO effect. A verb that
+        # cannot compute its own payload (a landed cost over a received quantity of zero) must say so
+        # HERE, before a human approves it, instead of writing an empty doc and reporting success.
+        nonpositive = verb.nonpositive(args)
+        if nonpositive:
+            return _refusal(
+                env, "INVALID_ARGS",
+                f"'{nonpositive[0]}' must be a number greater than zero — the effect cannot be "
+                f"computed otherwise", field=nonpositive[0])
         # Preflight (universal): refuse at PROPOSE if the native target isn't provisioned.
         if not client.exists(verb.doctype):
             return _refusal(env, "UPSTREAM_UNAVAILABLE",
@@ -786,8 +795,26 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         fields_written = native if verb.op in ("create", "update", "upsert") else {}
         effect_id = str(created.get("id") or created.get("name") or "")
         field_diff: list[dict[str, Any]] = []
+        # COMPENSATION HONESTY. `purchase.delete_order` / `crm.delete_*` are the inverses the
+        # REVERSIBLE verbs are compensated BY, so this is the path a ROLLBACK actually commits — and a
+        # reversal that did not happen must never be recorded as one. A delete whose record is still
+        # there afterwards is a FAILED write, not a partial one: no ledger row, no compensation token,
+        # no `executed` EVENT, so no caller can read it as "compensated". (A backend that REFUSES the
+        # delete already landed in the SystemError branch; this catches the quieter one — the backend
+        # that accepts it and removes nothing.)
+        if verb.op == "delete" and client.get(verb.doctype, effect_id) is not None:
+            print(f"[shim] WRITE did NOT land: {verb.doctype}/{effect_id} still exists", flush=True)
+            return _envelope("STATUS", env, {
+                "proposal": proposal_id, "state": "failed_terminal", "replayed": False,
+                "result": {
+                    "claim": "failed", "changed": False, "verified": False,
+                    "error": {"code": "WRITE_NOT_LANDED",
+                              "message": f"the backend accepted the delete but {verb.doctype}/"
+                                         f"{effect_id} still exists — it was NOT removed"},
+                    "ssot": {"system": SYSTEM, "read_after_write": True},
+                }})
         if verb.op == "delete":
-            unverified, verified, did_read = [], client.get(verb.doctype, effect_id) is None, True
+            unverified, verified, did_read = [], True, True  # witnessed gone, just above
         elif fields_written and effect_id:
             unverified, field_diff = _verify_and_diff(client, verb.doctype, effect_id, before_image, fields_written)
             verified, did_read = (not unverified), True
@@ -952,9 +979,19 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             # Contract conformance (plan C1): the DECLARED per-verb arg surface, so the control
             # plane can check a capability's cycle provides every arg this backend requires —
             # CONTRACT_MISMATCH at readiness instead of a silent failure after approval.
+            # `tier` and `reversibility` are CONTRACT, not law: facts about what this backend can do
+            # and can undo. The control plane's registry DECIDES the governance tier and the approvers
+            # (capability.risk + the strategy the owner authors) and reads these as the fail-closed
+            # floor — an undeclared tier counts as HIGH, an undeclared reversibility as IRREVERSIBLE
+            # (`nilscript.capability.wrap`). Reversibility was ABSENT here, so every reversible verb
+            # registered as IRREVERSIBLE: the platform held compensations it could not know it had.
             "verb_details": [
                 {"verb": v.verb, "tier": v.tier, "target": v.doctype,
-                 "required": list(v.required)}
+                 "required": list(v.required),
+                 "reversibility": (
+                     "COMPENSABLE" if v.reverse_method
+                     else COMPENSATIONS.get(v.verb, {}).get("reversibility", "IRREVERSIBLE")
+                 )}
                 for _, v in sorted(WRITE_VERBS.items())
             ],
             # The RESOURCES this backend can be the system of record for, and the native model it

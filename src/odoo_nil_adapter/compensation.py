@@ -29,12 +29,20 @@ COMPENSATIONS: dict[str, dict[str, Any]] = {
     # canonical Wosool vocabulary: same res.partner upsert as create_contact, same reversal.
     "crm.create_client": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
     "crm.update_contact": {"reversibility": "COMPENSABLE", "strategy": "before_image"},
+    # M8, the dual PO. `purchase.create_order` was IRREVERSIBLE — absent from this table — which made
+    # the two-binding saga impossible to unwind: when the Daftara leg refused, there was nothing to
+    # compensate the Odoo leg WITH. The order this verb creates is a DRAFT (confirming it is a
+    # separate verb), and a draft purchase order unlinks cleanly; once it is confirmed or received,
+    # Odoo refuses the unlink and the edge reports that refusal as a terminal failure — which is what
+    # a compensation owes its caller. A reversal that cannot run is not a reversal.
+    "purchase.create_order": {"reversibility": "REVERSIBLE", "verb": "purchase.delete_order"},
 }
 
 # compensating verb -> the arg that carries the real record id to act on.
 _COMP_ID_ARG: dict[str, str] = {
     "crm.delete_lead": "lead_id",
     "crm.delete_contact": "contact_id",
+    "purchase.delete_order": "order_id",
 }
 
 

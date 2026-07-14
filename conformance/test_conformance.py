@@ -20,8 +20,23 @@ def _env(verb: str, args: dict) -> dict:
     return {"nil": "0.1", "grant": "g", "workspace": "w", "body": {"verb": verb, "args": args}}
 
 
+def args_for(verb_name: str) -> dict:
+    """Valid-shaped placeholder args: "x" for every required field, EXCEPT the fields the verb
+    declares `positive` — those are arithmetic inputs, and "x" is not a number.
+
+    The harness used to seed "x" everywhere, which forced `commerce.set_landed_cost` to tolerate a
+    non-numeric quantity and "degrade" — writing an EMPTY doc while still reporting `executed` and
+    `claim: success`. The test's convenience was dictating the product's honesty. The seed is
+    realistic now, so the verb is free to refuse a cost it cannot compute."""
+    verb = WRITE_VERBS[verb_name]
+    args: dict = {field: "x" for field in verb.required}
+    for field in verb.positive:
+        args[field] = "10"
+    return args
+
+
 def _commit(client, verb_name: str) -> dict:
-    args = {field: "x" for field in WRITE_VERBS[verb_name].required}
+    args = args_for(verb_name)
     pid = client.post("/nil/v0.1/propose", json=_env(verb_name, args)).json()["body"]["id"]
     return client.post(
         "/nil/v0.1/commit",
@@ -55,7 +70,7 @@ def test_rollback_honesty() -> None:
 def test_write_verb_reaches_executed(verb_name: str) -> None:
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
     verb = WRITE_VERBS[verb_name]
-    args = {field: "x" for field in verb.required}  # placeholder valid-shaped args
+    args = args_for(verb_name)  # placeholder valid-shaped args
 
     proposed = client.post("/nil/v0.1/propose", json=_env(verb_name, args)).json()
     proposal_id = proposed.get("body", {}).get("id")
