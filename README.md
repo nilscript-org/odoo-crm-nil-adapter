@@ -32,6 +32,22 @@ per-model authoring.
 
 Read-through (no side effects): `crm.list_leads`, `crm.list_contacts`, `crm.list_stages`.
 
+**The ERP's own documents** (READS — no tier, no reversibility; they write nothing):
+
+| verb | record | Odoo report | returns |
+|---|---|---|---|
+| `purchase.get_order_document` | `purchase.order` | `purchase.report_purchaseorder` | base64 PDF + `content_type` + `filename` + **sha256 of the bytes** |
+| `account.get_invoice_document` | `account.move` | `account.report_invoice` | same |
+
+Creating a PO in Odoo returns the RECORD; the document is rendered by a **separate** call. Only Odoo's
+own QWeb render carries Odoo's numbering, tax lines, terms, logo and legal footer — so a document the
+platform renders itself is *not* the one in the system of record. These verbs fetch Odoo's bytes and
+hash them; a render that fails REFUSES (`DOCUMENT_UNAVAILABLE`) and never returns a substitute.
+Route: `render_qweb_pdf` over XML-RPC on Odoo ≤ 14; on Odoo ≥ 15 that method is private (`_render_qweb_pdf`)
+and unreachable over XML-RPC, so the adapter uses Odoo's report controller
+(`/web/session/authenticate` → `GET /report/pdf/<report>/<id>`). ⚠ **The live render is UNWITNESSED**
+— no sandbox credentials exist in this repo's environment; it must be driven on the Odoo sandbox.
+
 ¹ For a reversible field update, use the generic `resource.update` family — the edge captures a
 before-image and synthesizes a COMPENSABLE restore.
 

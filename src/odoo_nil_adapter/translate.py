@@ -11,6 +11,9 @@ an Odoo model name (`crm.lead`, `res.partner`). Two surfaces ship:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -84,8 +87,23 @@ class WriteVerb:
 
 @dataclass(frozen=True)
 class QueryVerb:
+    """A READ. It has no tier and no reversibility — not because they were forgotten, but because a
+    read has no effect to govern or to undo. `effect="read"` is declared EXPLICITLY (in describe and
+    in the manifest's `read_verbs` map) precisely so a consumer never has to infer it from absence:
+    absence, in the effect plane, fail-closes to IRREVERSIBLE, and a read must never register as an
+    unreversible write."""
+
     verb: str
     run: Callable[[SystemClient, dict[str, Any]], dict[str, Any]]
+    # Args the read cannot run without — the edge refuses a call that lacks one instead of crashing.
+    required: tuple[str, ...] = ()
+    target: str = ""  # the native model this read is about (declaration, not dispatch)
+    returns: str = "rows"  # "rows" | "document" — what the caller gets back
+    report: str = ""  # for returns="document": the ERP report that renders it (never rendered here)
+    effect: str = "read"
+
+    def missing(self, args: dict[str, Any]) -> list[str]:
+        return [field for field in self.required if not args.get(field)]
 
 
 def _maybe_int(value: Any) -> Any:
@@ -879,6 +897,107 @@ PURCHASE_DELETE_ORDER = WriteVerb(
     entity_type="purchase_order",
     supported_args=("order_id",),
 )
+# ── the ERP's OWN rendered documents (READ) ──────────────────────────────────────────────────────
+# Creating a PO or a bill in Odoo returns the RECORD. The DOCUMENT — the PDF the vendor receives — is
+# rendered by a SEPARATE call, from Odoo's own QWeb report, and only Odoo's render carries Odoo's
+# numbering, tax lines, payment terms, logo and legal footer. A document we render ourselves from the
+# record is a DIFFERENT document from the one in the system of record: a fabrication, and it breaks
+# the rule that what a human approves on the card is byte-identical to what the vendor receives.
+#
+# These verbs fetch the ERP's bytes and hash them. They compose nothing. They are READS: no tier, no
+# reversibility, absent from COMPENSATIONS and from the manifest's write-verb map by DESIGN.
+_PURCHASE_ORDER_REPORT = "purchase.report_purchaseorder"
+_VENDOR_BILL_REPORT = "account.report_invoice"
+_SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _document(
+    client: SystemClient, *, target: str, report_ref: str, record_id: Any, fallback: str
+) -> dict[str, Any]:
+    """Fetch the ERP's rendered document for one record → {document: {...}} or a structured refusal.
+
+    Every failure path REFUSES with DOCUMENT_UNAVAILABLE. There is no fallback renderer here and there
+    must never be one: "I could not get the official document" and "here is the official document"
+    must not produce the same answer."""
+    rid = str(record_id or "").strip()
+    if not rid:
+        return {"outcome": "refused", "code": "DOCUMENT_UNAVAILABLE", "message": "no record id given"}
+    try:
+        rows = client.search(target, [["id", "=", _maybe_int(rid)]], fields=("id", "name"), limit=1)
+    except SystemError as exc:
+        return {"outcome": "refused", "code": "DOCUMENT_UNAVAILABLE", "message": str(exc)}
+    if not rows:
+        return {
+            "outcome": "refused",
+            "code": "DOCUMENT_UNAVAILABLE",
+            "message": f"no {target} with id {rid}",
+        }
+    try:
+        pdf = client.render_report(report_ref, target, rid)
+    except SystemError as exc:
+        return {"outcome": "refused", "code": "DOCUMENT_UNAVAILABLE", "message": str(exc)}
+    if not pdf:
+        return {
+            "outcome": "refused",
+            "code": "DOCUMENT_UNAVAILABLE",
+            "message": f"{report_ref} rendered no bytes for {target}/{rid}",
+        }
+    # The filename is the RECORD'S OWN reference (Odoo's PO number / bill number) — never minted here.
+    ref = str(rows[0].get("name") or f"{fallback}-{rid}")
+    return {
+        "document": {
+            "filename": _SAFE_FILENAME.sub("_", ref)[:120] + ".pdf",
+            "content_type": "application/pdf",
+            "content_base64": base64.b64encode(pdf).decode("ascii"),
+            "sha256": hashlib.sha256(pdf).hexdigest(),  # of the ERP's bytes — what the ledger attests
+            "size": len(pdf),
+            "source": {
+                "system": "odoo_crm",
+                "report": report_ref,
+                "target": target,
+                "id": rid,
+            },
+        }
+    }
+
+
+def _run_get_order_document(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    return _document(
+        client,
+        target="purchase.order",
+        report_ref=_PURCHASE_ORDER_REPORT,
+        record_id=args.get("order_id"),
+        fallback="PO",
+    )
+
+
+def _run_get_invoice_document(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    return _document(
+        client,
+        target="account.move",
+        report_ref=_VENDOR_BILL_REPORT,
+        record_id=args.get("invoice_id"),
+        fallback="INV",
+    )
+
+
+PURCHASE_GET_ORDER_DOCUMENT = QueryVerb(
+    verb="purchase.get_order_document",
+    run=_run_get_order_document,
+    required=("order_id",),
+    target="purchase.order",
+    returns="document",
+    report=_PURCHASE_ORDER_REPORT,
+)
+ACCOUNT_GET_INVOICE_DOCUMENT = QueryVerb(
+    verb="account.get_invoice_document",
+    run=_run_get_invoice_document,
+    required=("invoice_id",),
+    target="account.move",
+    returns="document",
+    report=_VENDOR_BILL_REPORT,
+)
+
 PURCHASE_CONFIRM_ORDER = WriteVerb(
     verb="purchase.confirm_order",
     tier="HIGH",

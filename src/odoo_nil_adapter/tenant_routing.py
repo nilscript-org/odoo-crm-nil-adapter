@@ -128,6 +128,12 @@ class VaultResolvingClient:
     def get(self, target: str, record_id: str) -> dict[str, Any] | None:
         return self._real().get(target, record_id)
 
+    def render_report(self, report_ref: str, target: str, record_id: str) -> bytes:
+        # The ERP's own rendered document, fetched with THIS tenant's credentials — the report
+        # controller/XML-RPC call is as tenant-bound as any other read. (The parity gate caught the
+        # missing delegation before production did: an undelegated method 500s every vault-mode call.)
+        return self._real().render_report(report_ref, target, record_id)
+
 
 def build_from_env() -> SystemClient | None:
     """A VaultResolvingClient when NIL_REGISTRY_URL is set (SaaS multi-tenant mode), else None

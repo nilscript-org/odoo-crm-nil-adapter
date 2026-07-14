@@ -107,6 +107,7 @@ def _make_crm_pack() -> ModulePack:
 def _make_finance_pack() -> ModulePack:
     from odoo_nil_adapter.translate import (  # noqa: PLC0415
         ACCOUNT_CREATE_INVOICE,
+        ACCOUNT_GET_INVOICE_DOCUMENT,
         ACCOUNT_POST_INVOICE,
         ACCOUNT_REGISTER_PAYMENT,
         WOSOOL_CREATE_INVOICE,
@@ -129,7 +130,8 @@ def _make_finance_pack() -> ModulePack:
             WOSOOL_RECORD_PAYMENT,
             WOSOOL_CREATE_PURCHASE_INVOICE,
         ),
-        query_verbs=(),
+        # A READ: the ERP's OWN rendered invoice / vendor bill (QWeb `account.report_invoice`).
+        query_verbs=(ACCOUNT_GET_INVOICE_DOCUMENT,),
         projections={
             "account.move": (
                 "id",
@@ -237,6 +239,7 @@ def _make_purchasing_pack() -> ModulePack:
         PURCHASE_CREATE_ORDER,
         PURCHASE_CONFIRM_ORDER,
         PURCHASE_DELETE_ORDER,
+        PURCHASE_GET_ORDER_DOCUMENT,
         WOSOOL_SET_LANDED_COST,
     )
 
@@ -253,7 +256,9 @@ def _make_purchasing_pack() -> ModulePack:
             PURCHASE_CONFIRM_ORDER,
             WOSOOL_SET_LANDED_COST,
         ),
-        query_verbs=(),
+        # A READ: the ERP's OWN rendered purchase order (QWeb `purchase.report_purchaseorder`). The
+        # document the vendor receives is Odoo's, never one we compose from the record.
+        query_verbs=(PURCHASE_GET_ORDER_DOCUMENT,),
         projections={
             "purchase.order": (
                 "id",

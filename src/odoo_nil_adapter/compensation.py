@@ -38,6 +38,19 @@ COMPENSATIONS: dict[str, dict[str, Any]] = {
     "purchase.create_order": {"reversibility": "REVERSIBLE", "verb": "purchase.delete_order"},
 }
 
+# READS ARE NOT LISTED HERE, AND THAT IS A DECISION, NOT AN OMISSION.
+# `purchase.get_order_document` / `account.get_invoice_document` fetch the ERP's OWN rendered PDF for
+# a record (QWeb `purchase.report_purchaseorder` / `account.report_invoice`). They write nothing, so
+# there is nothing to reverse: they carry no tier and no reversibility anywhere in this adapter. In
+# THIS table, absence means IRREVERSIBLE — a fail-closed default that is right for effects and wrong
+# for reads. So the reads live in QUERY_VERBS (translate.py), are advertised under
+# `query_verb_details` (edge.py) with an explicit `effect: "read"`, and are declared in the manifest's
+# separate `read_verbs` map — never in the write-verb map whose default this table supplies. Naming
+# them here (even as "IRREVERSIBLE: none") would file a non-effect in the effect plane.
+NON_EFFECTING_VERBS: frozenset[str] = frozenset(
+    {"purchase.get_order_document", "account.get_invoice_document"}
+)
+
 # compensating verb -> the arg that carries the real record id to act on.
 _COMP_ID_ARG: dict[str, str] = {
     "crm.delete_lead": "lead_id",

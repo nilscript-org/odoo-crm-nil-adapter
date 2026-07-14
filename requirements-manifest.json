@@ -305,5 +305,27 @@
       "method": "button_validate"
     }
   },
+  "read_verbs": {
+    "purchase.get_order_document": {
+      "effect": "read",
+      "target": "purchase.order",
+      "report": "purchase.report_purchaseorder",
+      "returns": "document",
+      "required": [
+        "order_id"
+      ],
+      "note": "Returns the ERP's OWN rendered PDF (base64 + content_type + filename + sha256 of the bytes). A READ: no tier, no reversibility — it writes nothing. Deliberately NOT in `verbs`, where an absent reversibility fail-closes to IRREVERSIBLE. The live QWeb render is UNWITNESSED (no sandbox credentials in the build environment) and must be driven on the Odoo sandbox."
+    },
+    "account.get_invoice_document": {
+      "effect": "read",
+      "target": "account.move",
+      "report": "account.report_invoice",
+      "returns": "document",
+      "required": [
+        "invoice_id"
+      ],
+      "note": "The ERP's own rendered invoice / vendor bill. Same contract, same UNWITNESSED caveat."
+    }
+  },
   "transport_quirks": []
 }

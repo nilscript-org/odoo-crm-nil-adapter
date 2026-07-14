@@ -877,7 +877,15 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         verb = QUERY_VERBS.get(body.get("verb"))
         if verb is None:
             raise HTTPException(status_code=404, detail="unknown query verb")
-        return {"data": verb.run(client, body.get("args", {}) or {})}  # bare { data }
+        args = body.get("args", {}) or {}
+        missing = verb.missing(args)
+        if missing:  # a read that cannot run is a structured refusal, never a 500 (and never an empty
+            return {"data": {  # answer — "nothing here" and "I could not look" are different answers)
+                "outcome": "refused",
+                "code": "MISSING_ARGS",
+                "message": f"{verb.verb} requires: {', '.join(missing)}",
+            }}
+        return {"data": verb.run(client, args)}  # bare { data }
 
     @app.get("/nil/v0.1/status/{proposal_id}")
     def status(proposal_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
@@ -993,6 +1001,18 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                      else COMPENSATIONS.get(v.verb, {}).get("reversibility", "IRREVERSIBLE")
                  )}
                 for _, v in sorted(WRITE_VERBS.items())
+            ],
+            # READS, declared as reads. They carry NO tier and NO reversibility — a read has no effect
+            # to govern or undo — and `effect: "read"` says so EXPLICITLY, so no consumer has to infer
+            # it from absence (absence in the effect contract above fail-closes to IRREVERSIBLE, which
+            # would register a non-effecting document fetch as an unreversible write).
+            # `returns: "document"` means the verb hands back the ERP's OWN rendered bytes + their
+            # sha256 — the attachment a governed send must use, never a document we render ourselves.
+            "query_verb_details": [
+                {"verb": v.verb, "effect": v.effect, "target": v.target,
+                 "required": list(v.required), "returns": v.returns,
+                 **({"report": v.report} if v.report else {})}
+                for _, v in sorted(QUERY_VERBS.items())
             ],
             # The RESOURCES this backend can be the system of record for, and the native model it
             # spells each as (Wave A). Authority names the resource; the adapter keeps its vocabulary.

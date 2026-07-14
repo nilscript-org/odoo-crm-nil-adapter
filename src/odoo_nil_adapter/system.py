@@ -10,9 +10,13 @@ passed in by the runner from the environment — this module never reads or hard
 
 from __future__ import annotations
 
+import json as _json
 import time
 import xmlrpc.client
+from http.cookiejar import CookieJar
 from typing import Any, Callable, Protocol
+from urllib.parse import quote
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 # Transport statuses worth retrying — Odoo rate-limits (429) and transient gateway faults (5xx). An
 # application Fault (bad args, access error) is NOT here: it is terminal and must surface immediately.
@@ -55,6 +59,10 @@ class SystemClient(Protocol):
     def schema(self, target: str) -> list[dict[str, Any]] | None: ...  # target shape (skeleton), or None
 
     def get(self, target: str, record_id: str) -> dict[str, Any] | None: ...  # one record (before-image)
+
+    def render_report(  # the ERP's OWN rendered document (QWeb PDF) for one record — a pure READ
+        self, report_ref: str, target: str, record_id: str
+    ) -> bytes: ...
 
 
 def _triple(row: dict[str, Any], triple: list[Any]) -> bool:
@@ -138,6 +146,7 @@ class RealSystemClient:
 
     def __init__(self, base_url: str, *, db: str, login: str, api_key: str,
                  max_retries: int = 3, backoff: float = 0.5, min_interval: float = 0.0,
+                 http_timeout: float = 30.0,
                  sleep: Callable[[float], None] = time.sleep,
                  monotonic: Callable[[], float] = time.monotonic) -> None:
         self._url = base_url.rstrip("/")
@@ -145,6 +154,8 @@ class RealSystemClient:
         self._login = login
         self._key = api_key
         self._uid: int | None = None
+        self._version_major: int | None = None  # lazily probed via common.version()
+        self._http_timeout = http_timeout       # the report controller is an HTTP GET, not XML-RPC
         self._fields_cache: dict[str, list[dict[str, Any]] | None] = {}
         # Durability (the adapter's slice — the "429 flood" lesson): retry transient transport faults
         # with exponential backoff, and optionally throttle to a minimum inter-call interval so a burst
@@ -290,6 +301,129 @@ class RealSystemClient:
         rows = self._kw(target, "read", [[rid]], {})
         return (_writable(rows[0]) | {"id": rid}) if rows else None
 
+    # ── the ERP's OWN rendered document (QWeb report → PDF bytes) ────────────────────────────
+    # Creating a purchase order in Odoo returns the RECORD, never the document. The PDF the vendor is
+    # meant to receive is rendered SEPARATELY, by Odoo's own QWeb report (purchase.report_purchaseorder,
+    # account.report_invoice) — with Odoo's numbering, tax lines, terms, logo and legal footer. Two
+    # routes exist to it, and WHICH one is open depends on the Odoo version:
+    #
+    #  • Odoo ≤ 14 — `ir.actions.report.render_qweb_pdf(res_ids)` is PUBLIC, so `execute_kw` may call it
+    #    on the report record. It returns (pdf_bytes, "pdf"); XML-RPC marshals the bytes as base64 and
+    #    xmlrpc.client hands them back as an `xmlrpc.client.Binary`.
+    #  • Odoo ≥ 15 — the method was renamed `_render_qweb_pdf`, and Odoo's `execute_kw` REFUSES any
+    #    method whose name begins with `_` (odoo.service.model.check_method_name → AccessError). So on
+    #    15+ the private method is not reachable over XML-RPC AT ALL. The honest route there is Odoo's
+    #    own report controller over HTTP:
+    #        POST /web/session/authenticate  (db + login + API key) → session cookie
+    #        GET  /report/pdf/<report_ref>/<record_id>              → the exact bytes Odoo itself mails
+    #
+    # We probe the server version, try the route that version exposes first, and fall back to the other
+    # rather than guess. If neither yields bytes we raise SystemError and the caller REFUSES: this
+    # adapter never synthesizes a document, and "I could not fetch the official PO" must never look
+    # like "here is the official PO".
+    #
+    # ⚠ UNWITNESSED: this environment holds NO live Odoo credentials, so the live render has NEVER been
+    # run. Everything below is witnessed only against FakeSystem. It MUST be driven on the Odoo sandbox
+    # (target instance: saas~19.3 → the HTTP controller route) before it is trusted.
+    def _server_major(self) -> int:
+        """Odoo's major version, or 0 when it cannot be probed (→ try both routes)."""
+        if self._version_major is None:
+            try:
+                info = self._common.version() or {}
+                parts = info.get("server_version_info") or []
+                self._version_major = int(parts[0]) if parts else 0
+            except Exception:  # noqa: BLE001 — an unprobeable version is not a failure, just unknown
+                self._version_major = 0
+        return self._version_major
+
+    def _render_via_xmlrpc(self, report_ref: str, record_id: str) -> bytes:
+        """Odoo ≤ 14: the public `render_qweb_pdf` on the `ir.actions.report` record."""
+        rid = _as_int(record_id)
+        if rid is None:
+            raise SystemError(f"odoo report render needs a numeric record id, got {record_id!r}")
+        rows = self._kw(
+            "ir.actions.report", "search_read",
+            [[["report_name", "=", report_ref]]], {"fields": ["id"], "limit": 1},
+        )
+        if not rows:
+            raise SystemError(f"odoo has no report named {report_ref!r}")
+        result = self._kw("ir.actions.report", "render_qweb_pdf", [[rows[0]["id"]], [rid]])
+        return _pdf_bytes(result)
+
+    def _render_via_http(self, report_ref: str, record_id: str) -> bytes:
+        """Odoo ≥ 15 (and any version): the report controller, behind a real session."""
+        opener = build_opener(HTTPCookieProcessor(CookieJar()))
+        payload = _json.dumps({
+            "jsonrpc": "2.0", "method": "call",
+            "params": {"db": self._db, "login": self._login, "password": self._key},
+        }).encode("utf-8")
+        auth_req = Request(
+            f"{self._url}/web/session/authenticate", data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with opener.open(auth_req, timeout=self._http_timeout) as resp:
+                body = _json.loads(resp.read() or b"{}")
+        except Exception as exc:  # noqa: BLE001 — transport fault → a refusable System error
+            raise SystemError(f"odoo session authenticate transport error: {exc}") from exc
+        if body.get("error") or not (body.get("result") or {}).get("uid"):
+            raise SystemError("odoo session authenticate failed — the report controller needs a session")
+        url = f"{self._url}/report/pdf/{quote(report_ref, safe='')}/{quote(str(record_id), safe='')}"
+        try:
+            with opener.open(Request(url), timeout=self._http_timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                data = resp.read()
+        except Exception as exc:  # noqa: BLE001
+            raise SystemError(f"odoo report controller {report_ref}: {exc}") from exc
+        if not data or not data.startswith(b"%PDF"):
+            # Odoo answers an un-rendered report with an HTML error page, HTTP 200. Bytes that are not
+            # a PDF are NOT a document — attaching them would mail the vendor an error page.
+            raise SystemError(
+                f"odoo report controller {report_ref} returned {len(data)} bytes of "
+                f"{content_type or 'unknown type'}, not a PDF"
+            )
+        return data
+
+    def render_report(self, report_ref: str, target: str, record_id: str) -> bytes:
+        major = self._server_major()
+        routes: tuple[Callable[[str, str], bytes], ...] = (
+            (self._render_via_http, self._render_via_xmlrpc)
+            if major == 0 or major >= 15
+            else (self._render_via_xmlrpc, self._render_via_http)
+        )
+        failures: list[str] = []
+        for route in routes:
+            try:
+                pdf = route(report_ref, record_id)
+            except SystemError as exc:
+                failures.append(str(exc))
+                continue
+            if pdf:
+                return pdf
+            failures.append(f"{route.__name__} returned no bytes")
+        raise SystemError(
+            f"odoo could not render {report_ref} for {target}/{record_id}: " + " | ".join(failures)
+        )
+
+
+def _pdf_bytes(result: Any) -> bytes:
+    """Unwrap what `render_qweb_pdf` returns over XML-RPC: (content, 'pdf'), where content arrives as
+    an xmlrpc Binary (base64 on the wire), raw bytes, or a base64 string. Anything else is not a
+    document and must raise rather than be attached to an email."""
+    content = result[0] if isinstance(result, (list, tuple)) and result else result
+    if isinstance(content, xmlrpc.client.Binary):
+        return bytes(content.data)
+    if isinstance(content, bytes):
+        return content
+    if isinstance(content, str):
+        import base64
+
+        try:
+            return base64.b64decode(content, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise SystemError(f"odoo report render returned undecodable content: {exc}") from exc
+    raise SystemError(f"odoo report render returned {type(content).__name__}, not document bytes")
+
 
 class FakeSystem:
     """In-memory backend for the conformance proof — no live instance needed."""
@@ -299,6 +433,11 @@ class FakeSystem:
         self.messages: dict[tuple[str, str], list[str]] = {}  # (target, record_id) -> chatter notes
         self.schemas: dict[str, list[dict[str, Any]]] = {}  # optional per-target field_meta (tests)
         self.method_calls: list[tuple[str, str, str, dict[str, Any]]] = []  # generic op=method invocations
+        # The ERP's rendered documents, keyed (report_ref, record_id) — seeded by a test. The fake
+        # STORES documents; it never renders one, because a document this adapter could compose is
+        # exactly the thing the product must not send.
+        self.reports: dict[tuple[str, str], bytes] = {}
+        self.report_calls: list[tuple[str, str, str]] = []  # (report_ref, target, record_id)
         self._counter = 0
 
     def create(self, target: str, doc: dict[str, Any]) -> dict[str, Any]:
@@ -362,3 +501,12 @@ class FakeSystem:
 
     def get(self, target: str, record_id: str) -> dict[str, Any] | None:
         return next((r for r in self.docs.get(target, []) if r.get("name") == record_id), None)
+
+    def render_report(self, report_ref: str, target: str, record_id: str) -> bytes:
+        self.report_calls.append((report_ref, target, str(record_id)))
+        try:
+            return self.reports[(report_ref, str(record_id))]
+        except KeyError:
+            raise SystemError(
+                f"fake: no rendered {report_ref} for {target}/{record_id}"
+            ) from None
