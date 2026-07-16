@@ -49,3 +49,23 @@ def test_intent_seek_count() -> None:
 def test_intent_unknown_about_is_structured_refusal() -> None:
     out = _intent(_client(_seeded()), {"about": "hr.salary", "where": [], "seek": "count"})["data"]
     assert out["outcome"] == "refused" and out["code"]
+
+
+def test_intent_resolves_business_resource_name_to_native_model() -> None:
+    # The agent speaks BUSINESS: about="Product". Odoo stores it as `product.product`. The adapter
+    # DECLARES that mapping in RESOURCES; it must APPLY it on reads, not pass "Product" through as a
+    # model name (which Odoo has no table for → CAPABILITY_UNSUPPORTED). This is the exact gap that
+    # made "اعرض لي المنتجات" refuse in production while `about="res.partner"` worked.
+    sys = _seeded()
+    sys.docs["product.product"] = [{"id": i, "name": f"SKU-{i}"} for i in range(4)]
+    out = _intent(_client(sys), {"about": "Product", "where": [], "seek": "count"})["data"]
+    assert out == {"outcome": "result", "value": {"count": 4}}
+
+
+def test_intent_native_model_name_still_passes_through() -> None:
+    # Translation must not break the native spelling: an agent that says `product.product` (or learned
+    # it from describe) still lands on the same table. Business name and native name are one resource.
+    sys = _seeded()
+    sys.docs["product.product"] = [{"id": i, "name": f"SKU-{i}"} for i in range(4)]
+    out = _intent(_client(sys), {"about": "product.product", "where": [], "seek": "count"})["data"]
+    assert out == {"outcome": "result", "value": {"count": 4}}

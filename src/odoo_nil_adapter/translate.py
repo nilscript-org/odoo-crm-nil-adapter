@@ -1024,7 +1024,6 @@ from nilscript.dataplane import (  # noqa: E402
     Binding,
     BulkApprovalRequired,
     CapabilityUnsupported,
-    IdentityResolver,
     Intent,
     IntentResolver,
     InvalidFilter,
@@ -1141,10 +1140,40 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
 _RESOLVERS: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
+class _OdooBindings:
+    """Ontology → Odoo vocabulary. The agent asks about a `Product`; Odoo stores `product.product`.
+
+    Wave A's adapter-local half: the business names the thing, the backend keeps its own word. The
+    map is `RESOURCES` — the SAME table this adapter declares in `describe` — applied here so a read
+    by business name (`about="Product"`) resolves to the native model instead of being handed to Odoo
+    verbatim (which has no table `Product` → CAPABILITY_UNSUPPORTED). An `about` we do not recognize
+    (`crm.stage`, a raw native model) passes THROUGH unchanged, so the engine can serve it or refuse
+    it for itself — never a guess. `resolve_attr` stays identity: Odoo field names are already native
+    (`name`, `phone`), and the read plane derives the projection.
+
+    This was the production gap behind "اعرض لي المنتجات" refusing while `about="res.partner"` worked:
+    the adapter DECLARED the mapping but built its resolver with `IdentityResolver`, so it never
+    applied it. Mirrors daftara's `_DaftraBindings`."""
+
+    def resolve_target(self, about: str) -> str:
+        if not about:
+            return about
+        if about in RESOURCES:  # the canonical business resource name (Product, Customer, …)
+            return RESOURCES[about]
+        low = about.strip().lower()
+        for resource, native in RESOURCES.items():
+            if low in (resource.lower(), native.lower()):
+                return native
+        return about  # unknown/native model → pass through; the engine owns the refusal
+
+    def resolve_attr(self, about: str, attr: str) -> str:
+        return attr
+
+
 def _resolver(client: SystemClient) -> Any:
     r = _RESOLVERS.get(client)
     if r is None:
-        r = IntentResolver(_plane(client), IdentityResolver())
+        r = IntentResolver(_plane(client), _OdooBindings())
         _RESOLVERS[client] = r
     return r
 
