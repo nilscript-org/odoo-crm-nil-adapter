@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json as _json
 import time
+import uuid
 import xmlrpc.client
 from http.cookiejar import CookieJar
 from typing import Any, Callable, Protocol
@@ -21,6 +22,13 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 # Transport statuses worth retrying — Odoo rate-limits (429) and transient gateway faults (5xx). An
 # application Fault (bad args, access error) is NOT here: it is terminal and must surface immediately.
 _RETRYABLE_HTTP: frozenset[int] = frozenset({429, 502, 503, 504})
+
+# The portal document pages Odoo itself serves per model (portal.mixin records). Only targets listed
+# here can be rendered via the portal route; an unlisted target REFUSES rather than guessing a URL.
+_PORTAL_DOC_PATHS: dict[str, str] = {
+    "purchase.order": "my/purchase",
+    "account.move": "my/invoices",
+}
 
 
 class SystemError(RuntimeError):
@@ -312,19 +320,26 @@ class RealSystemClient:
     #    xmlrpc.client hands them back as an `xmlrpc.client.Binary`.
     #  • Odoo ≥ 15 — the method was renamed `_render_qweb_pdf`, and Odoo's `execute_kw` REFUSES any
     #    method whose name begins with `_` (odoo.service.model.check_method_name → AccessError). So on
-    #    15+ the private method is not reachable over XML-RPC AT ALL. The honest route there is Odoo's
-    #    own report controller over HTTP:
+    #    15+ the private method is not reachable over XML-RPC AT ALL. Odoo's report controller over
+    #    HTTP is one honest route there:
     #        POST /web/session/authenticate  (db + login + API key) → session cookie
     #        GET  /report/pdf/<report_ref>/<record_id>              → the exact bytes Odoo itself mails
+    #  • Odoo SaaS (witnessed live on ahmedco2.odoo.com, saas~19.3, 2026-07-16) — the session route is
+    #    ALSO closed: `/web/session/authenticate` answers AccessDenied to an API key (RPC-scoped keys
+    #    open no web session). What IS open is Odoo's own portal document controller:
+    #        GET /my/purchase/<id>?report_type=pdf&download=true&access_token=<token>
+    #    token-gated, session-less, rendering the SAME QWeb report Odoo mails the vendor. The token is
+    #    the record's own `access_token` (portal.mixin); when absent, Odoo mints a uuid4 lazily via
+    #    `_portal_ensure_token` — `_render_via_portal` does exactly that and nothing more.
     #
-    # We probe the server version, try the route that version exposes first, and fall back to the other
-    # rather than guess. If neither yields bytes we raise SystemError and the caller REFUSES: this
+    # We probe the server version, try the route that version exposes first, and fall back to the
+    # others rather than guess. If none yields bytes we raise SystemError and the caller REFUSES: this
     # adapter never synthesizes a document, and "I could not fetch the official PO" must never look
     # like "here is the official PO".
     #
-    # ⚠ UNWITNESSED: this environment holds NO live Odoo credentials, so the live render has NEVER been
-    # run. Everything below is witnessed only against FakeSystem. It MUST be driven on the Odoo sandbox
-    # (target instance: saas~19.3 → the HTTP controller route) before it is trusted.
+    # WITNESSED 2026-07-16 on ahmedco2.odoo.com (saas~19.3+e): xmlrpc route → method does not exist;
+    # session route → AccessDenied; portal route → HTTP 200 application/pdf, 29 534 bytes, %PDF magic
+    # (purchase.order/1, P00001). The portal route is the one modern Odoo SaaS actually serves.
     def _server_major(self) -> int:
         """Odoo's major version, or 0 when it cannot be probed (→ try both routes)."""
         if self._version_major is None:
@@ -336,7 +351,7 @@ class RealSystemClient:
                 self._version_major = 0
         return self._version_major
 
-    def _render_via_xmlrpc(self, report_ref: str, record_id: str) -> bytes:
+    def _render_via_xmlrpc(self, report_ref: str, target: str, record_id: str) -> bytes:
         """Odoo ≤ 14: the public `render_qweb_pdf` on the `ir.actions.report` record."""
         rid = _as_int(record_id)
         if rid is None:
@@ -350,7 +365,7 @@ class RealSystemClient:
         result = self._kw("ir.actions.report", "render_qweb_pdf", [[rows[0]["id"]], [rid]])
         return _pdf_bytes(result)
 
-    def _render_via_http(self, report_ref: str, record_id: str) -> bytes:
+    def _render_via_http(self, report_ref: str, target: str, record_id: str) -> bytes:
         """Odoo ≥ 15 (and any version): the report controller, behind a real session."""
         opener = build_opener(HTTPCookieProcessor(CookieJar()))
         payload = _json.dumps({
@@ -384,17 +399,56 @@ class RealSystemClient:
             )
         return data
 
+    def _render_via_portal(self, report_ref: str, target: str, record_id: str) -> bytes:
+        """Odoo SaaS (API-key-only credentials): the record's OWN portal page as PDF, token-gated.
+
+        This is the route saas~19 actually serves: `/my/<page>/<id>?report_type=pdf&access_token=…`
+        renders the same QWeb report the session-gated controller would, with no session. The token
+        is the record's `access_token`; when the record has none yet, we mint the uuid4 Odoo's own
+        `_portal_ensure_token` would mint on first portal use — access-provisioning metadata, written
+        once, never business data. An existing token is reused and nothing is written."""
+        page = _PORTAL_DOC_PATHS.get(target)
+        if page is None:
+            raise SystemError(f"odoo has no portal document page for {target!r} — portal route closed")
+        rid = _as_int(record_id)
+        if rid is None:
+            raise SystemError(f"odoo portal render needs a numeric record id, got {record_id!r}")
+        rows = self._kw(target, "read", [[rid]], {"fields": ["access_token"]})
+        if not rows:
+            raise SystemError(f"no {target} with id {rid}")
+        token = rows[0].get("access_token")
+        if not token:
+            token = str(uuid.uuid4())
+            self._kw(target, "write", [[rid], {"access_token": token}])
+        url = (f"{self._url}/{page}/{rid}?report_type=pdf&download=true"
+               f"&access_token={quote(str(token), safe='')}")
+        opener = build_opener()
+        try:
+            with opener.open(Request(url), timeout=self._http_timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                data = resp.read()
+        except Exception as exc:  # noqa: BLE001 — transport fault → a refusable System error
+            raise SystemError(f"odoo portal controller {page}/{rid}: {exc}") from exc
+        if not data or not data.startswith(b"%PDF"):
+            # A refused/expired token comes back as an HTML page, HTTP 200. Bytes that are not a PDF
+            # are NOT a document — attaching them would mail the vendor an error page.
+            raise SystemError(
+                f"odoo portal controller {page}/{rid} returned {len(data)} bytes of "
+                f"{content_type or 'unknown type'}, not a PDF"
+            )
+        return data
+
     def render_report(self, report_ref: str, target: str, record_id: str) -> bytes:
         major = self._server_major()
-        routes: tuple[Callable[[str, str], bytes], ...] = (
-            (self._render_via_http, self._render_via_xmlrpc)
+        routes: tuple[Callable[[str, str, str], bytes], ...] = (
+            (self._render_via_http, self._render_via_portal, self._render_via_xmlrpc)
             if major == 0 or major >= 15
-            else (self._render_via_xmlrpc, self._render_via_http)
+            else (self._render_via_xmlrpc, self._render_via_http, self._render_via_portal)
         )
         failures: list[str] = []
         for route in routes:
             try:
-                pdf = route(report_ref, record_id)
+                pdf = route(report_ref, target, record_id)
             except SystemError as exc:
                 failures.append(str(exc))
                 continue
