@@ -111,6 +111,25 @@ def test_projection_ranks_business_fields_over_technical_noise() -> None:
         assert noise not in keys, f"{noise} must not be in the projection; got {sorted(keys)}"
 
 
+def test_curated_projection_intersects_live_instance_fields() -> None:
+    # A CURATED projection (product.product) can name a field THIS Odoo instance lacks — e.g.
+    # `uom_po_id` when the purchase-UoM field is not installed. Odoo's search_read RAISES on an unknown
+    # field ("Invalid field 'uom_po_id' on 'product.product'"), crashing the whole read — the live
+    # error that still blocked products after routing + business-name resolution were fixed. The
+    # backend must intersect the curated list with the instance's LIVE fields and never REQUEST a field
+    # that isn't there. Here the doc HAS uom_po_id but the live schema omits it: it must be dropped.
+    sys = FakeSystem()
+    sys.schemas["product.product"] = [{"name": n} for n in ("id", "name", "list_price", "default_code")]
+    sys.docs["product.product"] = [
+        {"id": 1, "name": "Widget", "list_price": 9.0, "default_code": "W1", "uom_po_id": [1, "Units"]}
+    ]
+    keys = set(
+        _query(_client(sys), "nil.search", {"target": "product.product", "limit": 1})["data"]["items"][0].keys()
+    )
+    assert "uom_po_id" not in keys, f"a curated field absent on the instance must be dropped; got {sorted(keys)}"
+    assert {"id", "name", "list_price"} <= keys
+
+
 def test_count_works_on_discovered_model() -> None:
     client = _client(_seeded_account_move())
     out = _query(client, "nil.count", {"target": "account.move"})

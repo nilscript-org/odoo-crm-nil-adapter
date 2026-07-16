@@ -171,6 +171,20 @@ class OdooReadBackend:
             if not field_meta:  # not provisioned / not accessible → undiscoverable
                 return None
             fields = _derive_projection(field_meta)
+        else:
+            # A CURATED projection can name a field THIS Odoo instance does not have (module/version
+            # drift — e.g. `uom_po_id` when the purchase-UoM field is not installed). Odoo's
+            # search_read RAISES on an unknown field, crashing the entire read. Intersect the curated
+            # list with the instance's LIVE field set when the shape is known (fields_get returned
+            # something); keep it verbatim when the shape is unknown (empty/None schema — a backend
+            # that exposes no metadata). `id` is always kept. A field absent here is dropped, never
+            # requested — a lean read that survives every instance, instead of a curated list that
+            # assumes one.
+            field_meta = self._client.schema(target)
+            if field_meta:
+                available = {f.get("name") for f in field_meta}
+                pruned = tuple(f for f in fields if f == "id" or f in available)
+                fields = pruned or fields
         specs = tuple(
             FieldSpec(
                 name=f, type="str", is_key=(f == "id"),
