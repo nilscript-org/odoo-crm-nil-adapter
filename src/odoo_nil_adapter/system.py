@@ -11,6 +11,7 @@ passed in by the runner from the environment — this module never reads or hard
 from __future__ import annotations
 
 import json as _json
+import threading
 import time
 import uuid
 import xmlrpc.client
@@ -177,6 +178,12 @@ class RealSystemClient:
         self._last_call: float = 0.0
         self._common = xmlrpc.client.ServerProxy(f"{self._url}/xmlrpc/2/common", allow_none=True)
         self._models = xmlrpc.client.ServerProxy(f"{self._url}/xmlrpc/2/object", allow_none=True)
+        # G24: ServerProxy wraps ONE http.client connection — a state machine that two concurrent
+        # calls corrupt ("CannotSendRequest: Request-sent" / "ResponseNotReady: Idle"; witnessed
+        # live when a bulk fan-out committed two items at once and BOTH failed_terminal). The edge
+        # serves sync endpoints from a threadpool and the tenant's client is cached, so the CLIENT
+        # owns serialization. The lock guards ONLY the wire call, never a backoff sleep.
+        self._xmlrpc_lock = threading.Lock()
 
     def _throttle(self) -> None:
         """Hold each upstream call to at least `min_interval` apart (off when 0) — a simple governor so
@@ -193,7 +200,8 @@ class RealSystemClient:
         if self._uid:
             return self._uid
         try:
-            uid = self._common.authenticate(self._db, self._login, self._key, {})
+            with self._xmlrpc_lock:
+                uid = self._common.authenticate(self._db, self._login, self._key, {})
         except Exception as exc:  # noqa: BLE001 — surface any transport/XML fault as a System refusal
             raise SystemError(f"odoo authenticate transport error: {exc}") from exc
         if not uid:
@@ -206,7 +214,10 @@ class RealSystemClient:
         for attempt in range(self._max_retries + 1):
             self._throttle()
             try:
-                return self._models.execute_kw(self._db, uid, self._key, model, method, args, kw or {})
+                with self._xmlrpc_lock:
+                    return self._models.execute_kw(
+                        self._db, uid, self._key, model, method, args, kw or {}
+                    )
             except xmlrpc.client.Fault as fault:  # application error — terminal, never retried
                 tail = fault.faultString.strip().splitlines()[-1] if fault.faultString else "fault"
                 raise SystemError(f"odoo {model}.{method}: {tail}") from fault
@@ -344,7 +355,8 @@ class RealSystemClient:
         """Odoo's major version, or 0 when it cannot be probed (→ try both routes)."""
         if self._version_major is None:
             try:
-                info = self._common.version() or {}
+                with self._xmlrpc_lock:
+                    info = self._common.version() or {}
                 parts = info.get("server_version_info") or []
                 self._version_major = int(parts[0]) if parts else 0
             except Exception:  # noqa: BLE001 — an unprobeable version is not a failure, just unknown
