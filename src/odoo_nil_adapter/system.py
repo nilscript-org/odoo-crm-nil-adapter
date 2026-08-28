@@ -24,6 +24,22 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 # application Fault (bad args, access error) is NOT here: it is terminal and must surface immediately.
 _RETRYABLE_HTTP: frozenset[int] = frozenset({429, 502, 503, 504})
 
+# The ONE transport status that says what happened to the call: 429 is emitted by the rate limiter
+# (Odoo's, or the proxy in front of it) BEFORE the request is dispatched, so the ORM never saw it.
+# Its outcome is therefore observed — "not applied" — and retrying it is not a guess. Every other
+# transport failure (5xx, socket reset, timeout, unparseable answer) leaves the outcome UNOBSERVED:
+# a 504 in particular is the textbook "Odoo committed and the gateway stopped waiting".
+_UNAPPLIED_HTTP: frozenset[int] = frozenset({429})
+
+# Odoo ORM methods that only READ. Repeating one of these cannot change the world, so a transport
+# fault on them is retried exactly as before. EVERYTHING ELSE IS TREATED AS A WRITE — fail closed:
+# a method this adapter has not classified (any granted workflow method: action_post,
+# button_validate, action_confirm, …) must never be blindly repeated on this layer's own initiative.
+_READ_METHODS: frozenset[str] = frozenset({
+    "search", "read", "search_read", "search_count", "read_group",
+    "fields_get", "name_search", "name_get", "default_get",
+})
+
 # The portal document pages Odoo itself serves per model (portal.mixin records). Only targets listed
 # here can be rendered via the portal route; an unlisted target REFUSES rather than guessing a URL.
 _PORTAL_DOC_PATHS: dict[str, str] = {
@@ -34,6 +50,24 @@ _PORTAL_DOC_PATHS: dict[str, str] = {
 
 class SystemError(RuntimeError):
     """A write the System rejected — its message is surfaced/logged by the edge."""
+
+
+class OutcomeInDoubt(SystemError):
+    """A write whose outcome NOBODY OBSERVED — the request went out and no answer came back.
+
+    This is the honest third verdict, and the reason M42 was possible: the layer above only knew
+    `executed` and `failed_terminal`, and `failed_terminal` asserts "it did not happen". After a
+    dropped socket / gateway timeout on a `create`, that assertion is a guess — Odoo may hold the
+    record already. Repeating the call is how one commit becomes two purchase orders.
+
+    A SUBCLASS of SystemError on purpose: every existing handler already catches it, so an
+    un-updated path degrades to today's behaviour instead of escaping as a 500. Paths that CAN
+    answer honestly catch it FIRST and return a structured refusal (see edge._in_doubt_refusal)."""
+
+    def __init__(self, message: str, *, model: str, method: str) -> None:
+        super().__init__(message)
+        self.model = model
+        self.method = method
 
 
 class SystemClient(Protocol):
@@ -170,6 +204,8 @@ class RealSystemClient:
         # with exponential backoff, and optionally throttle to a minimum inter-call interval so a burst
         # of governed writes never hammers Odoo. Orchestration-level durability (resume across crashes,
         # per-tenant queues) is the separate Temporal plan; this keeps a SINGLE call resilient.
+        # `max_retries` applies to READS, and to the one write failure (429) that proves the call was
+        # never applied. A write whose outcome is unknown is NEVER repeated here — see `_kw`.
         self._max_retries = max_retries
         self._backoff = backoff
         self._min_interval = min_interval
@@ -210,7 +246,18 @@ class RealSystemClient:
         return self._uid
 
     def _kw(self, model: str, method: str, args: list[Any], kw: dict[str, Any] | None = None) -> Any:
+        """One governed Odoo call, with the retry rule that stopped M42: **a retry is only safe when
+        the operation is idempotent or can be checked first.**
+
+        A read repeats harmlessly, so it keeps the exponential backoff the "429 flood" lesson bought.
+        A WRITE does not: `create` that Odoo committed and whose answer was lost is, on a blind
+        retry, a second purchase order — a duplicate irreversible business act inside a single commit
+        call, invisible to every layer above. So a write is retried only when the failure PROVES the
+        call was never applied (429, rejected by the limiter before dispatch); every other transport
+        failure raises `OutcomeInDoubt`, and the decision to recover moves up to a layer that can
+        ask the backing system what actually happened."""
         uid = self._auth()
+        is_read = method in _READ_METHODS
         for attempt in range(self._max_retries + 1):
             self._throttle()
             try:
@@ -219,17 +266,32 @@ class RealSystemClient:
                         self._db, uid, self._key, model, method, args, kw or {}
                     )
             except xmlrpc.client.Fault as fault:  # application error — terminal, never retried
+                # Odoo ANSWERED and the ORM rolled back: an observed outcome, never a doubt.
                 tail = fault.faultString.strip().splitlines()[-1] if fault.faultString else "fault"
                 raise SystemError(f"odoo {model}.{method}: {tail}") from fault
-            except xmlrpc.client.ProtocolError as pe:  # transport status — retry the rate-limit/gateway ones
-                if pe.errcode in _RETRYABLE_HTTP and attempt < self._max_retries:
+            except xmlrpc.client.ProtocolError as pe:  # transport status — retry the safe ones only
+                applied_unknown = not is_read and pe.errcode not in _UNAPPLIED_HTTP
+                if (pe.errcode in _RETRYABLE_HTTP and attempt < self._max_retries
+                        and not applied_unknown):
                     self._sleep(self._backoff * (2 ** attempt))
                     continue
+                if applied_unknown:
+                    raise OutcomeInDoubt(
+                        f"odoo {model}.{method} answered HTTP {pe.errcode} — the write may or may "
+                        f"not have been applied; it was NOT repeated",
+                        model=model, method=method,
+                    ) from pe
                 raise SystemError(f"odoo {model}.{method} transport error: HTTP {pe.errcode}") from pe
-            except Exception as exc:  # noqa: BLE001 — other transient transport faults: retry, then surface
-                if attempt < self._max_retries:
+            except Exception as exc:  # noqa: BLE001 — socket reset, timeout, unparseable answer
+                if is_read and attempt < self._max_retries:
                     self._sleep(self._backoff * (2 ** attempt))
                     continue
+                if not is_read:
+                    raise OutcomeInDoubt(
+                        f"odoo {model}.{method} sent no readable answer ({exc}) — the write may or "
+                        f"may not have been applied; it was NOT repeated",
+                        model=model, method=method,
+                    ) from exc
                 raise SystemError(f"odoo {model}.{method} transport error: {exc}") from exc
         raise SystemError(f"odoo {model}.{method}: exhausted {self._max_retries} retries")  # unreachable guard
 

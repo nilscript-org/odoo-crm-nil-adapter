@@ -1,6 +1,10 @@
 """Durability (adapter slice): the RealSystemClient retries transient transport faults with backoff —
 the "429 flood" lesson — while an application Fault stays terminal. Orchestration-level durability
 (crash-resume, per-tenant queues) is the separate Temporal plan; this proves a SINGLE call is resilient.
+
+SCOPE, since the M42 fix: that backoff is for READ-shaped calls (and for the one write failure that
+proves the call was never applied). A write is never blindly repeated — see
+test_duplicate_write_hazard.py, which owns that half of the contract.
 """
 
 from __future__ import annotations

@@ -22,7 +22,7 @@ from odoo_nil_adapter import governance
 from odoo_nil_adapter.compensation import COMPENSATIONS, compensate
 from odoo_nil_adapter.manifest import apply_transport_quirks, overlay_requirements
 from odoo_nil_adapter.state import ShimState
-from odoo_nil_adapter.system import SystemClient, SystemError
+from odoo_nil_adapter.system import OutcomeInDoubt, SystemClient, SystemError
 from odoo_nil_adapter.tenant_routing import bind_tenant
 from odoo_nil_adapter.translate import (
     QUERY_VERBS,
@@ -373,6 +373,91 @@ def _envelope(performative: str, env: dict[str, Any], body: dict[str, Any]) -> d
     }
 
 
+# ── the attempt key, made queryable in the backing system (RECOVERY-MATRIX M42 / R2) ─────────────
+# The NIL attempt key (`prep:{prepared_id}:r{attempt}` → run_id → `{run_id}:{node_id}`) arrives here
+# as the COMMIT body's `idempotency_key` and used to die in `state.ledger`, a plain dict that is lost
+# on restart — so no backing system ever learned it, and a create could not be told apart from its
+# own duplicate. Stamped into a queryable field it becomes the thing to ASK ABOUT: "did this exact
+# attempt already write?" is answerable, and that is the whole difference between case C and case B.
+_IN_DOUBT = "OUTCOME_IN_DOUBT"  # the machine token every in-doubt refusal message opens with
+_KEY_SAFE = re.compile(r"[^A-Za-z0-9:._-]")
+
+
+def _idem_marker(key: str) -> str:
+    """A bounded, deterministic, queryable rendering of the attempt key. Bracketed so it stays
+    legible next to a human Source Document ("SEWAR-REPLEN-0001 [WSL-prep:abc:r1]") and so a
+    substring query cannot collide with an unrelated reference that merely shares a prefix."""
+    safe = _KEY_SAFE.sub("-", key.strip())
+    if len(safe) > 64:  # a key too long for the field still has to be exact — hash it, don't clip it
+        safe = "h" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+    return f"[WSL-{safe}]"
+
+
+def _stampable(client: SystemClient, doctype: str, field: str | None) -> str | None:
+    """The declared idempotency field, but only if the LIVE model really carries it as a writable
+    one. A declaration is our belief; `fields_get` is the instance's truth. Believing wrongly would
+    turn every create on that model into a rejected write — worse than having no key at all."""
+    if not field:
+        return None
+    schema = client.schema(doctype) or []
+    meta = next((f for f in schema if f.get("name") == field), None)
+    if meta is None or meta.get("readonly"):
+        return None
+    return field
+
+
+def _find_by_marker(client: SystemClient, doctype: str, field: str,
+                    marker: str) -> dict[str, Any] | None:
+    """The ask-first probe: has THIS attempt already written its record?
+
+    Two hits mean a duplicate ALREADY exists under this key (or the key was reused). Which of them
+    this commit produced is not knowable from here, so it raises the doubt rather than picking one —
+    and, crucially, rather than adding a third."""
+    hits = client.search(doctype, [[field, "like", marker]], limit=2)
+    if len(hits) > 1:
+        raise OutcomeInDoubt(
+            f"{len(hits)}+ {doctype} records already carry this attempt key in `{field}` — which of "
+            f"them belongs to this commit cannot be told from here",
+            model=doctype, method="create",
+        )
+    if not hits:
+        return None
+    row = hits[0]
+    rid = str(row.get("id") or row.get("name") or "")
+    return client.get(doctype, rid) or dict(row)
+
+
+def _recovery_hint(op: str, field: str | None) -> str:
+    """What a human can safely do next — said PER VERB, because the honest answer differs. Inventing
+    a reassuring generic sentence here would be the same class of lie as reporting failed_terminal."""
+    if op == "create":
+        if field:
+            return (f"This create stamps its attempt key into `{field}`: re-commit under the SAME "
+                    f"idempotency key and it will return the existing record, never a second one.")
+        return ("There is no queryable idempotency field on this create, so no probe can tell "
+                "'never happened' from 'already happened' — a human must look before re-running it.")
+    if op in ("update", "delete"):
+        return (f"This {op} is idempotent by construction (the same values / the same id), so a "
+                f"re-commit after checking the record does not compound the effect.")
+    return "Verify the record's state before this is run again — the effect may already stand."
+
+
+def _in_doubt_refusal(env: dict[str, Any], exc: OutcomeInDoubt, recovery: str) -> dict[str, Any]:
+    """An unobserved effect answered as a REFUSAL the caller can read, never as an exception (a 500)
+    and never as `failed_terminal` (which asserts "it did not happen" — nobody knows that).
+
+    The code is `SUSPENDED` because `RefusalCode` is a CLOSED enum in the kernel: a code outside it
+    makes pydantic raise in the SDK and kills the run at step 1 — the exact defect that silently
+    broke the canary for three days. SUSPENDED is the closest legal meaning (the System has stopped
+    and a human must decide) and, unlike UPSTREAM_UNAVAILABLE, it is NOT in RETRIABLE_REFUSALS, so
+    no caller reads it as "just try again". The machine-readable hazard rides in the message."""
+    return _refusal(
+        env, "SUSPENDED",
+        f"{_IN_DOUBT}: {exc} — {exc.model}.{exc.method} may already have taken effect. "
+        f"Do not retry blindly; verify in {SYSTEM} and decide. {recovery}",
+    )
+
+
 def _refusal(env: dict[str, Any], code: str, message: str, field: str | None = None,
              candidates: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"outcome": "refusal", "code": code, "message": message}
@@ -629,6 +714,9 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             try:
                 rid = _resolve_id(client, target, rid) or rid
                 client.call_method(target, rid, method, params)
+            except OutcomeInDoubt as exc:  # BEFORE SystemError: an unobserved method call is not a failure
+                print(f"[shim] METHOD IN DOUBT {target}.{method} -> {exc}", flush=True)
+                return _in_doubt_refusal(env, exc, _recovery_hint("method", None))
             except (SystemError, NotImplementedError) as exc:
                 print(f"[shim] METHOD FAILED {target}.{method} -> {exc}", flush=True)
                 return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
@@ -686,6 +774,11 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     else:
                         client.delete(target, rid)
                         rev_verb, rev_args, rev = "resource.create", {"target": target, "data": before}, "COMPENSABLE"
+            except OutcomeInDoubt as exc:  # BEFORE SystemError — see _in_doubt_refusal
+                # `resource.create` names an ARBITRARY Odoo model, so no idempotency field can be
+                # declared for it in advance: this is the honest refusal, not an ask-first recovery.
+                print(f"[shim] RESOURCE WRITE IN DOUBT {stored['verb']} -> {exc}", flush=True)
+                return _in_doubt_refusal(env, exc, _recovery_hint(op, None))
             except (SystemError, NotImplementedError) as exc:
                 print(f"[shim] RESOURCE WRITE FAILED {stored['verb']} -> {exc}", flush=True)
                 return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
@@ -721,6 +814,10 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         comp_spec = COMPENSATIONS.get(stored["verb"], {})
         comp_override: dict[str, Any] | None = None  # a before-image reversal the op handler synthesizes
         before_image: dict[str, Any] = {}  # pre-write SSOT snapshot → the diff's 'before' column
+        # True when the ask-first probe found this attempt's record already in the backing system, so
+        # this COMMIT wrote nothing. `state.ledger` reports the same thing for a retry the adapter's
+        # own memory recognises; this reports it for the retry only the BACKING SYSTEM can settle.
+        idem_replay = False
         try:
             # to_native is inside the try so an UNFILLED stub (NotImplementedError) is a clean
             # terminal failure, not a 500 — the conformance proof reads it as non-conformance.
@@ -784,12 +881,61 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     comp_override = {"resource_method": True, "target": verb.doctype, "id": record_id,
                                      "method": verb.reverse_method, "tier": verb.tier}
             else:  # op == "create"
-                created = client.create(verb.doctype, native)  # the real write
+                # ASK FIRST when this verb has somewhere durable to put the attempt key. The probe
+                # runs BEFORE the write, so it also settles the case the in-memory ledger cannot:
+                # the adapter restarted (M41) and the caller re-commits the same attempt — that must
+                # find the record leg one already wrote, not mint a second irreversible act.
+                idem_field = _stampable(client, verb.doctype, verb.idempotency_field)
+                if idem_field and key:
+                    marker = _idem_marker(key)
+                    prior = native.get(idem_field)
+                    native[idem_field] = f"{prior} {marker}" if prior else marker
+                    try:
+                        landed = _find_by_marker(client, verb.doctype, idem_field, marker)
+                    except OutcomeInDoubt:
+                        raise  # a duplicate already carries this key — do not add to the pile
+                    except SystemError as probe_failed:
+                        # The ask-first guard could not run. Writing anyway is exactly how the
+                        # duplicate gets made, so nothing is written — and "nothing was written" is
+                        # a DETERMINATE answer, not a doubt: this one is safe to retry.
+                        return _refusal(
+                            env, "UPSTREAM_UNAVAILABLE",
+                            f"could not check whether this attempt already created a "
+                            f"{verb.doctype} ({probe_failed}) — NOTHING WAS WRITTEN. Retrying under "
+                            f"the same idempotency key is safe.")
+                    if landed is not None:
+                        created, idem_replay = landed, True
+                    else:
+                        try:
+                            created = client.create(verb.doctype, native)  # the real write
+                        except OutcomeInDoubt as doubt:
+                            # The answer was lost. Ask the backing system what actually happened
+                            # instead of repeating an irreversible act — this is M42's whole cure.
+                            landed = None
+                            try:
+                                landed = _find_by_marker(client, verb.doctype, idem_field, marker)
+                            except OutcomeInDoubt:
+                                raise  # a duplicate already carries the key: the louder doubt wins
+                            except SystemError:
+                                pass  # the probe could not run either — the original doubt stands
+                            if landed is None:
+                                # Not found is NOT proof it never happened: Odoo may still be
+                                # committing. Saying "it failed" here is the same lie in the other
+                                # direction, so the doubt is what we report.
+                                raise doubt
+                            created, idem_replay = landed, True
+                else:
+                    created = client.create(verb.doctype, native)  # the real write
+        except OutcomeInDoubt as exc:  # BEFORE SystemError — see _in_doubt_refusal
+            print(f"[shim] WRITE IN DOUBT verb={stored['verb']} -> {exc}", flush=True)
+            return _in_doubt_refusal(
+                env, exc, _recovery_hint(verb.op, _stampable(client, verb.doctype,
+                                                             verb.idempotency_field)))
         except (SystemError, NotImplementedError) as exc:
             print(f"[shim] WRITE FAILED verb={stored['verb']} -> {exc}", flush=True)
             return _envelope("STATUS", env, {"proposal": proposal_id, "state": "failed_terminal", "replayed": False})
         reversibility = "COMPENSABLE" if comp_override else comp_spec.get("reversibility", "IRREVERSIBLE")
-        status_body = {"proposal": proposal_id, "state": "executed", "replayed": False}
+        status_body = {"proposal": proposal_id, "state": "executed", "replayed": idem_replay}
         # EARN the verification — never assert it. Re-read the SSOT and confirm the written fields
         # actually landed. A field that didn't persist (silent backend drop) ⇒ verified:false.
         fields_written = native if verb.op in ("create", "update", "upsert") else {}

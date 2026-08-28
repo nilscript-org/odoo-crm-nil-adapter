@@ -69,6 +69,25 @@ class WriteVerb:
     # and the shim reported `executed` / `claim: success` for a cost it had never set. Declared here,
     # refused at PROPOSE: "I wrote it" and "I could not compute it" must never be the same answer.
     positive: tuple[str, ...] = ()
+    # for op="create": the native field this verb stamps the COMMIT's attempt key into, so the act
+    # becomes DETERMINISTICALLY ADDRESSABLE in the backing system. Without one, a create whose
+    # answer is lost cannot be told apart from one that never happened, and the only honest answer
+    # to a transport failure is a refusal (RECOVERY-MATRIX "case C"). WITH one, the edge asks the
+    # backing system first and returns the record that already exists instead of minting a second.
+    #
+    # Only a field that is REALLY a free-text reference on the model may be named here, and the edge
+    # additionally checks the LIVE schema before stamping — an Odoo whose model lacks the field
+    # degrades to the honest refusal, never to a rejected write.
+    #     purchase.order  → `origin`  (Source Document; already a supported arg on this verb)
+    #     account.payment → `ref`     (Reference; this adapter already writes it, translate.py:631)
+    #     account.move    → `ref`     (Reference; the invoice-create verbs set nothing else there)
+    # Verbs with NO honest home for a key, left unstamped on purpose rather than inventing a field:
+    #     crm.create_lead        (crm.lead has no reference/source Char — nothing to query on)
+    #     commerce.create_product(product.product's `default_code` IS the SKU, a business key that
+    #                             belongs to the product, not to one commit attempt)
+    #     resource.create        (arbitrary target — no field can be declared for a model we do not
+    #                             know until the request arrives)
+    idempotency_field: str | None = None
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
@@ -511,6 +530,7 @@ ACCOUNT_CREATE_INVOICE = WriteVerb(
     },
     entity_type="invoice",
     supported_args=("partner_id", "invoice_date", "lines"),
+    idempotency_field="ref",
 )
 STOCK_VALIDATE_PICKING = WriteVerb(
     verb="stock.validate_picking",
@@ -577,6 +597,7 @@ ACCOUNT_REGISTER_PAYMENT = WriteVerb(
         "date",
         "ref",
     ),
+    idempotency_field="ref",
 )
 
 
@@ -732,6 +753,7 @@ WOSOOL_CREATE_INVOICE = WriteVerb(
         "lines",
     ),
     references=(("currency", "currency_id", "res.currency"),),
+    idempotency_field="ref",
 )
 WOSOOL_RECORD_PAYMENT = WriteVerb(
     verb="commerce.record_payment",
@@ -746,6 +768,7 @@ WOSOOL_RECORD_PAYMENT = WriteVerb(
     },
     entity_type="payment",
     supported_args=("invoice_id", "amount", "partner_id", "journal_id", "date"),
+    idempotency_field="ref",
 )
 WOSOOL_CREATE_PRODUCT = WriteVerb(
     verb="commerce.create_product",
@@ -808,6 +831,7 @@ WOSOOL_CREATE_PURCHASE_INVOICE = WriteVerb(
     entity_type="invoice",
     supported_args=("supplier_id", "currency", "invoice_date", "lines"),
     references=(("currency", "currency_id", "res.currency"),),
+    idempotency_field="ref",
 )
 
 # ── crm.* query verb constants ────────────────────────────────────────────────────────────────────
@@ -873,6 +897,7 @@ PURCHASE_CREATE_ORDER = WriteVerb(
     },
     entity_type="purchase_order",
     supported_args=("partner_id", "date_order", "origin", "lines"),
+    idempotency_field="origin",
 )
 PURCHASE_DELETE_ORDER = WriteVerb(
     # The INVERSE of purchase.create_order — and the reason the dual PO can be a saga at all.
