@@ -1145,7 +1145,24 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                  "reversibility": (
                      "COMPENSABLE" if v.reverse_method
                      else COMPENSATIONS.get(v.verb, {}).get("reversibility", "IRREVERSIBLE")
-                 )}
+                 ),
+                 # R2 — the RECOVERY declaration travels (template contract: recovery.witness_export).
+                 # The six keyed creates stamp `[WSL-<key>]` into `idempotency_field` and ask-first
+                 # before writing (`_find_by_marker`); this row is how the control plane learns it.
+                 # An unkeyed verb exports NO witness key at all — silence stays visible, and the
+                 # consumer's fail-closed floor reads absence as UNKNOWN, treated exactly as UNSAFE.
+                 # `negative_authoritative` describes the QUERY (Odoo ORM read-your-writes over the
+                 # same committed store); the doubt-WINDOW caveat lives in the runtime, which
+                 # re-raises on NOT FOUND while Odoo may still be committing.
+                 **({"witness": {
+                        "shape": "attempt_keyed",
+                        "field": v.idempotency_field,
+                        "lookup": (
+                            f"search('{v.doctype}', "
+                            f"[['{v.idempotency_field}', 'like', '[WSL-<key>]']], limit=2)"
+                        ),
+                        "negative_authoritative": True,
+                     }} if v.idempotency_field else {})}
                 for _, v in sorted(WRITE_VERBS.items())
             ],
             # READS, declared as reads. They carry NO tier and NO reversibility — a read has no effect
