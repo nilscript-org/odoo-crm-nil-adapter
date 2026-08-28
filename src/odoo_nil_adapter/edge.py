@@ -700,6 +700,20 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         bind_tenant(env.get("workspace") or None)
         body = env.get("body", {})
         key = body.get("idempotency_key", "")
+        if not key:
+            # Locked invariant #5 (C1.6): no external mutation without a non-empty business-effect
+            # identity. `""` used to be used like any other key — the first keyless COMMIT stored
+            # `ledger[""]`, and the SECOND keyless COMMIT of a DIFFERENT proposal answered
+            # `replayed: True` WITHOUT performing its write: two unrelated business effects sharing
+            # one identity because a caller omitted one. Not input validation — the identity model
+            # (the effect key is what recovery probes by; an act with no identity can never be
+            # safely retried). MALFORMED, because the kernel's refusal enum is closed and has it.
+            return _refusal(
+                env, "MALFORMED",
+                "COMMIT requires a non-empty idempotency_key: the business-effect identity is what "
+                "recovery probes by, and an act with no identity can never be safely retried.",
+                field="idempotency_key",
+            )
         if key in state.ledger:  # retried COMMIT — replay, no second write
             return _envelope("STATUS", env, {**state.ledger[key], "replayed": True})
         proposal_id = body.get("proposal", "")
