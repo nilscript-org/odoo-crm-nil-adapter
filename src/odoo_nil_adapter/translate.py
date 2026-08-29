@@ -88,6 +88,22 @@ class WriteVerb:
     #     resource.create        (arbitrary target — no field can be declared for a model we do not
     #                             know until the request arrives)
     idempotency_field: str | None = None
+    #: C3.7 — the recovery classification for a verb that carries NO attempt key. Not every keyless
+    #: write is unsafe: the owner's rule admits two shapes, and only one of them needs a key.
+    #:
+    #:   "convergent"  a stable pre-existing identity + SET semantics. `sale.confirm_order` on an
+    #:                 existing order_id is the same state however many times it runs, and the edge
+    #:                 already reports `already_confirmed` rather than confirming twice. Safe
+    #:                 BECAUSE replay is a no-op, not because anyone asks.
+    #:   "none"        genuinely nothing to query on. A permanent human-gate, and a CORRECT final
+    #:                 answer — not technical debt.
+    #:
+    #: Left unset ⇒ the plane reads UNKNOWN, which it treats exactly as UNSAFE. That is the
+    #: fail-closed floor, and the whole point of declaring: an unasked question and a considered
+    #: "there is nothing to query" must never read the same.
+    recovery_shape: str | None = None
+    #: Why — carried onto the wire so a human reading the verdict sees the reasoning, not a label.
+    recovery_note: str = ""
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
@@ -407,6 +423,8 @@ def _run_get_contact(client: SystemClient, args: dict[str, Any]) -> dict[str, An
 # ── write verb constants (referenced by packs.py; aggregated into WRITE_VERBS at module bottom) ──
 CRM_CREATE_LEAD = WriteVerb(
     verb="crm.create_lead",
+    recovery_shape="none",
+    recovery_note="a lead carries no free-text reference field and no dedup key — there is nothing to query on",
     tier="MEDIUM",
     doctype="crm.lead",
     op="create",
@@ -422,6 +440,8 @@ CRM_CREATE_LEAD = WriteVerb(
 )
 CRM_CREATE_CONTACT = WriteVerb(
     verb="crm.create_contact",
+    recovery_shape="convergent",
+    recovery_note="upsert on a REQUIRED dedup key (C3.5 refuses a keyless call)",
     tier="MEDIUM",
     doctype="res.partner",
     op="upsert",
@@ -438,6 +458,8 @@ CRM_CREATE_CONTACT = WriteVerb(
 )
 CRM_UPDATE_CONTACT = WriteVerb(
     verb="crm.update_contact",
+    recovery_shape="convergent",
+    recovery_note="updates an existing contact_id — the same fields written twice are the same state",
     tier="MEDIUM",
     doctype="res.partner",
     op="update",
@@ -463,6 +485,8 @@ CRM_UPDATE_CONTACT = WriteVerb(
 )
 CRM_LOG_NOTE = WriteVerb(
     verb="crm.log_note",
+    recovery_shape="none",
+    recovery_note="appends a mail.message; the body is searchable but nothing correlates it to one attempt",
     tier="MEDIUM",
     doctype="res.partner",
     op="method",
@@ -477,6 +501,8 @@ CRM_LOG_NOTE = WriteVerb(
 )
 CRM_UPDATE_LEAD_STAGE = WriteVerb(
     verb="crm.update_lead_stage",
+    recovery_shape="convergent",
+    recovery_note="sets a stage on an existing lead_id; SET semantics",
     tier="MEDIUM",
     doctype="crm.lead",
     op="update",
@@ -490,6 +516,8 @@ CRM_UPDATE_LEAD_STAGE = WriteVerb(
 )
 CRM_DELETE_LEAD = WriteVerb(
     verb="crm.delete_lead",
+    recovery_shape="convergent",
+    recovery_note="deletes an existing id, verified by read-back",
     tier="HIGH",
     doctype="crm.lead",
     op="delete",
@@ -503,6 +531,8 @@ CRM_DELETE_LEAD = WriteVerb(
 )
 CRM_DELETE_CONTACT = WriteVerb(
     verb="crm.delete_contact",
+    recovery_shape="convergent",
+    recovery_note="deletes an existing id, and the edge re-reads to confirm ABSENCE — a second delete is a no-op",
     tier="HIGH",
     doctype="res.partner",
     op="delete",
@@ -534,6 +564,8 @@ ACCOUNT_CREATE_INVOICE = WriteVerb(
 )
 STOCK_VALIDATE_PICKING = WriteVerb(
     verb="stock.validate_picking",
+    recovery_shape="convergent",
+    recovery_note="validates an existing picking_id; the moves are committed once",
     tier="HIGH",
     doctype="stock.picking",
     op="method",
@@ -548,6 +580,8 @@ STOCK_VALIDATE_PICKING = WriteVerb(
 )
 SALE_CONFIRM_ORDER = WriteVerb(
     verb="sale.confirm_order",
+    recovery_shape="convergent",
+    recovery_note="confirms an existing order_id, and already reports `already_confirmed` rather than confirming twice",
     tier="HIGH",
     doctype="sale.order",
     op="method",
@@ -562,6 +596,8 @@ SALE_CONFIRM_ORDER = WriteVerb(
 )
 ACCOUNT_POST_INVOICE = WriteVerb(
     verb="account.post_invoice",
+    recovery_shape="convergent",
+    recovery_note="posts an existing invoice_id; a posted move re-posts to the same state",
     tier="HIGH",
     doctype="account.move",
     op="method",
@@ -715,6 +751,8 @@ def _to_native_procurement_create_purchase_invoice(
 
 WOSOOL_CREATE_CLIENT = WriteVerb(
     verb="crm.create_client",
+    recovery_shape="convergent",
+    recovery_note="upsert on a REQUIRED dedup key (C3.5 refuses a keyless call), so the key is the stable identity",
     tier="MEDIUM",
     doctype="res.partner",
     op="upsert",
@@ -772,6 +810,8 @@ WOSOOL_RECORD_PAYMENT = WriteVerb(
 )
 WOSOOL_CREATE_PRODUCT = WriteVerb(
     verb="commerce.create_product",
+    recovery_shape="none",
+    recovery_note="`default_code` is the SKU — the PRODUCT's key, not one attempt's; reusing it as a witness would conflate two different identities",
     tier="MEDIUM",
     doctype="product.product",
     op="create",
@@ -792,6 +832,8 @@ WOSOOL_SET_LANDED_COST = WriteVerb(
     # insurance + duties) / quantity received lands on the product's `standard_price` — the cost of
     # goods Finance reads. op="update": we mutate an existing product, not mint one.
     verb="commerce.set_landed_cost",
+    recovery_shape="convergent",
+    recovery_note="writes a cost onto an existing product_id; SET semantics",
     tier="HIGH",
     doctype="product.product",
     op="update",
@@ -910,6 +952,8 @@ PURCHASE_DELETE_ORDER = WriteVerb(
     # Odoo REFUSES the unlink — and the edge reports that refusal as a terminal failure rather than
     # swallowing it, which is exactly the behaviour a compensation must have.
     verb="purchase.delete_order",
+    recovery_shape="convergent",
+    recovery_note="deletes an existing id, verified by read-back",
     tier="HIGH",  # deleting is HIGH in this adapter, as every other delete verb is
     doctype="purchase.order",
     op="delete",
@@ -1025,6 +1069,8 @@ ACCOUNT_GET_INVOICE_DOCUMENT = QueryVerb(
 
 PURCHASE_CONFIRM_ORDER = WriteVerb(
     verb="purchase.confirm_order",
+    recovery_shape="convergent",
+    recovery_note="confirms an existing order_id; the state is the same however many times it runs",
     tier="HIGH",
     doctype="purchase.order",
     op="method",

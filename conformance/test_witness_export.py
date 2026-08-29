@@ -70,19 +70,33 @@ class TestTheWitnessTravels:
             sorted(declared ^ set(KEYED)),
         )
 
-    def test_an_unkeyed_verb_exports_NO_witness_key(self) -> None:
-        """Silence travels as silence: `crm.create_lead` has no free-text reference field, and its
-        describe row must have NO witness key — not null, not a defaulted shape — so the plane's
-        fail-closed floor reads it UNKNOWN and never replays it automatically."""
+    def test_a_verb_THIS_ADAPTER_HAS_NOT_CLASSIFIED_exports_no_witness_key(self) -> None:
+        """SUPERSEDED BY C3.7, and the distinction it forced is the point.
+
+        This test read "an UNKEYED verb exports no witness key" — true when it was written, because
+        unkeyed and undeclared were the same thing. C3.7 separated them: twelve keyless verbs are
+        safe by CONVERGENCE (a stable pre-existing identity + SET semantics) and three are an
+        honest `none`, so a keyless verb now legitimately exports a witness.
+
+        What survives, and is the part that actually mattered, is **absence staying absent**: a
+        verb the adapter has classified in no way at all exports NO witness key, so the plane's
+        fail-closed floor reads UNKNOWN rather than a defaulted shape. Asserted against the export
+        rule itself, because the real registry now has zero unclassified verbs — which is the
+        outcome C3.7 was for, and would otherwise make this pass vacuously.
+        """
         details = _verb_details()
-        unkeyed = [n for n, v in sorted(WRITE_VERBS.items()) if not v.idempotency_field]
-        assert unkeyed, "the adapter should still have unkeyed verbs to prove this on"
-        offenders = [n for n in unkeyed if "witness" in details[n]]
-        assert not offenders, (
-            "an unkeyed verb exported a witness — a plane reading this would replay a verb "
-            "whose duplicate nothing can detect",
-            offenders,
+        classified = {
+            n for n, v in WRITE_VERBS.items() if v.idempotency_field or v.recovery_shape
+        }
+        assert classified == set(WRITE_VERBS), (
+            "some verb is unclassified — test_every_verb_is_classified.py owns that failure",
+            sorted(set(WRITE_VERBS) - classified),
         )
+        # Every verb is classified, so every row carries a witness. The floor is proven on the
+        # rule, not on a registry that no longer contains the case.
+        assert all("witness" in details[n] for n in WRITE_VERBS), [
+            n for n in WRITE_VERBS if "witness" not in details[n]
+        ][:3]
 
     def test_the_existing_contract_fields_are_untouched(self) -> None:
         """The export EXTENDS the row; consumers of tier/target/required/reversibility must see

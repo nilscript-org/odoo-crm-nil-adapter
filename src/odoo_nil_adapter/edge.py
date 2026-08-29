@@ -1204,7 +1204,19 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                             f"[['{v.idempotency_field}', 'like', '[WSL-<key>]']], limit=2)"
                         ),
                         "negative_authoritative": True,
-                     }} if v.idempotency_field else {})}
+                     }} if v.idempotency_field
+                     # C3.7 — a keyless verb is not automatically unsafe. `convergent` means a
+                     # stable pre-existing identity plus SET semantics: replay is a no-op, so no
+                     # attempt key is needed or meaningful. `none` is the honest permanent
+                     # human-gate — a CORRECT final answer, not debt. Undeclared exports nothing
+                     # and the plane reads UNKNOWN, treated exactly as UNSAFE.
+                     else {"witness": {
+                        "shape": v.recovery_shape,
+                        "note": v.recovery_note,
+                        **({"identity": list(v.dedup_keys or v.required)} if v.recovery_shape == "convergent" else {}),
+                        **({"lookup": f"get('{v.doctype}', <{(v.required or ('id',))[0]}>)",
+                            "negative_authoritative": True} if v.recovery_shape == "convergent" else {}),
+                     }} if v.recovery_shape else {})}
                 for _, v in sorted(WRITE_VERBS.items())
             ],
             # READS, declared as reads. They carry NO tier and NO reversibility — a read has no effect
