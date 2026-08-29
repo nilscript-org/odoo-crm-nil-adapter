@@ -641,6 +641,34 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         missing = verb.missing(args)
         if missing:
             return _refusal(env, "INVALID_ARGS", f"missing required arg: {missing[0]}", field=missing[0])
+        # C3.5 — AN UPSERT WITH NOTHING TO DEDUPLICATE ON IS A BLIND CREATE WEARING AN UPSERT'S
+        # NAME. The commit-path probe skips any dedup key the caller left empty, so a valid
+        # name-only `create_client` probed nothing and fell through to a create: its safety was
+        # never a property of the verb, only of callers who happened to pass an email.
+        #
+        # Two consequences, and the second is the worse one: a retry after a lost answer mints a
+        # second partner, AND the declared contract is false — `op="upsert"` promises
+        # update-in-place with a COMPENSABLE before-image, but with no key it can find nothing to
+        # update and performs a REVERSIBLE create while claiming the other. A governance envelope
+        # describing a different act than the one performed is worse than a missing one.
+        #
+        # Refused HERE rather than by widening `required`, and the reason is structural, not
+        # stylistic: `required` is a CONJUNCTION — every field in it must be present — and what
+        # this verb needs is a DISJUNCTION, one of `email` or `phone`. `required` cannot say that,
+        # so a guard is the only place the real precondition can live. It fires at PROPOSE, so
+        # nothing has been written when the caller is told, and the unsafe path becomes
+        # UNEXPRESSIBLE rather than filtered — this platform's own law.
+        if verb.op == "upsert" and verb.dedup_keys:
+            native_probe = verb.to_native(args)
+            if not any(native_probe.get(f) for f in verb.dedup_keys):
+                keys = " or ".join(verb.dedup_keys)
+                return _refusal(
+                    env, "INVALID_ARGS",
+                    f"'{verb_name}' deduplicates on {keys}, and this call supplies neither — it "
+                    f"could only create blindly, so a retry would mint a second {verb.doctype}. "
+                    f"Provide {keys}.",
+                    field=verb.dedup_keys[0],
+                )
         # An effect whose arithmetic is undefined is not a small effect — it is NO effect. A verb that
         # cannot compute its own payload (a landed cost over a received quantity of zero) must say so
         # HERE, before a human approves it, instead of writing an empty doc and reporting success.

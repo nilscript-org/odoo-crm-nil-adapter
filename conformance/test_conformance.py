@@ -32,6 +32,14 @@ def args_for(verb_name: str) -> dict:
     args: dict = {field: "x" for field in verb.required}
     for field in verb.positive:
         args[field] = "10"
+    # The same lesson one verb later (C3.5). An `upsert` deduplicates on ONE OF its declared
+    # dedup_keys, and `required` cannot express a disjunction — so a seed of required-only args
+    # produced a keyless upsert, which is a blind create wearing an upsert's name. The verb now
+    # refuses that, and the seed becomes realistic rather than the refusal being softened: exactly
+    # the trade made above for `positive`, where the harness's convenience was dictating the
+    # product's honesty.
+    if verb.op == "upsert" and verb.dedup_keys:
+        args.setdefault(verb.dedup_keys[0], "x")
     return args
 
 
