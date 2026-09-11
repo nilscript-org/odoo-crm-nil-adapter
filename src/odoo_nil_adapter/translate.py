@@ -53,6 +53,21 @@ class WriteVerb:
     # domain (edge.py's op=upsert dispatch, generalized fix round 1) — for an identity no single
     # field can carry on its own (e.g. a link keyed on (parent_id, child_id)).
     dedup_keys: tuple[str | tuple[str, ...], ...] = ()
+    # Fix round 1 (Task 1.3b, D-concern-1): `dedup_keys`' OR semantics tries EVERY declared entry in
+    # order and stops at the first hit — which is right when the keys are alternative spellings of
+    # the SAME identity (crm.create_contact's email-or-phone: whichever the caller happened to give
+    # names the same contact). It is WRONG when the keys are TIERS of a fallback — "probe email when
+    # given; consult name only when it is not" — because a genuinely NEW record whose email search
+    # comes up empty still falls through to the name search, and two unrelated records that merely
+    # share a display name can silently merge just because the caller also passed a fresh email.
+    #
+    # `dedup_probe`, when set, is a PURE function of the raw NIL args that narrows `dedup_keys` down
+    # to the ordered subset that actually applies to THIS call — e.g. `("email",)` when an email was
+    # given, `("name",)` when it was not, never both. `edge.py` only ever CALLS this (via
+    # `dedup_probe_keys`); it never branches on a business field name itself, so the mechanism stays
+    # vendor-neutral. Left `None` (the default) preserves every existing verb's behaviour exactly:
+    # `dedup_probe_keys` falls back to trying the full `dedup_keys` tuple, first hit wins.
+    dedup_probe: Callable[[dict[str, Any]], tuple[str | tuple[str, ...], ...]] | None = None
     method: str | None = (
         None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
     )
@@ -111,6 +126,12 @@ class WriteVerb:
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
+
+    def dedup_probe_keys(self, args: dict[str, Any]) -> tuple[str | tuple[str, ...], ...]:
+        """The dedup_keys entries to actually probe FOR THIS CALL. Delegates to `dedup_probe` when
+        the verb declares one (a per-call narrowing — see its docstring above); otherwise returns the
+        full declared `dedup_keys` unchanged, which is every verb's behaviour today."""
+        return self.dedup_probe(args) if self.dedup_probe is not None else self.dedup_keys
 
     def nonpositive(self, args: dict[str, Any]) -> list[str]:
         """Declared `positive` args that are absent, non-numeric, or <= 0 — the uncomputable set."""
@@ -1211,6 +1232,18 @@ def _to_native_create_supplier(args: dict[str, Any]) -> dict[str, Any]:
     return doc
 
 
+# Fix round 1 (Task 1.3b, D-concern-1): a plain OR-probed `dedup_keys=("email","name")` would try
+# `email` first and, on a miss, ALSO try `name` — so a genuinely NEW supplier whose email search
+# comes up empty could still merge into an UNRELATED existing supplier that merely shares a display
+# name. That is wrong: when the caller gave an email, `name` must never be consulted at all. The
+# ruling is exact — email given → probe email ONLY; email absent → probe name ONLY, never both in
+# the same call. `dedup_probe` (translate.py's `WriteVerb`, `edge.py`'s `dedup_probe_keys`) expresses
+# that as a pure per-call narrowing so `edge.py` stays vendor-neutral: it only ever calls this
+# function, it never itself knows that "email" or "name" are the fields in play.
+def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[str, ...]:
+    return ("email",) if args.get("email") else ("name",)
+
+
 PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
     verb="procurement.create_supplier",
     # Convergent by the SAME C3.5 discipline as `crm.create_contact`/`crm.create_client`: an upsert
@@ -1224,9 +1257,9 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
     # only once.
     recovery_shape="convergent",
     recovery_note=(
-        "upserts on email when given; falls back to name otherwise (C3.5's dedup-key discipline — "
-        "the same OR-probed dedup_keys tuple crm.create_contact uses, ordered so email wins when both "
-        "are present)"
+        "upserts on email when given, name ONLY when it is not (dedup_probe narrows the call to "
+        "exactly one of the two — never both — so an unrelated supplier sharing a display name can "
+        "never merge just because a fresh email was also given; fix round 1, D-concern-1)"
     ),
     tier="MEDIUM",
     doctype="res.partner",
@@ -1240,7 +1273,11 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
         + (f" <{a['email']}>" if a.get("email") else ""),
     },
     entity_type="supplier",
+    # The declared possible keys (documentation, describe/manifest, and the C3.5 fallback when no
+    # `dedup_probe` narrowing is available) — unchanged. Runtime probing goes through `dedup_probe`
+    # below, which always selects exactly ONE of these two for a given call.
     dedup_keys=("email", "name"),
+    dedup_probe=_dedup_probe_create_supplier,
 )
 
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────

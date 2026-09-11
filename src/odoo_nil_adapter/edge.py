@@ -660,6 +660,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # UNEXPRESSIBLE rather than filtered — this platform's own law.
         if verb.op == "upsert" and verb.dedup_keys:
             native_probe = verb.to_native(args)
+            # Fix round 1 (Task 1.3b): the keys actually probed for THIS call — narrowed by
+            # `dedup_probe` when the verb declares one (e.g. "email when given, name only when it is
+            # not" — never both), else the full declared `dedup_keys` OR-set, unchanged. Vendor-neutral:
+            # this file only ever calls the verb's own resolver, never branches on a field name.
+            probe_keys = verb.dedup_probe_keys(args) or verb.dedup_keys  # never empty: a resolver
+            # returning nothing falls back to the full declared set rather than crashing below.
             # A dedup_keys entry is either a single field name (satisfied when THAT field alone has
             # a value) or a tuple of field names — a compound key, satisfied only when EVERY field in
             # the group has a value (it is probed as one AND-of-equalities; a partial group could
@@ -669,12 +675,12 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 fields = entry if isinstance(entry, tuple) else (entry,)
                 return all(native_probe.get(f) for f in fields)
 
-            if not any(_group_satisfied(entry) for entry in verb.dedup_keys):
+            if not any(_group_satisfied(entry) for entry in probe_keys):
                 def _label(entry: str | tuple[str, ...]) -> str:
                     return "+".join(entry) if isinstance(entry, tuple) else entry
 
-                keys = " or ".join(_label(entry) for entry in verb.dedup_keys)
-                first_entry = verb.dedup_keys[0]
+                keys = " or ".join(_label(entry) for entry in probe_keys)
+                first_entry = probe_keys[0]
                 first_field = first_entry[0] if isinstance(first_entry, tuple) else first_entry
                 return _refusal(
                     env, "INVALID_ARGS",
@@ -910,8 +916,14 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                 # unique, e.g. a link keyed on (parent_id, child_id), and no single field in it is a
                 # safe key on its own). A single hit ⇒ update it in place (COMPENSABLE before-image);
                 # no hit ⇒ create (REVERSIBLE by the verb's delete).
+                #
+                # Fix round 1 (Task 1.3b): `dedup_probe_keys` narrows the OR-set to what THIS call's
+                # args actually license probing on (e.g. email-only when given, name-only when not),
+                # so a genuinely new record whose email search misses is never allowed to fall
+                # through to an unrelated record that merely shares a display name. A verb with no
+                # `dedup_probe` gets the unchanged full-set behaviour every other verb already has.
                 match_id: str | None = None
-                for key in verb.dedup_keys:
+                for key in verb.dedup_probe_keys(stored["args"]) or verb.dedup_keys:
                     fields = key if isinstance(key, tuple) else (key,)
                     values = [native.get(f) for f in fields]
                     if not all(values):  # every field in the group must carry a value to probe it

@@ -84,8 +84,13 @@ def test_optional_args_are_omitted_when_not_given(fake_client: _CountingFakeSyst
     assert "vat" not in record
 
 
-# ── convergence: a second create with the same email returns the existing id, no second write ────
-def test_convergent_on_email_second_create_is_a_no_op(fake_client: _CountingFakeSystem) -> None:
+# ── fix round 1 (D-concern-1): dedup is EXACTLY email-only when given, name-only when not ────────
+# Coordinator ruling: two unrelated suppliers sharing a display name must never merge just because a
+# fresh (non-matching) email was also given on the second call. `dedup_probe` enforces that by
+# narrowing the probe to exactly ONE key per call — never falling from email through to name.
+def test_b_email_given_and_matches_an_existing_supplier_converges_no_second_create(
+    fake_client: _CountingFakeSystem,
+) -> None:
     # `name` is held IDENTICAL across both calls on purpose: `res.partner.name` is also this
     # FakeSystem's record identity (it has no separate numeric id), so varying it would make the
     # SECOND call's own write shift what `entity.id` reads back as — a fake-harness artifact, not a
@@ -107,7 +112,7 @@ def test_convergent_on_email_second_create_is_a_no_op(fake_client: _CountingFake
     assert fake_client.docs["res.partner"][0]["phone"] == "0501234567"
 
 
-def test_convergent_on_name_when_no_email_given(fake_client: _CountingFakeSystem) -> None:
+def test_c_no_email_and_same_name_converges_no_second_create(fake_client: _CountingFakeSystem) -> None:
     """No email at all — the fallback dedup key (`name`) converges a retry instead of minting a
     second vendor purely because the caller supplied no email either time."""
     client = _client(fake_client)
@@ -115,6 +120,33 @@ def test_convergent_on_name_when_no_email_given(fake_client: _CountingFakeSystem
     second = _commit(client, "procurement.create_supplier", {"name": "Nameonly Vendor"})
     assert first["result"]["entity"]["id"] == second["result"]["entity"]["id"]
     assert fake_client.created["res.partner"] == 1
+
+
+def test_a_email_given_but_matches_nothing_never_falls_through_to_a_same_named_supplier(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    """The finding this fixes: two UNRELATED suppliers sharing a display name must never merge just
+    because the second call also happened to carry a genuinely fresh email. Before the fix, a miss on
+    `email` fell through to probing `name` — which WOULD have matched the first supplier here and
+    silently overwritten it instead of creating a second, distinct one."""
+    client = _client(fake_client)
+    first = _commit(
+        client, "procurement.create_supplier", {"name": "Gulf Trading Co", "email": "riyadh@gulftrading.example"},
+    )
+    second = _commit(
+        client, "procurement.create_supplier",
+        {"name": "Gulf Trading Co", "email": "jeddah@gulftrading.example"},
+    )
+    assert first["state"] == "executed" and second["state"] == "executed"
+    # NOTE: `FakeSystem` has no separate numeric id — a record's identity IS its `name` field — so
+    # two same-named rows can read back an equal `entity.id` even though they are DISTINCT rows in
+    # the backing store. The load-bearing proof here is therefore the write count and the store
+    # itself, not the (harness-artifact) id string.
+    assert fake_client.created["res.partner"] == 2
+    rows = fake_client.docs["res.partner"]
+    assert len(rows) == 2
+    emails = {r["email"] for r in rows}
+    assert emails == {"riyadh@gulftrading.example", "jeddah@gulftrading.example"}
 
 
 # ── compensation: REVERSIBLE, reusing crm.delete_contact (same res.partner, same reversal) ────────
