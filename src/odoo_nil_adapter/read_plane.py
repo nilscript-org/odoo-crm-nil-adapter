@@ -149,6 +149,18 @@ def _to_domain(predicates: Sequence[Predicate]) -> list[list[Any]]:
     return domain
 
 
+def _native(target: str) -> str:
+    """The native Odoo model for `target`, which may already be native OR a declared business
+    resource name (`Supplier`, `Customer`) — translate.py's `_target_for_plane`/`_ScopedPlane` now
+    hand the RESOURCE name through on purpose (I1, final review) so `describe_target` below can select
+    that resource's own curated projection when two resources share one model. Every native I/O call
+    (`fetch`/`count`/`get_one`/`aggregate`) must resolve back to the real model before it reaches
+    Odoo — a business name is not a table name."""
+    from odoo_nil_adapter.translate import native_model  # lazy: translate↔read_plane cycle guard
+
+    return native_model(target)
+
+
 class OdooReadBackend:
     """Adapts a `SystemClient` to the universal `ReadBackend` protocol (native I/O only)."""
 
@@ -167,9 +179,8 @@ class OdooReadBackend:
         (D37), but this method must not silently depend on that staying true forever, so it resolves
         again here (a no-op when `target` is already native)."""
         from odoo_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
-        from odoo_nil_adapter.translate import native_model  # lazy: same cycle guard
 
-        native = native_model(target)
+        native = _native(target)
         if not governance.module_enabled(native):
             return None
         # A curated projection can be declared under the business name (`Supplier`) or the native model
@@ -209,24 +220,27 @@ class OdooReadBackend:
         )
 
     def fetch(self, target, *, predicates, fields, sort, limit, after_id):
+        native = _native(target)  # I1: `target` may be a business resource name (e.g. "Supplier")
         domain = _to_domain(predicates)
         if after_id is not None:  # keyset paging: stable for 1M+, no offset drift
             domain = [["id", ">", after_id], *domain]
         cols = tuple(dict.fromkeys(("id", *fields)))
-        return self._client.search(target, domain, fields=cols, limit=limit, order="id asc")
+        return self._client.search(native, domain, fields=cols, limit=limit, order="id asc")
 
     def count(self, target, *, predicates):
-        return self._client.count(target, _to_domain(predicates))
+        return self._client.count(_native(target), _to_domain(predicates))
 
     def get_one(self, target, record_id, fields):
+        native = _native(target)
         cols = tuple(dict.fromkeys(("id", *fields)))
-        rows = self._client.search(target, [["id", "=", record_id]], fields=cols, limit=1)
+        rows = self._client.search(native, [["id", "=", record_id]], fields=cols, limit=1)
         return rows[0] if rows else None
 
     def aggregate(self, target, *, predicates, group_by, metrics):
         # Group via a bounded native pull keyed on `group_by` (the shim's stand-in for read_group);
         # the engine only reaches here when server_aggregate is advertised.
-        rows = self._client.search(target, _to_domain(predicates), fields=(group_by, "id"), limit=100_000)
+        native = _native(target)
+        rows = self._client.search(native, _to_domain(predicates), fields=(group_by, "id"), limit=100_000)
         buckets: dict[Any, int] = {}
         for r in rows:
             key = r.get(group_by)

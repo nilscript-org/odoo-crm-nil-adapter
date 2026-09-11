@@ -50,27 +50,32 @@ class _RecordingBackend:
         }
 
     def describe_target(self, target: str) -> TargetSchema | None:
-        return self._schemas.get(target)
+        # I1 (final review): translate.py may now hand this a declared BUSINESS name ("Supplier",
+        # "Customer") instead of the already-resolved native model, so `describe_target` can select
+        # a resource's own projection when two resources share one model — exactly mirroring the real
+        # `OdooReadBackend.describe_target`, which resolves again here for the same reason.
+        return self._schemas.get(translate.native_model(target))
 
     def _domain(self, predicates: Any) -> list[tuple[str, str, Any]]:
         return [(p.field, _OP_TO_ODOO[p.op], p.value) for p in predicates]
 
     def fetch(self, target, *, predicates, fields, sort, limit, after_id):
-        self.last_target = target
+        # Every native I/O call resolves to the real model — the exact boundary this fixture proves.
+        self.last_target = translate.native_model(target)
         self.last_domain = self._domain(predicates)
         return []
 
     def count(self, target, *, predicates):
-        self.last_target = target
+        self.last_target = translate.native_model(target)
         self.last_domain = self._domain(predicates)
         return 0
 
     def get_one(self, target, record_id, fields):
-        self.last_target = target
+        self.last_target = translate.native_model(target)
         return None
 
     def aggregate(self, target, *, predicates, group_by, metrics):
-        self.last_target = target
+        self.last_target = translate.native_model(target)
         self.last_domain = self._domain(predicates)
         return []
 

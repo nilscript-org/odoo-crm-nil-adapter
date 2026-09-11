@@ -12,6 +12,7 @@ I1: `vat` leaked into Customer's default projection because Customer and Supplie
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from odoo_nil_adapter import translate
@@ -99,3 +100,74 @@ def test_customer_default_projection_excludes_vat() -> None:
 def test_supplier_default_projection_includes_vat() -> None:
     schema = OdooReadBackend(FakeSystem()).describe_target("Supplier")
     assert "vat" in schema.default_projection
+
+
+# ── I1 (final review): the projection must be reachable THROUGH THE REAL EDGE, not just at the
+# describe_target level — `test_supplier_default_projection_includes_vat` above passed even while the
+# real `nil.search`/`nil.get` paths could never reach it (every real read resolved to the native model
+# BEFORE the plane was called). These drive the actual wire.
+def test_nil_search_supplier_through_the_edge_returns_the_supplier_projection_with_reveal() -> None:
+    out = _query(
+        _client(_seeded_partners()), "nil.search", {"target": "Supplier", "reveal": ["vat"]}
+    )
+    assert out["items"] == [
+        {"id": 2, "name": "Pure Supplier", "phone": "222", "email": "s@x.com", "vat": "VS1"}
+    ]
+
+
+def test_nil_search_supplier_through_the_edge_redacts_vat_without_reveal() -> None:
+    out = _query(_client(_seeded_partners()), "nil.search", {"target": "Supplier"})
+    assert "vat" not in out["items"][0]
+    assert "vat" in out.get("redacted", [])
+
+
+def test_nil_search_customer_through_the_edge_never_carries_vat_even_with_reveal() -> None:
+    out = _query(
+        _client(_seeded_partners()), "nil.search", {"target": "Customer", "reveal": ["vat"]}
+    )
+    assert all("vat" not in row for row in out["items"])
+
+
+def test_nil_get_supplier_through_the_edge_returns_vat_with_reveal() -> None:
+    out = _query(
+        _client(_seeded_partners()), "nil.get", {"target": "Supplier", "id": 2, "reveal": ["vat"]}
+    )
+    assert out.get("vat") == "VS1"
+
+
+# ── I3 (final review): the scoped existence count must fail CLOSED, never OPEN ─────────────────────
+def test_id_satisfies_domain_propagates_a_refused_scope_count_instead_of_returning_true() -> None:
+    """Direct unit proof on the function itself: a scoped count that cannot run must never come back
+    as `True` (which would let the caller's own unscoped `get` proceed and possibly hand back a
+    record outside the resource's domain)."""
+
+    class _RefusingPlane:
+        def count(self, target: str, *, filter: object) -> dict:
+            raise translate.CapabilityUnsupported("scoped count refused")
+
+    with pytest.raises(translate.CapabilityUnsupported):
+        translate._id_satisfies_domain(_RefusingPlane(), "Supplier", "res.partner", 2)
+
+
+def test_get_supplier_is_refused_never_found_false_never_the_record_when_the_scope_count_cannot_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration proof: once the refusal propagates, `_run_nil_get`'s own try/except turns it into a
+    structured `refused` outcome — never the silent `{"found": False}` a normal miss would answer
+    (which would misreport "the caller's own read will refuse too" when the refusal is actually caused
+    by the scope check's OWN extra predicate), and never the unscoped record."""
+
+    class _BoomPlane:
+        def count(self, target: str, *, filter: object) -> dict:
+            raise translate.CapabilityUnsupported("scoped count refused")
+
+        def get(self, *args: object, **kwargs: object) -> dict:
+            raise AssertionError("must never reach the unscoped get once the scope check refuses")
+
+    monkeypatch.setattr(translate, "_plane", lambda client: _BoomPlane())
+    out = translate._run_nil_get(FakeSystem(), {"target": "Supplier", "id": 2})
+    assert out == {
+        "outcome": "refused",
+        "code": "CAPABILITY_UNSUPPORTED",
+        "message": "scoped count refused",
+    }

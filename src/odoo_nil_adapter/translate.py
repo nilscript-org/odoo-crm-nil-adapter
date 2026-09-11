@@ -1368,6 +1368,20 @@ def _resolved_target(args: dict[str, Any]) -> str:
     return _OdooBindings().resolve_target(args.get("target", ""))
 
 
+# I1 (final review): the `Supplier` projection (packs.py's own `vat`-carrying entry, keyed by the
+# BUSINESS name) was unreachable — every real read resolved to the native model (`res.partner`)
+# BEFORE calling the plane, so `describe_target` always matched the shared `res.partner` entry
+# (Customer's) and a `Supplier` read could never see `vat`, even with `reveal`. Ruling: the plane's
+# projection is chosen by the RESOURCE when the caller named one (an EXACT declared key — "Supplier",
+# not a case-insensitive or aliased guess), falling back to the fully resolved native model for a
+# native name or an unrecognized string — today's behaviour, unchanged. `OdooReadBackend.describe_target`
+# (read_plane.py) already tries the exact name first, then the native model; this is the missing half
+# that actually HANDS it the exact name instead of resolving it away first.
+def _target_for_plane(args: dict[str, Any]) -> str:
+    about = args.get("target", "")
+    return about if about in RESOURCES else _resolved_target(args)
+
+
 # Odoo triple op → the NIL predicate op it round-trips through (the read plane's own `_to_domain`
 # undoes this on the way back out). Only the ops a `base_filter_for` entry can plausibly use.
 _TRIPLE_OP_TO_NIL: dict[str, str] = {
@@ -1391,7 +1405,7 @@ def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
     resource = args.get("target", "")
     try:
         result = _plane(client).search(
-            _resolved_target(args),
+            _target_for_plane(args),
             filter=_translate_product_supplier_filter(client, resource, _filter_with_base(args)),
             fields=args.get("fields"),
             limit=int(args.get("limit") or 50),
@@ -1405,7 +1419,7 @@ def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
 
 def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _plane(client).count(_resolved_target(args), filter=_filter_with_base(args))
+        return _plane(client).count(_target_for_plane(args), filter=_filter_with_base(args))
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -1440,7 +1454,7 @@ def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
         if not _id_satisfies_domain(_plane(client), resource, native, record_id):
             return {"found": False, "id": record_id}
         rec = _plane(client).get(
-            native,
+            _target_for_plane(args),
             record_id=record_id,
             fields=args.get("fields"),
             grant_fields=_grant(args),
@@ -1455,7 +1469,7 @@ def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
 def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).aggregate(
-            _resolved_target(args),
+            _target_for_plane(args),
             filter=_filter_with_base(args),
             group_by=args["group_by"],
             metrics=tuple(args.get("metrics") or ("count",)),
@@ -1467,7 +1481,7 @@ def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, 
 def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         handle = _plane(client).export(
-            _resolved_target(args),
+            _target_for_plane(args),
             filter=_filter_with_base(args),
             fields=args.get("fields"),
             tenant=str(args.get("tenant") or "default"),
@@ -1542,32 +1556,47 @@ class _ScopedPlane:
         ]
         return [*base, *(filt or [])]
 
+    def _plane_target(self, target: str) -> str:
+        """I1 (final review): route to the RESOURCE's own name (so `describe_target` can pick its OWN
+        projection — e.g. `Supplier`'s `vat`-carrying entry, packs.py) when this call's target is the
+        native model we are scoping, mirroring `_target_for_plane`'s choice for the direct `nil.*`
+        verbs. Only an EXACT declared resource name earns this — `IntentResolver` always resolves
+        `intent.about` to `self._native` before calling us, so `self._resource` (the RAW `about`) is
+        only trustworthy as a schema key when it is itself one of the declared canonical names; a case
+        variant or an already-native model name keeps resolving to the plain native schema, unchanged."""
+        return self._resource if target == self._native and self._resource in RESOURCES else target
+
     def search(self, target, *, filter, fields, limit, cursor=None, grant_fields=None):  # noqa: A002
         return self._plane.search(
-            target, filter=self._scoped_filter(target, filter), fields=fields, limit=limit,
-            cursor=cursor, grant_fields=grant_fields,
+            self._plane_target(target), filter=self._scoped_filter(target, filter), fields=fields,
+            limit=limit, cursor=cursor, grant_fields=grant_fields,
         )
 
     def count(self, target, *, filter):  # noqa: A002
-        return self._plane.count(target, filter=self._scoped_filter(target, filter))
+        return self._plane.count(self._plane_target(target), filter=self._scoped_filter(target, filter))
 
     def aggregate(self, target, *, filter, group_by, metrics):  # noqa: A002
         return self._plane.aggregate(
-            target, filter=self._scoped_filter(target, filter), group_by=group_by, metrics=metrics
+            self._plane_target(target), filter=self._scoped_filter(target, filter), group_by=group_by,
+            metrics=metrics,
         )
 
     def export(self, target, *, filter, fields, tenant, now, approved=False, grant_fields=None):  # noqa: A002
         return self._plane.export(
-            target, filter=self._scoped_filter(target, filter), fields=fields, tenant=tenant, now=now,
-            approved=approved, grant_fields=grant_fields,
+            self._plane_target(target), filter=self._scoped_filter(target, filter), fields=fields,
+            tenant=tenant, now=now, approved=approved, grant_fields=grant_fields,
         )
 
     def get(self, target, *, record_id, fields, grant_fields=None):
+        # I3: `_id_satisfies_domain` no longer swallows a refused scope check into `True` — a refusal
+        # here propagates to `_run_nil_intent`'s own `except _READ_REFUSALS`, never silently `None`.
         if target == self._native and not _id_satisfies_domain(
             self._plane, self._resource, self._native, record_id
         ):
             return None
-        return self._plane.get(target, record_id=record_id, fields=fields, grant_fields=grant_fields)
+        return self._plane.get(
+            self._plane_target(target), record_id=record_id, fields=fields, grant_fields=grant_fields
+        )
 
 
 def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
