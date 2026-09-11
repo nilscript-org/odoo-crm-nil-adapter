@@ -1149,11 +1149,30 @@ def _resolved_target(args: dict[str, Any]) -> str:
     return _OdooBindings().resolve_target(args.get("target", ""))
 
 
+# Odoo triple op → the NIL predicate op it round-trips through (the read plane's own `_to_domain`
+# undoes this on the way back out). Only the ops a `base_filter_for` entry can plausibly use.
+_TRIPLE_OP_TO_NIL: dict[str, str] = {
+    "=": "eq", "!=": "ne", ">": "gt", ">=": "gte", "<": "lt", "<=": "lte", "in": "in",
+}
+
+
+def _filter_with_base(args: dict[str, Any]) -> list[dict[str, Any]]:
+    """D37 (Task 1.2): prepend the resource's fixed base domain (e.g. `supplier_rank > 0`) to the
+    caller's filter, keyed on the ORIGINAL business name — never the resolved model, which by then
+    can no longer tell `Customer` and `Supplier` apart. A native model name (no RESOURCES entry)
+    contributes no base predicate, so today's behaviour is unchanged."""
+    base = [
+        {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value}
+        for field, op, value in base_filter_for(args.get("target", ""))
+    ]
+    return [*base, *(args.get("filter") or [])]
+
+
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).search(
             _resolved_target(args),
-            filter=args.get("filter") or [],
+            filter=_filter_with_base(args),
             fields=args.get("fields"),
             limit=int(args.get("limit") or 50),
             cursor=args.get("cursor"),
@@ -1165,7 +1184,7 @@ def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
 
 def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _plane(client).count(_resolved_target(args), filter=args.get("filter") or [])
+        return _plane(client).count(_resolved_target(args), filter=_filter_with_base(args))
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -1187,7 +1206,7 @@ def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, 
     try:
         return _plane(client).aggregate(
             _resolved_target(args),
-            filter=args.get("filter") or [],
+            filter=_filter_with_base(args),
             group_by=args["group_by"],
             metrics=tuple(args.get("metrics") or ("count",)),
         )
@@ -1199,7 +1218,7 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
     try:
         handle = _plane(client).export(
             _resolved_target(args),
-            filter=args.get("filter") or [],
+            filter=_filter_with_base(args),
             fields=args.get("fields"),
             tenant=str(args.get("tenant") or "default"),
             now=datetime.now(UTC),
@@ -1239,9 +1258,9 @@ class _OdooBindings:
         if not about:
             return about
         if about in RESOURCES:  # the canonical business resource name (Product, Customer, …)
-            return RESOURCES[about]
+            return native_model(about)
         low = about.strip().lower()
-        for resource, native in RESOURCES.items():
+        for resource, (native, _base_domain) in RESOURCES.items():
             if low in (resource.lower(), native.lower()):
                 return native
         return about  # unknown/native model → pass through; the engine owns the refusal
@@ -1311,24 +1330,59 @@ WRITE_VERBS = {**_packs_mod.all_write_verbs()}
 QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 
 
-# The business RESOURCES Odoo can be the system of record for, and the native model it spells each as
-# (Wave A). Odoo already serves the universal read plane, so every resource here is readable; the ones
-# with write verbs are fully ownable.
+# The business RESOURCES Odoo can be the system of record for: the native model it spells each as, and
+# a FIXED base domain that scopes reads when two resources share one model (Wave A + D37). Odoo already
+# serves the universal read plane, so every resource here is readable; the ones with write verbs are
+# fully ownable.
 #
-# Deliberately NOT declared: `PurchaseInvoice` and `Supplier`. Odoo spells a purchase invoice as
-# `account.move` — the SAME model as a customer invoice — and a supplier as `res.partner`, the same
-# model as a customer. Those are not two resources to Odoo; they are one model wearing two hats. If we
-# declared them, a native target would denote two different resources and routing would have to guess
-# which one a call meant. It would guess wrong eventually, silently, and in the ledger. So Odoo simply
-# does not claim to be the system of record for things it cannot tell apart.
-RESOURCES: dict[str, str] = {
-    "Customer": "res.partner",
-    "Lead": "crm.lead",
-    "Invoice": "account.move",
-    "Payment": "account.payment",
-    "Product": "product.product",
-    "PurchaseOrder": "purchase.order",
+# `PurchaseInvoice` is still NOT declared: Odoo spells it `account.move`, the SAME model as a customer
+# invoice, and (unlike Customer/Supplier) there is no field on `account.move` that cleanly partitions
+# "a purchase invoice" from "a customer invoice" the way `supplier_rank`/`customer_rank` partition
+# `res.partner` — `move_type` does, but declaring it here would need the same base-domain treatment as
+# Supplier below, and nothing has asked for a governed PurchaseInvoice read yet. Left undeclared on
+# purpose, not by oversight: an undeclared resource still passes through as a native target
+# (`account.move`) unfiltered, so nothing is lost — it just isn't offered as its own business name.
+#
+# `Supplier` WAS the second half of "one model, two hats" — Odoo spells both a customer and a supplier
+# as `res.partner`, so a bare native target could not tell them apart, and declaring both without a
+# disambiguator would make routing guess. The fix is not to guess: `res.partner` carries
+# `customer_rank`/`supplier_rank` counters Odoo itself uses to mean exactly this distinction, so each
+# resource declares the counter as its base domain. A `Supplier` read can only ever see partners with
+# `supplier_rank > 0`; a `Customer` read keeps `supplier_rank`'s twin, `customer_rank > 0`. Two
+# resources, two domains, one model — resolved by declaration, never by inference at read time.
+RESOURCES: dict[str, tuple[str, list[tuple[str, str, Any]]]] = {
+    "Customer": ("res.partner", [("customer_rank", ">", 0)]),
+    "Supplier": ("res.partner", [("supplier_rank", ">", 0)]),
+    "Lead": ("crm.lead", []),
+    "Invoice": ("account.move", []),
+    "Payment": ("account.payment", []),
+    "Product": ("product.product", []),
+    "PurchaseOrder": ("purchase.order", []),
 }
+
+
+def native_model(resource: str) -> str:
+    """The native Odoo model for a declared business resource name; the value unchanged for anything
+    else (a native model name, or an unknown noun the engine will refuse on its own)."""
+    entry = RESOURCES.get(resource)
+    return entry[0] if entry else resource
+
+
+def base_filter_for(resource: str) -> list[tuple[str, str, Any]]:
+    """The fixed Odoo-domain triples that disambiguate a resource sharing its model with another
+    (`Supplier`/`Customer` both on `res.partner`). Empty for a resource with no ambiguity to resolve,
+    and for anything not declared in RESOURCES at all — a native model name keeps today's unfiltered
+    behaviour."""
+    entry = RESOURCES.get(resource)
+    return list(entry[1]) if entry else []
+
+
+def describe() -> dict[str, Any]:
+    """A translate-local mirror of the wire `/nil/v0.1/describe`'s `resources` field (business name →
+    native model), for tests that want the declared resource vocabulary without spinning up the edge.
+    `edge.describe()` reads `RESOURCES` directly and carries the full (model, base_filter) pair; this
+    projects it down to the name→model shape the wire contract has always advertised."""
+    return {"resources": {name: native for name, (native, _base_domain) in RESOURCES.items()}}
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:

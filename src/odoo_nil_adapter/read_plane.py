@@ -160,14 +160,25 @@ class OdooReadBackend:
         model the instance provisions is discovered live from `fields_get` and given a derived lean
         projection — so reads cover every Odoo module, not just CRM. A model the instance does not
         expose (empty/None schema) returns None → a clean refusal upstream, never a guess. A model
-        outside the operator's enabled module scope is undiscoverable too (Phase 5)."""
-        from odoo_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
+        outside the operator's enabled module scope is undiscoverable too (Phase 5).
 
-        if not governance.module_enabled(target):
+        `target` may still be a declared BUSINESS name (`Supplier`, `Customer`) rather than the native
+        model — every current caller resolves it via `translate.native_model` before it gets this far
+        (D37), but this method must not silently depend on that staying true forever, so it resolves
+        again here (a no-op when `target` is already native)."""
+        from odoo_nil_adapter import governance  # lazy: translate↔read_plane would cycle at import
+        from odoo_nil_adapter.translate import native_model  # lazy: same cycle guard
+
+        native = native_model(target)
+        if not governance.module_enabled(native):
             return None
+        # A curated projection can be declared under the business name (`Supplier`) or the native model
+        # (`res.partner`, shared by Customer) — try the exact name first, then the resolved model.
         fields = _TARGET_FIELDS.get(target)
         if fields is None:
-            field_meta = self._client.schema(target)
+            fields = _TARGET_FIELDS.get(native)
+        if fields is None:
+            field_meta = self._client.schema(native)
             if not field_meta:  # not provisioned / not accessible → undiscoverable
                 return None
             fields = _derive_projection(field_meta)
@@ -180,7 +191,7 @@ class OdooReadBackend:
             # that exposes no metadata). `id` is always kept. A field absent here is dropped, never
             # requested — a lean read that survives every instance, instead of a curated list that
             # assumes one.
-            field_meta = self._client.schema(target)
+            field_meta = self._client.schema(native)
             if field_meta:
                 available = {f.get("name") for f in field_meta}
                 pruned = tuple(f for f in fields if f == "id" or f in available)
@@ -188,7 +199,7 @@ class OdooReadBackend:
         specs = tuple(
             FieldSpec(
                 name=f, type="str", is_key=(f == "id"),
-                sensitivity="sensitive" if _is_sensitive(target, f) else "normal",
+                sensitivity="sensitive" if _is_sensitive(native, f) else "normal",
             )
             for f in fields
         )
