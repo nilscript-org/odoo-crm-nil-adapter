@@ -1140,10 +1140,19 @@ def _grant(args: dict[str, Any]) -> tuple[str, ...]:
     return tuple(reveal) if reveal else ()
 
 
+# D37 (Task 1.1): every nil.* read verb used to hand `args["target"]` straight to the plane — a
+# business name (`Customer`) the backend has no table for → CAPABILITY_UNSUPPORTED, even though
+# `nil.intent` (below) already resolved the identical name correctly. `_resolved_target` makes the
+# SAME call `nil.intent` makes (`_OdooBindings().resolve_target`) the FIRST thing every read verb does,
+# so a business name resolves before it ever reaches the plane — never after.
+def _resolved_target(args: dict[str, Any]) -> str:
+    return _OdooBindings().resolve_target(args.get("target", ""))
+
+
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).search(
-            args["target"],
+            _resolved_target(args),
             filter=args.get("filter") or [],
             fields=args.get("fields"),
             limit=int(args.get("limit") or 50),
@@ -1156,7 +1165,7 @@ def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
 
 def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _plane(client).count(args["target"], filter=args.get("filter") or [])
+        return _plane(client).count(_resolved_target(args), filter=args.get("filter") or [])
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -1164,7 +1173,7 @@ def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         rec = _plane(client).get(
-            args["target"],
+            _resolved_target(args),
             record_id=args.get("id"),
             fields=args.get("fields"),
             grant_fields=_grant(args),
@@ -1177,7 +1186,7 @@ def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
 def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).aggregate(
-            args["target"],
+            _resolved_target(args),
             filter=args.get("filter") or [],
             group_by=args["group_by"],
             metrics=tuple(args.get("metrics") or ("count",)),
@@ -1189,7 +1198,7 @@ def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, 
 def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         handle = _plane(client).export(
-            args["target"],
+            _resolved_target(args),
             filter=args.get("filter") or [],
             fields=args.get("fields"),
             tenant=str(args.get("tenant") or "default"),
