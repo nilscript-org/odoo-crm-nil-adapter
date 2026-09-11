@@ -1721,6 +1721,12 @@ RESOURCES: dict[str, str] = {
 # resource absent here (or present with `[]`) is read unfiltered — including every resource that was
 # already declared before this task. Kept OUT of `RESOURCES` itself so the wire `describe()` field
 # never changes value type (see the comment above `RESOURCES`).
+#
+# I5 (final review, ACCEPTED as-is): a caller that names the NATIVE model directly (`res.partner`,
+# never a resource in this map) reads BOTH Customer and Supplier unfiltered — deliberately, not an
+# oversight. Bypassing the business vocabulary to address Odoo's own table name is the caller's own
+# choice, made with full knowledge of what that table holds; the resource base domains above exist to
+# disambiguate the BUSINESS NAMES, not to retroactively police a caller who chose not to use one.
 RESOURCE_DOMAINS: dict[str, list[tuple[str, str, Any]]] = {
     "Customer": [("customer_rank", ">", 0)],
     "Supplier": [("supplier_rank", ">", 0)],
