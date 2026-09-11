@@ -233,8 +233,14 @@
       ],
       "hidden_requirements": [],
       "dedup_keys": [
-        "email",
-        "name"
+        [
+          "email",
+          "supplier_rank"
+        ],
+        [
+          "name",
+          "supplier_rank"
+        ]
       ],
       "compensation": {
         "verb": "crm.delete_contact",

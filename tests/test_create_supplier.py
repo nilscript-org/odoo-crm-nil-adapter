@@ -149,6 +149,77 @@ def test_a_email_given_but_matches_nothing_never_falls_through_to_a_same_named_s
     assert emails == {"riyadh@gulftrading.example", "jeddah@gulftrading.example"}
 
 
+# ── I4 (final review): the dedup probe must be SCOPED by the Supplier base domain (supplier_rank>0) —
+# an existing CUSTOMER-ONLY partner sharing the given email/name must never be the convergence target,
+# or the verb silently renames/re-flags a customer's own record while its signed card still reads
+# "Create supplier «X»".
+def test_d_a_customer_only_partner_sharing_the_email_is_never_the_dedup_match(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    client = _client(fake_client)
+    _commit(client, "crm.create_contact", {"name": "Ali Person", "email": "shared@x.example"})
+
+    created = _commit(
+        client, "procurement.create_supplier",
+        {"name": "Totally Different Vendor Co", "email": "shared@x.example"},
+    )
+
+    assert created["state"] == "executed"
+    assert fake_client.created["res.partner"] == 2  # a NEW record — the customer was never touched
+    rows = fake_client.docs["res.partner"]
+    customer_row = next(r for r in rows if r["name"] == "Ali Person")
+    assert customer_row["name"] == "Ali Person"  # untouched: never renamed
+    assert not customer_row.get("is_company")  # never re-flagged
+    assert customer_row.get("supplier_rank", 0) == 0  # still not a supplier
+    supplier_row = next(r for r in rows if r["name"] == "Totally Different Vendor Co")
+    assert supplier_row["supplier_rank"] == 1
+    assert supplier_row["email"] == "shared@x.example"
+
+
+def test_d_a_customer_only_partner_sharing_the_name_is_never_the_dedup_match(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    """Same finding, the name-only fallback branch (no email given to `create_supplier`). The seeded
+    contact still needs ITS OWN dedup key (crm.create_contact upserts on email/phone) — an unrelated
+    email is enough; what matters is that create_supplier's OWN call carries no email at all, so it
+    probes by name alone."""
+    client = _client(fake_client)
+    _commit(client, "crm.create_contact", {"name": "Shared Display Name", "email": "ali@x.example"})
+
+    created = _commit(client, "procurement.create_supplier", {"name": "Shared Display Name"})
+
+    assert created["state"] == "executed"
+    assert fake_client.created["res.partner"] == 2
+    rows = fake_client.docs["res.partner"]
+    supplier_rows = [r for r in rows if r.get("supplier_rank") == 1]
+    assert len(supplier_rows) == 1
+
+
+def test_e_an_existing_supplier_sharing_the_email_still_converges(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    """I4 narrows the dedup match — it does not disable convergence. An existing SUPPLIER (created by
+    this same verb) sharing the email is still the correct convergence target.
+
+    `name` is held IDENTICAL across both calls on purpose (same caveat as
+    `test_b_email_given_and_matches_an_existing_supplier_converges_no_second_create` above):
+    `FakeSystem` has no separate numeric id, so varying the name would shift what `entity.id` reads
+    back as — a fake-harness artifact, not a dedup question."""
+    client = _client(fake_client)
+    first = _commit(
+        client, "procurement.create_supplier", {"name": "Existing Vendor", "email": "vendor@x.example"},
+    )
+    second = _commit(
+        client, "procurement.create_supplier",
+        {"name": "Existing Vendor", "email": "vendor@x.example", "phone": "0500000000"},
+    )
+
+    assert first["state"] == "executed" and second["state"] == "executed"
+    assert first["result"]["entity"]["id"] == second["result"]["entity"]["id"]
+    assert fake_client.created["res.partner"] == 1
+    assert fake_client.docs["res.partner"][0]["phone"] == "0500000000"
+
+
 # ── compensation: REVERSIBLE, reusing crm.delete_contact (same res.partner, same reversal) ────────
 def test_compensation_is_reversible_via_delete_contact() -> None:
     spec = compensation.COMPENSATIONS["procurement.create_supplier"]

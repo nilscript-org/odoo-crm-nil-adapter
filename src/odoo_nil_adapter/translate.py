@@ -1246,8 +1246,24 @@ def _to_native_create_supplier(args: dict[str, Any]) -> dict[str, Any]:
 # the same call. `dedup_probe` (translate.py's `WriteVerb`, `edge.py`'s `dedup_probe_keys`) expresses
 # that as a pure per-call narrowing so `edge.py` stays vendor-neutral: it only ever calls this
 # function, it never itself knows that "email" or "name" are the fields in play.
-def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[str, ...]:
-    return ("email",) if args.get("email") else ("name",)
+#
+# I4 (final review): the probe used to search `res.partner` UNSCOPED by rank, so a genuinely new
+# supplier's email could converge onto an existing CUSTOMER-ONLY partner and silently rename it while
+# the signed preview still read "Create supplier «X»". Ruling: scope EVERY probed entry by the SAME
+# base domain the read side already enforces for `Supplier` (`RESOURCE_DOMAINS["Supplier"]`,
+# `supplier_rank > 0`) — a customer-only partner (no `supplier_rank`, or `0`) is never a match, so the
+# create proceeds and mints its own record; Odoo's own uniqueness (if any) answers from there. Each
+# entry becomes a COMPOUND (AND-probed) key — `(<identity field>, "supplier_rank")` — the exact
+# mechanism `procurement.link_supplier` already generalized in edge.py's op=upsert dispatch.
+# `_to_native_create_supplier` stamps `supplier_rank: 1` UNCONDITIONALLY (never from caller input), so
+# the equality check is satisfied by every record this verb itself ever creates or updates.
+#
+# A person who wants to promote an existing CUSTOMER to a supplier does so explicitly (e.g. a future
+# verb, or a direct `resource.update`) — this verb's dedup is deliberately narrow, not a general
+# partner-merge tool.
+def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    identity = "email" if args.get("email") else "name"
+    return ((identity, "supplier_rank"),)
 
 
 PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
@@ -1265,7 +1281,8 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
     recovery_note=(
         "upserts on email when given, name ONLY when it is not (dedup_probe narrows the call to "
         "exactly one of the two — never both — so an unrelated supplier sharing a display name can "
-        "never merge just because a fresh email was also given; fix round 1, D-concern-1)"
+        "never merge just because a fresh email was also given; fix round 1, D-concern-1), and EACH "
+        "probe is scoped by supplier_rank>0 so a customer-only partner is never the match (I4)"
     ),
     tier="MEDIUM",
     doctype="res.partner",
@@ -1280,9 +1297,10 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
     },
     entity_type="supplier",
     # The declared possible keys (documentation, describe/manifest, and the C3.5 fallback when no
-    # `dedup_probe` narrowing is available) — unchanged. Runtime probing goes through `dedup_probe`
-    # below, which always selects exactly ONE of these two for a given call.
-    dedup_keys=("email", "name"),
+    # `dedup_probe` narrowing is available) — unchanged in SHAPE (compound AND-groups, I4): the actual
+    # per-call narrowing always goes through `dedup_probe` below, which selects exactly one of these
+    # two groups for a given call.
+    dedup_keys=(("email", "supplier_rank"), ("name", "supplier_rank")),
     dedup_probe=_dedup_probe_create_supplier,
 )
 
