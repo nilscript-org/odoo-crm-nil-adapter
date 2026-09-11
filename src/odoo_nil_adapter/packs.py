@@ -86,12 +86,14 @@ def _make_crm_pack() -> ModulePack:
             CRM_GET_CONTACT,
         ),
         projections={
-            # `vat` is included so `Supplier` (D37: res.partner, base domain supplier_rank > 0) reads
-            # its tax id by default — Odoo's own disambiguator between a customer and a supplier record
-            # is `supplier_rank`/`customer_rank`, but a human confirming a SUPPLIER wants their VAT/tax
-            # number on the card. It is already declared `sensitive` below, so it is redacted unless the
-            # caller `reveal`s it — adding it to the projection changes what is OFFERED, not what leaks.
-            "res.partner": ("id", "name", "phone", "email", "vat"),
+            # Fix round 1, I1: `vat` must NOT land on Customer's shared `res.partner` projection —
+            # that leaked a field nobody asked for onto every plain Customer read. `Supplier` gets its
+            # OWN entry (keyed by the business name, not the native model) instead, so the two
+            # resources sharing `res.partner` can carry different default fields. `vat` is already
+            # declared `sensitive` below (and independently caught by read_plane's generic "vat"
+            # fragment match), so it is redacted unless the caller `reveal`s it either way.
+            "res.partner": ("id", "name", "phone", "email"),
+            "Supplier": ("id", "name", "email", "phone", "vat"),
             "crm.lead": (
                 "id",
                 "name",

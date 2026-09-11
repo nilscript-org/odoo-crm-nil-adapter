@@ -1189,15 +1189,42 @@ def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]
         return _refusal(exc)
 
 
+def _id_satisfies_domain(plane: Any, resource: str, native: str, record_id: Any) -> bool:
+    """Whether `record_id` on `native` satisfies `resource`'s fixed base domain (fix round 1, C2/C1) —
+    checked via a SCOPED EXISTENCE COUNT rather than inspecting a fetched record's fields, because the
+    domain's own field (`supplier_rank`) is not part of the resource's curated read projection and a
+    projected `get()` result would not carry it at all. No domain declared (or no id given) is
+    vacuously true — a native model name keeps today's unfiltered behaviour."""
+    base = base_filter_for(resource)
+    if not base or record_id is None:
+        return True
+    base_preds = [
+        {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value} for field, op, value in base
+    ]
+    try:
+        result = plane.count(native, filter=[*base_preds, {"field": "id", "op": "eq", "value": record_id}])
+    except _READ_REFUSALS:
+        return True  # let the caller's own read surface/report the refusal itself, never mask it here
+    return bool(result.get("count", 0))
+
+
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
+        resource = args.get("target", "")
+        native = _resolved_target(args)
+        record_id = args.get("id")
+        # Fix round 1, C2: `ReadPlane.get()` takes no `filter` — resolving the target alone (Task 1.1)
+        # let a `Supplier` fetch return ANY partner, including a pure customer. A record outside the
+        # resource's base domain answers the SAME shape a missing id answers — never the record itself.
+        if not _id_satisfies_domain(_plane(client), resource, native, record_id):
+            return {"found": False, "id": record_id}
         rec = _plane(client).get(
-            _resolved_target(args),
-            record_id=args.get("id"),
+            native,
+            record_id=record_id,
             fields=args.get("fields"),
             grant_fields=_grant(args),
         )
-        return rec if rec is not None else {"found": False, "id": args.get("id")}
+        return rec if rec is not None else {"found": False, "id": record_id}
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -1236,9 +1263,6 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         return _refusal(exc)
 
 
-_RESOLVERS: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
-
-
 class _OdooBindings:
     """Ontology → Odoo vocabulary. The agent asks about a `Product`; Odoo stores `product.product`.
 
@@ -1258,9 +1282,9 @@ class _OdooBindings:
         if not about:
             return about
         if about in RESOURCES:  # the canonical business resource name (Product, Customer, …)
-            return native_model(about)
+            return RESOURCES[about]
         low = about.strip().lower()
-        for resource, (native, _base_domain) in RESOURCES.items():
+        for resource, native in RESOURCES.items():
             if low in (resource.lower(), native.lower()):
                 return native
         return about  # unknown/native model → pass through; the engine owns the refusal
@@ -1269,23 +1293,78 @@ class _OdooBindings:
         return attr
 
 
-def _resolver(client: SystemClient) -> Any:
-    r = _RESOLVERS.get(client)
-    if r is None:
-        r = IntentResolver(_plane(client), _OdooBindings())
-        _RESOLVERS[client] = r
-    return r
+class _ScopedPlane:
+    """Fix round 1, C1: `nil.intent` bypassed Supplier/Customer scoping entirely, because
+    `IntentResolver.resolve()` (third-party, out of adapter scope — `nilscript/dataplane/intent.py`)
+    calls `self._bind.resolve_target(intent.about)` and hands the plane only the RESOLVED model
+    string; the `BindingResolver` protocol has no hook to also carry a base domain. This wraps the
+    real `ReadPlane` and, for every search/count/aggregate/export call whose `target` is the
+    resource's native model, prepends `base_filter_for(resource)` — the exact thing `_filter_with_base`
+    does for the direct `nil.search`/`nil.count`/... verbs (Task 1.1/1.2), just applied one layer up
+    since this call site cannot touch the caller's filter before the resolver builds it. `get` is not
+    filterable at all (same reason as `_run_nil_get`, C2), so it enforces the domain by REFUSING
+    (returning `None`, the plane's own not-found shape) instead."""
+
+    def __init__(self, plane: Any, resource: str, native: str) -> None:
+        self._plane = plane
+        self._resource = resource
+        self._native = native
+
+    def _scoped_filter(self, target: str, filt: Any) -> Any:
+        if target != self._native:  # an unrelated/native target passed straight through — unfiltered
+            return filt
+        base = [
+            {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value}
+            for field, op, value in base_filter_for(self._resource)
+        ]
+        return [*base, *(filt or [])]
+
+    def search(self, target, *, filter, fields, limit, cursor=None, grant_fields=None):  # noqa: A002
+        return self._plane.search(
+            target, filter=self._scoped_filter(target, filter), fields=fields, limit=limit,
+            cursor=cursor, grant_fields=grant_fields,
+        )
+
+    def count(self, target, *, filter):  # noqa: A002
+        return self._plane.count(target, filter=self._scoped_filter(target, filter))
+
+    def aggregate(self, target, *, filter, group_by, metrics):  # noqa: A002
+        return self._plane.aggregate(
+            target, filter=self._scoped_filter(target, filter), group_by=group_by, metrics=metrics
+        )
+
+    def export(self, target, *, filter, fields, tenant, now, approved=False, grant_fields=None):  # noqa: A002
+        return self._plane.export(
+            target, filter=self._scoped_filter(target, filter), fields=fields, tenant=tenant, now=now,
+            approved=approved, grant_fields=grant_fields,
+        )
+
+    def get(self, target, *, record_id, fields, grant_fields=None):
+        if target == self._native and not _id_satisfies_domain(
+            self._plane, self._resource, self._native, record_id
+        ):
+            return None
+        return self._plane.get(target, record_id=record_id, fields=fields, grant_fields=grant_fields)
 
 
 def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     """The single intent payload: build an Intent and resolve it deterministically over the ReadPlane.
-    The caller selects no verb and builds no filter — the system owns the mechanics."""
+    The caller selects no verb and builds no filter — the system owns the mechanics.
+
+    Fix round 1, C1: a fresh `IntentResolver` is built per call (no longer cached per client) over a
+    `_ScopedPlane` derived from THIS call's `about` — the resource can differ every call, so a single
+    cached resolver could not carry a fixed scope. `resource`/`native` are computed with the SAME
+    `_OdooBindings().resolve_target` the resolver itself calls internally on `intent.about`, so the
+    proxy's notion of "the resolved model" always matches what `IntentResolver` actually passes it."""
     where = tuple(
         Binding(attr=b.get("attr"), rel=b.get("rel"), value=b.get("value"))
         for b in (args.get("where") or [])
     )
+    resource = args.get("about", "")
+    native = _OdooBindings().resolve_target(resource)
+    plane = _ScopedPlane(_plane(client), resource, native)
     intent = Intent(
-        about=args.get("about", ""),
+        about=resource,
         where=where,
         seek=args.get("seek", "all"),
         by=args.get("by"),
@@ -1293,7 +1372,7 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         cursor=args.get("cursor"),
     )
     try:
-        outcome = _resolver(client).resolve(intent)
+        outcome = IntentResolver(plane, _OdooBindings()).resolve(intent)
     except (
         SystemError
     ) as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
@@ -1330,10 +1409,18 @@ WRITE_VERBS = {**_packs_mod.all_write_verbs()}
 QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 
 
-# The business RESOURCES Odoo can be the system of record for: the native model it spells each as, and
-# a FIXED base domain that scopes reads when two resources share one model (Wave A + D37). Odoo already
-# serves the universal read plane, so every resource here is readable; the ones with write verbs are
-# fully ownable.
+# The business RESOURCES Odoo can be the system of record for, and the native model it spells each as
+# (Wave A). Odoo already serves the universal read plane, so every resource here is readable; the ones
+# with write verbs are fully ownable.
+#
+# FIX (review C3, fix round 1): `RESOURCES` stays `dict[str, str]` — the exact shape it has always
+# had — because `edge.py:1236` puts it on the wire VERBATIM as `describe()["resources"]`, and
+# `nilscript-controlplane`'s `resource_authority.py` (`build_target_index`, `adapter_resources`)
+# already parses that field as a plain model-name string for every resource this adapter declares
+# (Customer, Lead, Invoice, Payment, Product, PurchaseOrder). Changing the VALUE type there — even to
+# add one new resource — is a breaking change to a live cross-repo handshake, not an adapter-local
+# decision. The base domain that disambiguates `Supplier`/`Customer` lives in the SEPARATE
+# `RESOURCE_DOMAINS` map below instead, which nothing outside this adapter reads.
 #
 # `PurchaseInvoice` is still NOT declared: Odoo spells it `account.move`, the SAME model as a customer
 # invoice, and (unlike Customer/Supplier) there is no field on `account.move` that cleanly partitions
@@ -1347,42 +1434,48 @@ QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 # as `res.partner`, so a bare native target could not tell them apart, and declaring both without a
 # disambiguator would make routing guess. The fix is not to guess: `res.partner` carries
 # `customer_rank`/`supplier_rank` counters Odoo itself uses to mean exactly this distinction, so each
-# resource declares the counter as its base domain. A `Supplier` read can only ever see partners with
-# `supplier_rank > 0`; a `Customer` read keeps `supplier_rank`'s twin, `customer_rank > 0`. Two
-# resources, two domains, one model — resolved by declaration, never by inference at read time.
-RESOURCES: dict[str, tuple[str, list[tuple[str, str, Any]]]] = {
-    "Customer": ("res.partner", [("customer_rank", ">", 0)]),
-    "Supplier": ("res.partner", [("supplier_rank", ">", 0)]),
-    "Lead": ("crm.lead", []),
-    "Invoice": ("account.move", []),
-    "Payment": ("account.payment", []),
-    "Product": ("product.product", []),
-    "PurchaseOrder": ("purchase.order", []),
+# resource declares the counter as its base domain (in `RESOURCE_DOMAINS`, not here). A `Supplier`
+# read can only ever see partners with `supplier_rank > 0`; a `Customer` read keeps `supplier_rank`'s
+# twin, `customer_rank > 0`. Two resources, two domains, one model — resolved by declaration, never by
+# inference at read time.
+RESOURCES: dict[str, str] = {
+    "Customer": "res.partner",
+    "Supplier": "res.partner",
+    "Lead": "crm.lead",
+    "Invoice": "account.move",
+    "Payment": "account.payment",
+    "Product": "product.product",
+    "PurchaseOrder": "purchase.order",
+}
+
+# The fixed base domain (Odoo triples) that scopes a resource sharing its model with another. A
+# resource absent here (or present with `[]`) is read unfiltered — including every resource that was
+# already declared before this task. Kept OUT of `RESOURCES` itself so the wire `describe()` field
+# never changes value type (see the comment above `RESOURCES`).
+RESOURCE_DOMAINS: dict[str, list[tuple[str, str, Any]]] = {
+    "Customer": [("customer_rank", ">", 0)],
+    "Supplier": [("supplier_rank", ">", 0)],
 }
 
 
 def native_model(resource: str) -> str:
     """The native Odoo model for a declared business resource name; the value unchanged for anything
     else (a native model name, or an unknown noun the engine will refuse on its own)."""
-    entry = RESOURCES.get(resource)
-    return entry[0] if entry else resource
+    return RESOURCES.get(resource, resource)
 
 
 def base_filter_for(resource: str) -> list[tuple[str, str, Any]]:
     """The fixed Odoo-domain triples that disambiguate a resource sharing its model with another
     (`Supplier`/`Customer` both on `res.partner`). Empty for a resource with no ambiguity to resolve,
-    and for anything not declared in RESOURCES at all — a native model name keeps today's unfiltered
-    behaviour."""
-    entry = RESOURCES.get(resource)
-    return list(entry[1]) if entry else []
+    and for anything not declared at all — a native model name keeps today's unfiltered behaviour."""
+    return list(RESOURCE_DOMAINS.get(resource, []))
 
 
 def describe() -> dict[str, Any]:
     """A translate-local mirror of the wire `/nil/v0.1/describe`'s `resources` field (business name →
-    native model), for tests that want the declared resource vocabulary without spinning up the edge.
-    `edge.describe()` reads `RESOURCES` directly and carries the full (model, base_filter) pair; this
-    projects it down to the name→model shape the wire contract has always advertised."""
-    return {"resources": {name: native for name, (native, _base_domain) in RESOURCES.items()}}
+    native model — a plain string, exactly what `edge.describe()` has always put on the wire), for
+    tests that want the declared resource vocabulary without spinning up the edge."""
+    return {"resources": dict(RESOURCES)}
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:
