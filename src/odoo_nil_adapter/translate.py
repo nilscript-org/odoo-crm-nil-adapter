@@ -48,7 +48,11 @@ class WriteVerb:
     entity_type: str
     # for op="upsert": native fields probed (in order) to find an existing record before writing —
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
-    dedup_keys: tuple[str, ...] = ()
+    # Each entry is either a single field name (OR semantics: that ONE field's value alone
+    # identifies the record) or a `tuple[str, ...]` — a COMPOUND key, probed as one AND-of-equalities
+    # domain (edge.py's op=upsert dispatch, generalized fix round 1) — for an identity no single
+    # field can carry on its own (e.g. a link keyed on (parent_id, child_id)).
+    dedup_keys: tuple[str | tuple[str, ...], ...] = ()
     method: str | None = (
         None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
     )
@@ -1085,6 +1089,106 @@ PURCHASE_CONFIRM_ORDER = WriteVerb(
     entity_type="purchase_order",
 )
 
+# ── procurement.link_supplier / unlink_supplier (Task 1.3, D37/D38/O3 — fix round 1) ──────────────
+# Coordinator ruling (fix round 1): a write not on the governed wire does not exist for this
+# platform. The earlier `translate.run()` direct-execution surface is GONE — these are now real
+# `WriteVerb` entries in WRITE_VERBS, declared in `/nil/v0.1/describe`, committed through `edge.py`'s
+# ordinary PROPOSE→COMMIT exactly like every other curated verb.
+#
+# `to_native` is PURE (no I/O, per translate.py:1): the lookup this task originally needed
+# (`sku` → `product_tmpl_id`) moves to the CALLER. Args are `{product_ref, supplier_ref, price?,
+# min_qty?, delay_days?, sku?}` — `product_ref` is the product TEMPLATE's id in the record system,
+# `supplier_ref` the partner id (both strings the caller already resolved: the control plane / the
+# os-server hold both in the Odoo mirror, `sku_by_tmpl`/`sku_by_variant`). `sku` is a display-only
+# passthrough this verb never writes (it earns its slot in `supported_args` so it is never flagged
+# `ignored` at PROPOSE — carrying it is deliberate, not a mistake).
+def _to_native_link_supplier(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → the `product.supplierinfo` fields this verb writes. `sku`, if given, is display-only
+    and never lands here — see the module comment above."""
+    doc: dict[str, Any] = {}
+    if args.get("product_ref"):
+        doc["product_tmpl_id"] = _maybe_int(args["product_ref"])
+    if args.get("supplier_ref"):
+        doc["partner_id"] = _maybe_int(args["supplier_ref"])
+    if args.get("price") is not None:
+        doc["price"] = _maybe_float(args["price"])
+    if args.get("min_qty") is not None:
+        doc["min_qty"] = _maybe_float(args["min_qty"])
+    if args.get("delay_days") is not None:
+        doc["delay"] = _maybe_float(args["delay_days"])
+    return doc
+
+
+PROCUREMENT_LINK_SUPPLIER = WriteVerb(
+    verb="procurement.link_supplier",
+    recovery_shape="convergent",
+    recovery_note=(
+        "upserts on the REQUIRED compound pair (product_tmpl_id, partner_id) — edge.py's op=upsert "
+        "dedup now probes tuple entries as an AND-group (fix round 1), so a retry converges on the "
+        "existing link instead of minting a second one"
+    ),
+    tier="MEDIUM",
+    doctype="product.supplierinfo",
+    op="upsert",
+    required=("product_ref", "supplier_ref"),
+    to_native=_to_native_link_supplier,
+    preview=lambda a: {
+        "en": f"Link supplier {a.get('supplier_ref', '')} to product "
+        f"{a.get('sku') or a.get('product_ref', '')}"
+        + (f" at {a['price']}" if a.get("price") is not None else ""),
+        "ar": f"ربط المورد {a.get('supplier_ref', '')} بالمنتج "
+        f"{a.get('sku') or a.get('product_ref', '')}"
+        + (f" بسعر {a['price']}" if a.get("price") is not None else ""),
+    },
+    entity_type="product_supplier_link",
+    # A compound (AND-probed) key — see the generalized `dedup_keys` handling in edge.py's op=upsert
+    # dispatch. Every OTHER dedup_keys entry in this file stays a single field name (OR semantics,
+    # unchanged); this is the one compound entry.
+    dedup_keys=(("product_tmpl_id", "partner_id"),),
+    supported_args=("product_ref", "supplier_ref", "price", "min_qty", "delay_days", "sku"),
+)
+
+# `procurement.unlink_supplier` identifies the record by ITS OWN id (`link_ref`), obtained by the
+# caller from a prior `nil.search`/`nil.get` on the `ProductSupplier` resource (which already
+# exposes the raw `id`) — the SAME idiom every other curated delete verb in this file uses
+# (`crm.delete_lead`/`lead_id`, `crm.delete_contact`/`contact_id`, `purchase.delete_order`/
+# `order_id`). This is a deliberate choice, not an oversight: `edge.py`'s `op="delete"` dispatch
+# resolves its record via `_resolve_id(client, doctype, args[required[0]])`, which is a SINGLE-FIELD
+# lookup — using `product_ref` (a product TEMPLATE's id) or `supplier_ref` (a partner id) directly
+# there would risk an id COLLISION across unrelated models (Odoo ids are per-table sequences, so
+# `product.template` #7 and `product.supplierinfo` #7 can both exist as unrelated rows) — an
+# `op="delete"` call could target and remove the WRONG supplier-link. `link_ref` is the
+# `product.supplierinfo` record's own id: an exact match, safe by construction.
+PROCUREMENT_UNLINK_SUPPLIER = WriteVerb(
+    verb="procurement.unlink_supplier",
+    # IRREVERSIBLE, and this is a DEVIATION from the fix round 1 ruling ("unlink COMPENSABLE by
+    # re-create from the before-image") — see the concern filed in the Task 1.3 report for the full
+    # argument. Short version: `edge.py`'s curated `op="delete"` branch never reads the record before
+    # deleting it (unlike its `op="update"` branch, which captures a before-image via
+    # `_before_image_reversal`, and unlike the GENERIC `resource.delete` path, which already does
+    # `before = client.get(...)` for exactly this reason) — so NOTHING beyond the deleted record's own
+    # id survives into `compensate()`'s `result` for any curated delete, this one included. Declaring
+    # COMPENSABLE while `compensate()` cannot actually rebuild `product_ref`/`supplier_ref`/`price`/
+    # `min_qty`/`delay_days` from an id alone would be exactly the kind of governance-envelope lie
+    # this codebase's own history (M8's dual-PO saga, the C3 RESOURCES-shape fix) exists to prevent —
+    # a declared reversibility the platform cannot actually perform. The honest fix is one more line
+    # in edge.py's delete branch (capture `before = client.get(verb.doctype, record_id)` before the
+    # delete, mirroring the update branch exactly) — outside this round's ONE permitted edit.
+    recovery_shape="convergent",
+    recovery_note="deletes an existing link_ref, and the edge re-reads to confirm ABSENCE — a second unlink is a no-op",
+    tier="MEDIUM",
+    doctype="product.supplierinfo",
+    op="delete",
+    required=("link_ref",),
+    to_native=_to_native_delete,
+    preview=lambda a: {
+        "en": f"Unlink supplier from product-supplier link {a.get('link_ref', '')}",
+        "ar": f"إلغاء ربط المورد من سجل ربط المورد بالمنتج {a.get('link_ref', '')}",
+    },
+    entity_type="product_supplier_link",
+    supported_args=("link_ref",),
+)
+
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
 # These delegate to the shared `ReadPlane` (projection + byte-cap-refuse + capability fallback + read
 # authz + export/bulk gating). The edge dispatches them through QUERY_VERBS like any read verb; engine
@@ -1597,233 +1701,6 @@ def _project_product_supplier_items(
     if not _is_product_supplier(resource) or not isinstance(result, dict) or not result.get("items"):
         return result
     return {**result, "items": [_project_product_supplier_row(client, resource, r) for r in result["items"]]}
-
-
-# ── procurement.link_supplier / unlink_supplier / link_suppliers (Task 1.3, D37/D38/O3) ───────────
-# A DIRECT-EXECUTION surface (`run()`), not the generic op=create/update/delete/method/upsert spine
-# `edge.py` COMMIT drives from WRITE_VERBS. Two reasons, and either alone would be enough:
-#
-#   1. Convergence here is on the COMPOUND pair (product_tmpl_id, partner_id) — `edge.py`'s
-#      `op="upsert"` probes exactly ONE `dedup_keys` field's equality at a time (never an AND of
-#      two: `elif len(hits) == 1: match_id = ...; break` on the FIRST field that has a value), so it
-#      cannot express "convergent on this pair" without either a false-positive match on `partner_id`
-#      alone (any two links to the same supplier would collide) or a fabricated single-field key
-#      Odoo's `product.supplierinfo` does not have.
-#   2. `sku` needs a live search (`product.product.default_code` → `product_tmpl_id`) to become a
-#      writable id. `WriteVerb.to_native` is documented PURE — "no I/O" (translate.py:1) — and has no
-#      client to search with; every other verb in this adapter relies on that staying true.
-#
-# `edge.py` is scaffold-generated and out of this adapter's editable scope ("Do not edit —
-# regenerate with `nilscript scaffold-shim`"), so neither primitive can be bent to fit. `run()` is
-# this task's addressable surface: a future task can decide whether the op vocabulary itself should
-# grow a compound-upsert primitive. Because these verbs are not in WRITE_VERBS, their reversal lives
-# in `compensation.PRODUCT_SUPPLIER_COMPENSATIONS` — a separate table from `COMPENSATIONS`, whose
-# keyspace the conformance suite asserts is exactly the curated write-verb set `edge.py` commits
-# through (`test_every_declared_compensation_is_executable`, `test_manifest_declares_every_write_verb...`).
-def _write_refusal(code: str, message: str) -> dict[str, Any]:
-    """The adapter's existing refusal shape (translate.py's own `_refusal`, for a write path that has
-    no exception object to read a code/message off of)."""
-    return {"outcome": "refused", "code": code, "message": message}
-
-
-def _record_id(record: dict[str, Any]) -> str:
-    return str(record.get("id") or record.get("name") or "")
-
-
-def _resolve_product_supplier_pair(
-    client: SystemClient, sku: Any, supplier_id: Any
-) -> tuple[dict[str, Any], None] | tuple[None, dict[str, Any]]:
-    """Resolve+validate {sku, supplier_id} → the native identity to link, or a refusal. An unknown
-    sku, or a supplier_id that is not a `supplier_rank > 0` partner, refuses — never a partial write."""
-    sku_s = str(sku or "").strip()
-    if not sku_s:
-        return None, _write_refusal("INVALID_ARGS", "missing required arg: sku")
-    product_id, tmpl_id = _resolve_sku(client, sku_s)
-    if tmpl_id is None:
-        return None, _write_refusal("INVALID_ARGS", f"no product with sku {sku_s!r}")
-    sid_s = str(supplier_id or "").strip()
-    if not sid_s:
-        return None, _write_refusal("INVALID_ARGS", "missing required arg: supplier_id")
-    try:
-        sid_int = int(sid_s)
-    except ValueError:
-        return None, _write_refusal(
-            "INVALID_ARGS", f"supplier_id must be a numeric partner id, got {supplier_id!r}"
-        )
-    if not _id_satisfies_domain(_plane(client), "Supplier", native_model("Supplier"), sid_int):
-        return None, _write_refusal(
-            "INVALID_ARGS", f"no supplier (a partner with supplier_rank > 0) with id {sid_int}"
-        )
-    return {"sku": sku_s, "product_id": product_id, "product_tmpl_id": tmpl_id, "supplier_id": sid_int}, None
-
-
-def _link_supplier_native(pair: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
-    doc: dict[str, Any] = {"product_tmpl_id": pair["product_tmpl_id"], "partner_id": pair["supplier_id"]}
-    if pair.get("product_id") is not None:
-        doc["product_id"] = pair["product_id"]
-    if args.get("price") is not None:
-        doc["price"] = _maybe_float(args["price"])
-    if args.get("min_qty") is not None:
-        doc["min_qty"] = _maybe_float(args["min_qty"])
-    if args.get("delay_days") is not None:
-        doc["delay"] = _maybe_float(args["delay_days"])
-    return doc
-
-
-def _find_supplier_link(client: SystemClient, pair: dict[str, Any]) -> list[dict[str, Any]]:
-    return client.search(
-        _PRODUCT_SUPPLIER_MODEL,
-        [["product_tmpl_id", "=", pair["product_tmpl_id"]], ["partner_id", "=", pair["supplier_id"]]],
-        limit=2,
-    )
-
-
-def _create_or_get_supplier_link(
-    client: SystemClient, pair: dict[str, Any], args: dict[str, Any]
-) -> tuple[dict[str, Any], bool]:
-    """(record, created). Convergent on the pair (product_tmpl_id, partner_id): a second call with the
-    same pair returns the EXISTING record and creates nothing."""
-    existing = _find_supplier_link(client, pair)
-    if len(existing) > 1:
-        raise SystemError(
-            f"ambiguous: {len(existing)}+ {_PRODUCT_SUPPLIER_MODEL} rows already link "
-            f"product_tmpl_id={pair['product_tmpl_id']} to partner_id={pair['supplier_id']}"
-        )
-    if existing:
-        return existing[0], False
-    created = client.create(_PRODUCT_SUPPLIER_MODEL, _link_supplier_native(pair, args))
-    return created, True
-
-
-def _run_procurement_link_supplier(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
-    pair, refusal = _resolve_product_supplier_pair(client, args.get("sku"), args.get("supplier_id"))
-    if refusal is not None:
-        return refusal
-    try:
-        record, created = _create_or_get_supplier_link(client, pair, args)
-    except SystemError as exc:
-        return _write_refusal("UPSTREAM_ERROR", str(exc))
-    rid = _record_id(record)
-    return {
-        "id": rid,
-        "created": created,
-        "entity": {
-            "type": "product_supplier_link", "id": rid,
-            "sku": pair["sku"], "supplier_id": str(pair["supplier_id"]),
-        },
-    }
-
-
-def _run_procurement_unlink_supplier(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
-    pair, refusal = _resolve_product_supplier_pair(client, args.get("sku"), args.get("supplier_id"))
-    if refusal is not None:
-        return refusal
-    existing = _find_supplier_link(client, pair)
-    if not existing:  # already unlinked — convergent no-op, not an error
-        return {
-            "unlinked": False,
-            "entity": {
-                "type": "product_supplier_link",
-                "sku": pair["sku"], "supplier_id": str(pair["supplier_id"]),
-            },
-        }
-    if len(existing) > 1:
-        return _write_refusal(
-            "UPSTREAM_ERROR",
-            f"ambiguous: {len(existing)}+ {_PRODUCT_SUPPLIER_MODEL} rows link this pair",
-        )
-    record = existing[0]
-    rid = _record_id(record)
-    before_image = {
-        "sku": pair["sku"], "supplier_id": str(pair["supplier_id"]),
-        "price": record.get("price"), "min_qty": record.get("min_qty"),
-        "delay_days": record.get("delay"),
-    }
-    client.delete(_PRODUCT_SUPPLIER_MODEL, rid)
-    return {
-        "unlinked": True,
-        "entity": {
-            "type": "product_supplier_link", "id": rid,
-            "sku": pair["sku"], "supplier_id": str(pair["supplier_id"]),
-        },
-        "before_image": before_image,
-    }
-
-
-def _resolve_batch_pairs(
-    client: SystemClient, links: Any
-) -> tuple[list[dict[str, Any]], None] | tuple[None, dict[str, Any]]:
-    """Validate EVERY pair in a batch before any write is attempted — an unknown sku/supplier_id
-    anywhere in the batch refuses the WHOLE call, never a partial write (the batch exists precisely
-    because the engine forbids `foreach` over an adapter effect, so this must be one all-or-nothing
-    validation pass, not N independent ones)."""
-    if not isinstance(links, list) or not links:
-        return None, _write_refusal("INVALID_ARGS", "missing required arg: links")
-    pairs: list[dict[str, Any]] = []
-    for link in links:
-        if not isinstance(link, dict):
-            return None, _write_refusal("INVALID_ARGS", f"each link must be an object, got {link!r}")
-        pair, refusal = _resolve_product_supplier_pair(client, link.get("sku"), link.get("supplier_id"))
-        if refusal is not None:
-            return None, refusal
-        pairs.append({**pair, "_args": link})
-    return pairs, None
-
-
-def _run_procurement_link_suppliers(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
-    pairs, refusal = _resolve_batch_pairs(client, args.get("links"))
-    if refusal is not None:
-        return refusal
-    linked: list[str] = []
-    existing: list[str] = []
-    created_pairs: list[dict[str, str]] = []
-    for pair in pairs:
-        try:
-            record, created = _create_or_get_supplier_link(client, pair, pair["_args"])
-        except SystemError as exc:
-            return _write_refusal("UPSTREAM_ERROR", str(exc))
-        rid = _record_id(record)
-        (linked if created else existing).append(rid)
-        if created:
-            created_pairs.append({"sku": pair["sku"], "supplier_id": str(pair["supplier_id"])})
-    return {"linked": linked, "existing": existing, "created_pairs": created_pairs}
-
-
-def _run_procurement_unlink_suppliers(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
-    """The symmetric batch unlink — what `procurement.link_suppliers`' REVERSIBLE compensation
-    actually runs, so unwinding a batch create is also one call, never a `foreach`."""
-    pairs, refusal = _resolve_batch_pairs(client, args.get("links"))
-    if refusal is not None:
-        return refusal
-    unlinked: list[str] = []
-    for pair in pairs:
-        existing = _find_supplier_link(client, pair)
-        if len(existing) > 1:
-            return _write_refusal(
-                "UPSTREAM_ERROR", "ambiguous: multiple product.supplierinfo rows link a pair in this batch"
-            )
-        if existing:
-            rid = _record_id(existing[0])
-            client.delete(_PRODUCT_SUPPLIER_MODEL, rid)
-            unlinked.append(rid)
-    return {"unlinked": unlinked}
-
-
-_PROCUREMENT_LINK_VERBS: dict[str, Callable[[SystemClient, dict[str, Any]], dict[str, Any]]] = {
-    "procurement.link_supplier": _run_procurement_link_supplier,
-    "procurement.unlink_supplier": _run_procurement_unlink_supplier,
-    "procurement.link_suppliers": _run_procurement_link_suppliers,
-    "procurement.unlink_suppliers": _run_procurement_unlink_suppliers,
-}
-
-
-def run(verb_name: str, client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
-    """Direct execution for the product<->supplier link verbs (see the module comment above this
-    section for why they bypass the generic WRITE_VERBS/edge.py COMMIT spine)."""
-    handler = _PROCUREMENT_LINK_VERBS.get(verb_name)
-    if handler is None:
-        return _write_refusal("UNKNOWN_VERB", f"verb not supported by run(): {verb_name}")
-    return handler(client, dict(args or {}))
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:

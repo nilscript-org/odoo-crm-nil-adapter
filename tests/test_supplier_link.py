@@ -1,12 +1,14 @@
 """Task 1.3 (D37/D38/O3): the product<->supplier link is a resource Odoo reads and a verb Odoo
-writes. `procurement.link_supplier` / `unlink_supplier` / `link_suppliers` are a direct-execution
-surface (`translate.run`) — see that function's docstring in translate.py for why they bypass the
-generic WRITE_VERBS/edge.py COMMIT spine (compound-pair convergence + a live sku lookup, neither of
-which the closed-for-editing `edge.py` can express).
+writes. Fix round 1 (coordinator ruling): a write not on the governed wire does not exist for this
+platform — `procurement.link_supplier` / `procurement.unlink_supplier` are real `WRITE_VERBS`
+entries, declared in `/nil/v0.1/describe`, committed through `edge.py`'s ordinary PROPOSE->COMMIT
+like every other curated verb. `to_native` is PURE: `product_ref` (the product TEMPLATE's id) and
+`supplier_ref` (the partner id) arrive pre-resolved from the caller (the control plane / os-server
+hold both in the Odoo mirror).
 
 `fake_client` here is a REAL `FakeSystem` (not the minimal recording double in conftest.py) so these
-tests exercise genuine search/create/delete logic — convergence is proven by actually not writing a
-second record, not by mocking a client that says so.
+tests exercise genuine search/create/delete logic through the real edge — convergence is proven by
+an actual absent second write, not a mock's say-so.
 """
 
 from __future__ import annotations
@@ -14,14 +16,15 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
 
 from odoo_nil_adapter import compensation, translate
+from odoo_nil_adapter.edge import CapturingEmitter, create_app
 from odoo_nil_adapter.system import FakeSystem
 
 
 class _CountingFakeSystem(FakeSystem):
-    """FakeSystem, plus a per-target create counter — the exact `fake_client.created[...]` surface
-    the brief's own test asserts on, to prove a converged second call wrote nothing."""
+    """FakeSystem, plus a per-target create counter — proves a converged second call wrote nothing."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -34,32 +37,51 @@ class _CountingFakeSystem(FakeSystem):
 
 @pytest.fixture
 def fake_client() -> _CountingFakeSystem:
-    sys = _CountingFakeSystem()
-    sys.docs["product.product"] = [
-        {"id": 101, "name": "Widget 16", "default_code": "ODOO-16", "product_tmpl_id": 201},
-        {"id": 102, "name": "Widget 17", "default_code": "ODOO-17", "product_tmpl_id": 202},
-    ]
-    sys.docs["res.partner"] = [
-        {"id": 7, "name": "Acme Supplies", "supplier_rank": 1},
-        {"id": 8, "name": "Best Vendors", "supplier_rank": 1},
-        {"id": 9, "name": "Pure Customer", "customer_rank": 1},  # NOT a supplier
-    ]
-    return sys
+    return _CountingFakeSystem()
 
 
-# ── the brief's three tests, verbatim ──────────────────────────────────────────────────────────
+def _client(sys: FakeSystem) -> TestClient:
+    return TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+
+
+def _env(verb: str, args: dict) -> dict:
+    return {"nil": "0.1", "grant": "g", "workspace": "w", "body": {"verb": verb, "args": args}}
+
+
+def _commit(client: TestClient, verb: str, args: dict) -> dict:
+    pid = client.post("/nil/v0.1/propose", json=_env(verb, args)).json()["body"]["id"]
+    return client.post(
+        "/nil/v0.1/commit",
+        json={"nil": "0.1", "grant": "g", "workspace": "w",
+              "body": {"proposal": pid, "idempotency_key": pid}},
+    ).json()["body"]
+
+
+def _query(client: TestClient, verb: str, args: dict) -> dict:
+    return client.post("/nil/v0.1/query", json=_env(verb, args)).json()["data"]
+
+
+# ── the brief's three tests, adapted to the new arg names (product_ref/supplier_ref) ─────────────
 def test_link_is_convergent_on_the_pair(fake_client: _CountingFakeSystem) -> None:
-    a = translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    b = translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    assert a["id"] == b["id"] and fake_client.created["product.supplierinfo"] == 1
+    client = _client(fake_client)
+    a = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    b = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    assert a["state"] == "executed" and b["state"] == "executed"
+    assert a["result"]["entity"]["id"] == b["result"]["entity"]["id"]
+    assert fake_client.created["product.supplierinfo"] == 1
 
 
 def test_link_reversibility_is_declared() -> None:
-    assert compensation.PRODUCT_SUPPLIER_COMPENSATIONS["procurement.link_supplier"]["reversibility"] == "REVERSIBLE"
+    assert compensation.COMPENSATIONS["procurement.link_supplier"]["reversibility"] == "REVERSIBLE"
 
 
 def test_links_are_readable_as_a_resource(fake_client: _CountingFakeSystem) -> None:
-    translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
+    fake_client.docs["product.product"] = [
+        {"id": 101, "name": "Widget 16", "default_code": "ODOO-16", "product_tmpl_id": 201},
+    ]
+    client = _client(fake_client)
+    _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+
     out = translate._run_nil_search(
         fake_client,
         {"target": "ProductSupplier", "filter": [{"field": "sku", "op": "eq", "value": "ODOO-16"}]},
@@ -67,115 +89,97 @@ def test_links_are_readable_as_a_resource(fake_client: _CountingFakeSystem) -> N
     assert out["items"][0]["supplier_id"]
 
 
-# ── additional covering tests ──────────────────────────────────────────────────────────────────
-def test_links_are_readable_and_carry_the_sku_too(fake_client: _CountingFakeSystem) -> None:
-    translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    out = translate._run_nil_search(fake_client, {"target": "ProductSupplier"})
+# ── describe: both verbs are listed and advertised as committable ────────────────────────────────
+def test_describe_lists_both_verbs() -> None:
+    client = _client(FakeSystem())
+    d = client.get("/nil/v0.1/describe").json()
+    assert "procurement.link_supplier" in d["verbs"]
+    assert "procurement.unlink_supplier" in d["verbs"]
+    rows = {row["verb"]: row for row in d["verb_details"]}
+    assert rows["procurement.link_supplier"]["reversibility"] == "REVERSIBLE"
+    assert rows["procurement.unlink_supplier"]["reversibility"] == "IRREVERSIBLE"
+    assert rows["procurement.link_supplier"]["target"] == "product.supplierinfo"
+
+
+# ── the compound-dedup edge test (the one permitted edge.py change) ──────────────────────────────
+def test_compound_dedup_converges_on_the_ANDed_pair_not_either_field_alone(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    """Two links sharing ONE field (same supplier, different product) must NOT collide — proving the
+    dedup probe is a real AND-of-both-fields, not an accidental single-field match."""
+    client = _client(fake_client)
+
+    first = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    second = _commit(
+        client, "procurement.link_supplier", {"product_ref": "202", "supplier_ref": "7"}
+    )  # same supplier, DIFFERENT product — must be a distinct link, not a false convergence
+
+    assert first["result"]["entity"]["id"] != second["result"]["entity"]["id"]
+    assert fake_client.created["product.supplierinfo"] == 2
+
+    # re-linking the FIRST pair again must still converge on it alone.
+    replay = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    assert replay["result"]["entity"]["id"] == first["result"]["entity"]["id"]
+    assert fake_client.created["product.supplierinfo"] == 2  # no third row
+
+
+def test_compound_dedup_refuses_on_more_than_one_existing_match(fake_client: _CountingFakeSystem) -> None:
+    # a pre-existing data anomaly: two supplierinfo rows already link the same pair.
+    fake_client.docs["product.supplierinfo"] = [
+        {"name": "product.supplierinfo-00001", "product_tmpl_id": 201, "partner_id": 7},
+        {"name": "product.supplierinfo-00002", "product_tmpl_id": 201, "partner_id": 7},
+    ]
+    client = _client(fake_client)
+
+    committed = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+
+    assert committed["state"] == "failed_terminal"
+    assert len(fake_client.docs["product.supplierinfo"]) == 2  # no third row minted by a guess
+
+
+# ── unlink removes the link, and is a convergent no-op the second time ───────────────────────────
+def test_unlink_removes_the_link(fake_client: _CountingFakeSystem) -> None:
+    client = _client(fake_client)
+    linked = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    link_ref = linked["result"]["entity"]["id"]
+
+    unlinked = _commit(client, "procurement.unlink_supplier", {"link_ref": link_ref})
+
+    assert unlinked["state"] == "executed"
+    assert fake_client.get("product.supplierinfo", link_ref) is None
+
+
+def test_unlink_declares_irreversible_honestly() -> None:
+    # See translate.PROCUREMENT_UNLINK_SUPPLIER's docstring: edge.py's curated op="delete" branch
+    # captures no before-image, so a COMPENSABLE declaration here would be undeliverable at ROLLBACK
+    # time — declaring IRREVERSIBLE is the honest choice, not an oversight.
+    assert "procurement.unlink_supplier" not in compensation.COMPENSATIONS
+
+
+def test_link_rollback_previews_the_unlink(fake_client: _CountingFakeSystem) -> None:
+    client = _client(fake_client)
+    committed = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    token = committed["compensation"]["token"]
+
+    rolled = client.post("/nil/v0.1/rollback", json={
+        "nil": "0.1", "grant": "g", "workspace": "w",
+        "body": {"compensation_token": token, "reason": "owner_cancel"},
+    }).json()["body"]
+
+    assert rolled["outcome"] == "proposal"
+    assert rolled["verb"] == "procurement.unlink_supplier"
+    assert rolled["resolved"]["link_ref"] == committed["result"]["entity"]["id"]
+
+
+# ── nil.search ProductSupplier, unchanged (read side stays as built) ─────────────────────────────
+def test_nil_search_product_supplier_exposes_sku_and_supplier_id(fake_client: _CountingFakeSystem) -> None:
+    fake_client.docs["product.product"] = [
+        {"id": 101, "name": "Widget 16", "default_code": "ODOO-16", "product_tmpl_id": 201},
+    ]
+    client = _client(fake_client)
+    _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+
+    out = _query(client, "nil.search", {"target": "ProductSupplier"})
+
     assert out["items"][0]["sku"] == "ODOO-16"
     assert out["items"][0]["supplier_id"] == "7"
-
-
-def test_link_refuses_an_unknown_sku(fake_client: _CountingFakeSystem) -> None:
-    out = translate.run("procurement.link_supplier", fake_client, {"sku": "NO-SUCH-SKU", "supplier_id": "7"})
-    assert out["outcome"] == "refused"
-    assert fake_client.created.get("product.supplierinfo", 0) == 0
-
-
-def test_link_refuses_a_partner_that_is_not_a_supplier(fake_client: _CountingFakeSystem) -> None:
-    # id 9 is a real partner, but customer_rank only — not supplier_rank > 0.
-    out = translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "9"})
-    assert out["outcome"] == "refused"
-    assert fake_client.created.get("product.supplierinfo", 0) == 0
-
-
-def test_unlink_removes_the_pair(fake_client: _CountingFakeSystem) -> None:
-    linked = translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    out = translate.run("procurement.unlink_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    assert out["unlinked"] is True
-    assert fake_client.get("product.supplierinfo", linked["id"]) is None
-
-
-def test_unlink_of_an_already_unlinked_pair_is_a_convergent_no_op(fake_client: _CountingFakeSystem) -> None:
-    out = translate.run("procurement.unlink_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-    assert out["unlinked"] is False
-
-
-def test_unlink_compensation_shape_is_a_recreate_from_the_before_image(
-    fake_client: _CountingFakeSystem,
-) -> None:
-    translate.run(
-        "procurement.link_supplier",
-        fake_client,
-        {"sku": "ODOO-16", "supplier_id": "7", "price": "12.5", "min_qty": "3", "delay_days": "5"},
-    )
-    unlinked = translate.run("procurement.unlink_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-
-    spec = compensation.PRODUCT_SUPPLIER_COMPENSATIONS["procurement.unlink_supplier"]
-    assert spec["reversibility"] == "COMPENSABLE" and spec["strategy"] == "before_image"
-
-    comp_args = compensation.compensate_product_supplier_link("procurement.unlink_supplier", unlinked)
-    assert comp_args == {
-        "sku": "ODOO-16", "supplier_id": "7", "price": 12.5, "min_qty": 3.0, "delay_days": 5.0,
-    }
-    # re-running the compensating verb with those exact args must recreate the same effective link.
-    recreated = translate.run("procurement.link_supplier", fake_client, comp_args)
-    assert recreated["created"] is True
-    assert fake_client.created["product.supplierinfo"] == 2  # one create, one unlink, one re-create
-
-
-def test_batch_link_is_convergent_per_pair(fake_client: _CountingFakeSystem) -> None:
-    translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-
-    out = translate.run(
-        "procurement.link_suppliers",
-        fake_client,
-        {"links": [
-            {"sku": "ODOO-16", "supplier_id": "7"},  # already linked -> existing
-            {"sku": "ODOO-17", "supplier_id": "8"},  # new -> linked
-        ]},
-    )
-
-    assert len(out["linked"]) == 1 and len(out["existing"]) == 1
-    assert fake_client.created["product.supplierinfo"] == 2  # the first call's + exactly one more
-
-
-def test_batch_link_refusal_on_an_unknown_sku_creates_nothing(fake_client: _CountingFakeSystem) -> None:
-    out = translate.run(
-        "procurement.link_suppliers",
-        fake_client,
-        {"links": [
-            {"sku": "ODOO-16", "supplier_id": "7"},   # valid
-            {"sku": "GHOST-SKU", "supplier_id": "8"},  # unknown -> the whole batch refuses
-        ]},
-    )
-
-    assert out["outcome"] == "refused"
-    assert fake_client.created.get("product.supplierinfo", 0) == 0
-
-
-def test_batch_reversibility_is_declared_and_unlinks_only_what_it_created(
-    fake_client: _CountingFakeSystem,
-) -> None:
-    # a pre-existing link that the batch must NOT touch on rollback
-    translate.run("procurement.link_supplier", fake_client, {"sku": "ODOO-16", "supplier_id": "7"})
-
-    spec = compensation.PRODUCT_SUPPLIER_COMPENSATIONS["procurement.link_suppliers"]
-    assert spec["reversibility"] == "REVERSIBLE" and spec["verb"] == "procurement.unlink_suppliers"
-
-    committed = translate.run(
-        "procurement.link_suppliers",
-        fake_client,
-        {"links": [
-            {"sku": "ODOO-16", "supplier_id": "7"},  # pre-existing -> must survive the rollback
-            {"sku": "ODOO-17", "supplier_id": "8"},  # freshly created -> must be undone
-        ]},
-    )
-    comp_args = compensation.compensate_product_supplier_link("procurement.link_suppliers", committed)
-    assert comp_args == {"links": [{"sku": "ODOO-17", "supplier_id": "8"}]}
-
-    rolled_back = translate.run("procurement.unlink_suppliers", fake_client, comp_args)
-    assert rolled_back["unlinked"]
-
-    still_there = translate._run_nil_search(fake_client, {"target": "ProductSupplier"})
-    remaining = {(item["sku"], item["supplier_id"]) for item in still_there["items"]}
-    assert remaining == {("ODOO-16", "7")}  # the pre-existing pair, and only it, survives

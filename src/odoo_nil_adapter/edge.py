@@ -660,14 +660,28 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # UNEXPRESSIBLE rather than filtered — this platform's own law.
         if verb.op == "upsert" and verb.dedup_keys:
             native_probe = verb.to_native(args)
-            if not any(native_probe.get(f) for f in verb.dedup_keys):
-                keys = " or ".join(verb.dedup_keys)
+            # A dedup_keys entry is either a single field name (satisfied when THAT field alone has
+            # a value) or a tuple of field names — a compound key, satisfied only when EVERY field in
+            # the group has a value (it is probed as one AND-of-equalities; a partial group could
+            # only probe a subset of the real identity, which is exactly the blind-create hazard this
+            # guard exists to catch).
+            def _group_satisfied(entry: str | tuple[str, ...]) -> bool:
+                fields = entry if isinstance(entry, tuple) else (entry,)
+                return all(native_probe.get(f) for f in fields)
+
+            if not any(_group_satisfied(entry) for entry in verb.dedup_keys):
+                def _label(entry: str | tuple[str, ...]) -> str:
+                    return "+".join(entry) if isinstance(entry, tuple) else entry
+
+                keys = " or ".join(_label(entry) for entry in verb.dedup_keys)
+                first_entry = verb.dedup_keys[0]
+                first_field = first_entry[0] if isinstance(first_entry, tuple) else first_entry
                 return _refusal(
                     env, "INVALID_ARGS",
                     f"'{verb_name}' deduplicates on {keys}, and this call supplies neither — it "
                     f"could only create blindly, so a retry would mint a second {verb.doctype}. "
                     f"Provide {keys}.",
-                    field=verb.dedup_keys[0],
+                    field=first_field,
                 )
         # An effect whose arithmetic is undefined is not a small effect — it is NO effect. A verb that
         # cannot compute its own payload (a landed cost over a received quantity of zero) must say so
@@ -888,18 +902,29 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     comp_override, before_image = _before_image_reversal(client, verb.doctype, record_id, native)
                 created = client.update(verb.doctype, record_id, native)
             elif verb.op == "upsert":
-                # Probe the dedup keys (in order) for an existing record. A single hit ⇒ update it in
-                # place (COMPENSABLE before-image); no hit ⇒ create (REVERSIBLE by the verb's delete).
+                # Probe the dedup keys (in order) for an existing record. Each entry is either a
+                # single field name (the original semantics: that ONE field's value alone identifies
+                # the record — unchanged, still OR-probed in order) or a TUPLE of field names — a
+                # compound key, probed as one AND-of-equalities domain (generalized here, template
+                # improvement worth porting upstream: some identities need more than one field to be
+                # unique, e.g. a link keyed on (parent_id, child_id), and no single field in it is a
+                # safe key on its own). A single hit ⇒ update it in place (COMPENSABLE before-image);
+                # no hit ⇒ create (REVERSIBLE by the verb's delete).
                 match_id: str | None = None
-                for field in verb.dedup_keys:
-                    value = native.get(field)
-                    if not value:
+                for key in verb.dedup_keys:
+                    fields = key if isinstance(key, tuple) else (key,)
+                    values = [native.get(f) for f in fields]
+                    if not all(values):  # every field in the group must carry a value to probe it
                         continue
-                    hits = client.search(verb.doctype, [[field, "=", value]], limit=2)
+                    domain = [[f, "=", v] for f, v in zip(fields, values)]
+                    hits = client.search(verb.doctype, domain, limit=2)
                     if len(hits) > 1:
-                        # Ambiguous: >1 record matches this key. Guessing one (or creating a third)
-                        # corrupts the identity graph — refuse instead. Terminal, no write performed.
-                        raise SystemError(f"upsert ambiguous: {len(hits)}+ records match {field}={value!r}")
+                        # Ambiguous: >1 record matches this key (or key group). Guessing one (or
+                        # creating a third) corrupts the identity graph — refuse instead. Terminal,
+                        # no write performed.
+                        raise SystemError(
+                            f"upsert ambiguous: {len(hits)}+ records match {dict(zip(fields, values))!r}"
+                        )
                     if len(hits) == 1:
                         match_id = str(hits[0].get("id") or hits[0].get("name") or "")
                         break

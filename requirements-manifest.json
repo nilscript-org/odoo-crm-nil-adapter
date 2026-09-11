@@ -223,6 +223,41 @@
       ],
       "hidden_requirements": []
     },
+    "procurement.link_supplier": {
+      "doctype": "product.supplierinfo",
+      "op": "upsert",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "product_ref",
+        "supplier_ref"
+      ],
+      "hidden_requirements": [],
+      "dedup_keys": [
+        [
+          "product_tmpl_id",
+          "partner_id"
+        ]
+      ],
+      "compensation": {
+        "verb": "procurement.unlink_supplier",
+        "arg_map": {
+          "link_ref": "$.result.entity.id"
+        },
+        "tier": "MEDIUM",
+        "window": "P30D"
+      }
+    },
+    "procurement.unlink_supplier": {
+      "doctype": "product.supplierinfo",
+      "op": "delete",
+      "tier": "MEDIUM",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "link_ref"
+      ],
+      "hidden_requirements": []
+    },
     "purchase.confirm_order": {
       "doctype": "purchase.order",
       "op": "method",
