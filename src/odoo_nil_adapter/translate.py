@@ -1189,6 +1189,60 @@ PROCUREMENT_UNLINK_SUPPLIER = WriteVerb(
     supported_args=("link_ref",),
 )
 
+# ── procurement.create_supplier (Task 1.3b): a res.partner Odoo can be the SUPPLIER record for ────
+# `ManageSuppliers.create` (baseline capability) routes here when the operator's Supplier authority
+# is Odoo. Odoo has no separate "vendor" table — a supplier IS a `res.partner` with `supplier_rank`
+# raised above zero, the exact counter `Supplier`'s base domain already reads (`RESOURCE_DOMAINS`
+# above). So this verb writes the SAME model `crm.create_contact` writes, deliberately: it stamps
+# `supplier_rank: 1` and leaves `customer_rank` untouched (Odoo's own default, 0) — a record this
+# verb creates is a vendor, never a customer, and a `Supplier` read finds it immediately because the
+# base domain and this verb's write agree on the same field.
+def _to_native_create_supplier(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo `res.partner` scoped as a supplier. `is_company` is always True (a supplier
+    is a business, never a person) — unlike `crm.create_contact`, it is not an optional input here."""
+    doc: dict[str, Any] = {"name": args["name"], "is_company": True, "supplier_rank": 1}
+    for nil_key, odoo_key in (
+        ("email", "email"),
+        ("phone", "phone"),
+        ("vat", "vat"),
+    ):
+        if args.get(nil_key):
+            doc[odoo_key] = args[nil_key]
+    return doc
+
+
+PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
+    verb="procurement.create_supplier",
+    # Convergent by the SAME C3.5 discipline as `crm.create_contact`/`crm.create_client`: an upsert
+    # with nothing to deduplicate on is a blind create wearing an upsert's name. The difference here
+    # is that `name` (this verb's only REQUIRED arg) is itself the fallback member of `dedup_keys` —
+    # so, unlike create_contact (whose dedup set is email/phone, neither required), this verb can
+    # never actually reach C3.5's keyless-create refusal: a name is always present. That is a
+    # deliberate reading of the brief ("dedup on email when given, else on name"), not an oversight —
+    # a real supplier always has a name, and probing it when no email was given converges a retry
+    # onto the same vendor instead of minting a duplicate purely because the caller wrote the name
+    # only once.
+    recovery_shape="convergent",
+    recovery_note=(
+        "upserts on email when given; falls back to name otherwise (C3.5's dedup-key discipline — "
+        "the same OR-probed dedup_keys tuple crm.create_contact uses, ordered so email wins when both "
+        "are present)"
+    ),
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="upsert",
+    required=("name",),
+    to_native=_to_native_create_supplier,
+    preview=lambda a: {
+        "en": f"Create supplier “{a.get('name', '')}”"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+        "ar": f"إنشاء مورد «{a.get('name', '')}»"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+    },
+    entity_type="supplier",
+    dedup_keys=("email", "name"),
+)
+
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
 # These delegate to the shared `ReadPlane` (projection + byte-cap-refuse + capability fallback + read
 # authz + export/bulk gating). The edge dispatches them through QUERY_VERBS like any read verb; engine

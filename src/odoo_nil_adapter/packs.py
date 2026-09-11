@@ -250,6 +250,7 @@ def _make_purchasing_pack() -> ModulePack:
         WOSOOL_SET_LANDED_COST,
         PROCUREMENT_LINK_SUPPLIER,
         PROCUREMENT_UNLINK_SUPPLIER,
+        PROCUREMENT_CREATE_SUPPLIER,
     )
 
     return ModulePack(
@@ -267,6 +268,8 @@ def _make_purchasing_pack() -> ModulePack:
             # Task 1.3 (D37/D38/O3, fix round 1): the product<->supplier link.
             PROCUREMENT_LINK_SUPPLIER,
             PROCUREMENT_UNLINK_SUPPLIER,
+            # Task 1.3b: ManageSuppliers.create routes here — a res.partner with supplier_rank>0.
+            PROCUREMENT_CREATE_SUPPLIER,
         ),
         # A READ: the ERP's OWN rendered purchase order (QWeb `purchase.report_purchaseorder`). The
         # document the vendor receives is Odoo's, never one we compose from the record.
