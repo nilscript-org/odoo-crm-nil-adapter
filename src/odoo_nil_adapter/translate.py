@@ -1781,27 +1781,55 @@ def _resolve_sku(client: SystemClient, sku: str) -> tuple[int | None, int | None
     return (int(pid) if pid is not None else None, tmpl_id)
 
 
-def _lookup_default_code(
-    client: SystemClient, *, product_id: Any, product_tmpl_id: Any
-) -> str | None:
-    """The product's SKU (`default_code`), preferring the specific variant (`product_id`) over the
-    template — "the product's default_code, resolved via the template/variant" (Task 1.3 decision)."""
-    if product_id is not None:
-        rows = client.search(
-            "product.product", [["id", "=", product_id]], fields=("default_code",), limit=1
-        )
-        if rows and rows[0].get("default_code"):
-            return str(rows[0]["default_code"])
-    if product_tmpl_id is not None:
-        rows = client.search(
-            "product.product",
-            [["product_tmpl_id", "=", product_tmpl_id]],
-            fields=("default_code",),
-            limit=1,
-        )
-        if rows and rows[0].get("default_code"):
-            return str(rows[0]["default_code"])
-    return None
+def _unwrap_ref(value: Any) -> Any:
+    """A real Odoo many2one comes back as `[id, label]`; the plain id (or scalar value), unwrapped.
+    `None`-safe, and a no-op for a value that is already scalar."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _as_int_id(value: Any) -> int | None:
+    unwrapped = _unwrap_ref(value)
+    try:
+        return int(unwrapped) if unwrapped is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# I2 (final review): `_lookup_default_code` did up to TWO XML-RPC round trips PER ROW (one by
+# `product_id`, one falling back to `product_tmpl_id`) — for os-server's mirror poller (PAGE_LIMIT=200
+# x MAX_PAGES=50), up to ~20,000 serial calls against the customer's live Odoo per sync tick. Batched:
+# collect the WHOLE page's `product_id`/`product_tmpl_id` sets up front and resolve each set in ONE
+# `search_read`, so a page costs at most two calls total — not two per row.
+def _batch_default_codes(
+    client: SystemClient, rows: list[dict[str, Any]]
+) -> dict[tuple[str, int], str]:
+    """`{("id", product_id) | ("product_tmpl_id", tmpl_id): default_code}` for every id referenced
+    across `rows` — the batched replacement for calling `_lookup_default_code` once per row."""
+    product_ids = {i for i in (_as_int_id(r.get("product_id")) for r in rows) if i is not None}
+    tmpl_ids = {i for i in (_as_int_id(r.get("product_tmpl_id")) for r in rows) if i is not None}
+    codes: dict[tuple[str, int], str] = {}
+    if product_ids:
+        for r in client.search(
+            "product.product", [["id", "in", sorted(product_ids)]],
+            fields=("id", "default_code"), limit=len(product_ids),
+        ):
+            if r.get("default_code"):
+                codes[("id", int(r["id"]))] = str(r["default_code"])
+    if tmpl_ids:
+        # Several variants can share one template; any variant's own code stands in for the template's
+        # (the original per-row lookup made the same arbitrary "first match" choice via `limit=1`,
+        # unordered) — the bound below is generous, not unbounded: a page-sized set of templates times
+        # a realistic variant fan-out, never "search everything".
+        for r in client.search(
+            "product.product", [["product_tmpl_id", "in", sorted(tmpl_ids)]],
+            fields=("product_tmpl_id", "default_code"), limit=max(len(tmpl_ids) * 20, 200),
+        ):
+            tmpl_id = _as_int_id(r.get("product_tmpl_id"))
+            if tmpl_id is not None and r.get("default_code"):
+                codes.setdefault(("product_tmpl_id", tmpl_id), str(r["default_code"]))
+    return codes
 
 
 def _is_product_supplier(resource: str) -> bool:
@@ -1832,25 +1860,27 @@ def _translate_product_supplier_filter(
 
 
 def _project_product_supplier_row(
-    client: SystemClient, resource: str, row: dict[str, Any]
+    client: SystemClient, resource: str, row: dict[str, Any], codes: dict[tuple[str, int], str] | None = None
 ) -> dict[str, Any]:
     """Add the exposed `sku`/`supplier_id` keys to one raw `product.supplierinfo` read row — never
-    removing Odoo's own field names, so a caller that already reads `partner_id` keeps working."""
+    removing Odoo's own field names, so a caller that already reads `partner_id` keeps working.
+
+    `codes` is the batched `{("id"|"product_tmpl_id", id): default_code}` map (I2) a page-level caller
+    (`_project_product_supplier_items`) already resolved for the WHOLE page in ≤2 calls; a lone-row
+    caller (`_run_nil_get`) omits it and this falls back to a one-row batch — still ≤2 calls, just not
+    shared with any other row."""
     if not _is_product_supplier(resource) or not isinstance(row, dict):
         return row
     out = dict(row)
-    partner = row.get("partner_id")
-    if isinstance(partner, (list, tuple)):
-        partner = partner[0] if partner else None
+    partner = _unwrap_ref(row.get("partner_id"))
     if partner is not None:
         out["supplier_id"] = str(partner)
-    product_id = row.get("product_id")
-    if isinstance(product_id, (list, tuple)):
-        product_id = product_id[0] if product_id else None
-    tmpl_id = row.get("product_tmpl_id")
-    if isinstance(tmpl_id, (list, tuple)):
-        tmpl_id = tmpl_id[0] if tmpl_id else None
-    sku = _lookup_default_code(client, product_id=product_id, product_tmpl_id=tmpl_id)
+    lookup = codes if codes is not None else _batch_default_codes(client, [row])
+    product_id = _as_int_id(row.get("product_id"))
+    tmpl_id = _as_int_id(row.get("product_tmpl_id"))
+    sku = lookup.get(("id", product_id)) if product_id is not None else None
+    if sku is None and tmpl_id is not None:
+        sku = lookup.get(("product_tmpl_id", tmpl_id))
     if sku:
         out["sku"] = sku
     return out
@@ -1859,10 +1889,15 @@ def _project_product_supplier_row(
 def _project_product_supplier_items(
     client: SystemClient, resource: str, result: dict[str, Any]
 ) -> dict[str, Any]:
-    """The same projection, applied to every item of a `nil.search`/`nil.export`-shaped result."""
+    """The same projection, applied to every item of a `nil.search`/`nil.export`-shaped result — the
+    default-code lookup is batched ONCE for the whole page (I2), never once per row."""
     if not _is_product_supplier(resource) or not isinstance(result, dict) or not result.get("items"):
         return result
-    return {**result, "items": [_project_product_supplier_row(client, resource, r) for r in result["items"]]}
+    codes = _batch_default_codes(client, result["items"])
+    return {
+        **result,
+        "items": [_project_product_supplier_row(client, resource, r, codes) for r in result["items"]],
+    }
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:
