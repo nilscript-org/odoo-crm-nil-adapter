@@ -266,14 +266,14 @@
         "arg_map": {
           "link_ref": "$.result.entity.id"
         },
-        "tier": "MEDIUM",
+        "tier": "HIGH",
         "window": "P30D"
       }
     },
     "procurement.unlink_supplier": {
       "doctype": "product.supplierinfo",
       "op": "delete",
-      "tier": "MEDIUM",
+      "tier": "HIGH",
       "reversibility": "IRREVERSIBLE",
       "required": [
         "link_ref"

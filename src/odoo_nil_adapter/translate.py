@@ -1197,7 +1197,13 @@ PROCUREMENT_UNLINK_SUPPLIER = WriteVerb(
     # delete, mirroring the update branch exactly) — outside this round's ONE permitted edit.
     recovery_shape="convergent",
     recovery_note="deletes an existing link_ref, and the edge re-reads to confirm ABSENCE — a second unlink is a no-op",
-    tier="MEDIUM",
+    # C1 (final review): every OTHER delete in this adapter is HIGH (crm.delete_lead, crm.delete_contact,
+    # purchase.delete_order — this adapter's own stated rule is `_CRUD_TIERS = {..., "delete": "HIGH"}`,
+    # governance.py:60). This verb was the single MEDIUM exception, and MEDIUM auto-executes with no
+    # human in the loop — exactly wrong for an IRREVERSIBLE delete that captures no before-image. The
+    # fix-round-1 ruling that accepted IRREVERSIBLE here did so ON THE PREMISE that HIGH tier parks it
+    # for a human (progress.md:74); declaring MEDIUM broke that premise. HIGH, like every other delete.
+    tier="HIGH",
     doctype="product.supplierinfo",
     op="delete",
     required=("link_ref",),

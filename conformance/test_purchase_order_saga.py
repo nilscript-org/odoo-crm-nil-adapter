@@ -184,6 +184,20 @@ def test_describe_declares_tier_and_reversibility_for_every_write_verb() -> None
         assert row["tier"] in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
 
 
+def test_every_delete_verb_declares_HIGH_or_CRITICAL_tier() -> None:
+    """C1 (final review): the adapter's own stated rule (`governance.py`'s `_CRUD_TIERS`: delete ->
+    HIGH) must not live only in a comment — it found the one silent exception
+    (`procurement.unlink_supplier`, shipped at MEDIUM). A MEDIUM tier auto-executes with no human in
+    the loop, which is exactly wrong for a delete: this is an adapter-wide invariant, not a one-off
+    fix, so a future delete verb cannot reintroduce the same defect unnoticed."""
+    for name, verb in WRITE_VERBS.items():
+        if verb.op == "delete":
+            assert verb.tier in ("HIGH", "CRITICAL"), (
+                f"{name}: delete verb declared tier={verb.tier!r} — every delete in this adapter "
+                "must park for a human (HIGH or CRITICAL), never auto-execute"
+            )
+
+
 def test_every_declared_compensation_is_executable() -> None:
     """A compensating verb this adapter cannot RUN is not a compensation — it is a promise that mints
     a token, previews a reversal, and then fails. Every verb named in COMPENSATIONS must be a curated

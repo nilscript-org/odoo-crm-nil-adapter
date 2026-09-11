@@ -156,6 +156,27 @@ def test_unlink_declares_irreversible_honestly() -> None:
     assert "procurement.unlink_supplier" not in compensation.COMPENSATIONS
 
 
+# ── C1 (final review): an IRREVERSIBLE delete with no before-image must be HIGH tier, like every
+# other delete in this adapter — MEDIUM auto-executes with no human in the loop.
+def test_unlink_is_HIGH_tier_declared_and_on_the_wire(fake_client: _CountingFakeSystem) -> None:
+    assert translate.PROCUREMENT_UNLINK_SUPPLIER.tier == "HIGH"
+    d = _client(fake_client).get("/nil/v0.1/describe").json()
+    rows = {row["verb"]: row for row in d["verb_details"]}
+    assert rows["procurement.unlink_supplier"]["tier"] == "HIGH"
+
+
+def test_unlink_proposal_carries_the_HIGH_tier(fake_client: _CountingFakeSystem) -> None:
+    client = _client(fake_client)
+    linked = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
+    link_ref = linked["result"]["entity"]["id"]
+
+    proposed = client.post(
+        "/nil/v0.1/propose", json=_env("procurement.unlink_supplier", {"link_ref": link_ref})
+    ).json()["body"]
+
+    assert proposed["tier"] == "HIGH"
+
+
 def test_link_rollback_previews_the_unlink(fake_client: _CountingFakeSystem) -> None:
     client = _client(fake_client)
     committed = _commit(client, "procurement.link_supplier", {"product_ref": "201", "supplier_ref": "7"})
@@ -183,3 +204,41 @@ def test_nil_search_product_supplier_exposes_sku_and_supplier_id(fake_client: _C
 
     assert out["items"][0]["sku"] == "ODOO-16"
     assert out["items"][0]["supplier_id"] == "7"
+
+
+# ── I2 (final review): the default_code lookup must be BATCHED per page, not once per row ─────────
+class _CountingSearchFakeSystem(FakeSystem):
+    """FakeSystem, plus a log of every `search()` call — proves the batched lookup issues at most one
+    `product.product` search per identifier space for a WHOLE page, not one (or two) per row."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_calls: list[tuple[str, list]] = []
+
+    def search(self, target: str, domain: list, **kwargs: Any) -> list[dict[str, Any]]:
+        self.search_calls.append((target, domain))
+        return super().search(target, domain, **kwargs)
+
+
+def test_product_supplier_page_batches_the_default_code_lookup_at_most_two_calls() -> None:
+    sys = _CountingSearchFakeSystem()
+    page_size = 50
+    sys.docs["product.supplierinfo"] = [
+        {"id": i, "name": f"product.supplierinfo-{i:05d}", "product_tmpl_id": 1000 + i, "partner_id": 7}
+        for i in range(page_size)
+    ]
+    sys.docs["product.product"] = [
+        {"id": 2000 + i, "name": f"Widget {i}", "default_code": f"SKU-{i}", "product_tmpl_id": 1000 + i}
+        for i in range(page_size)
+    ]
+    client = _client(sys)
+
+    out = _query(client, "nil.search", {"target": "ProductSupplier", "limit": page_size})
+
+    assert len(out["items"]) == page_size
+    assert all(item.get("sku") == f"SKU-{i}" for i, item in enumerate(out["items"]))
+    product_calls = [c for c in sys.search_calls if c[0] == "product.product"]
+    assert len(product_calls) <= 2, (
+        f"expected at most 2 product.product searches for a {page_size}-row page, saw "
+        f"{len(product_calls)}: {product_calls}"
+    )
