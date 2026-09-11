@@ -75,3 +75,59 @@ def compensate(verb: str, result: dict[str, Any]) -> dict[str, Any]:
     entity = result.get("entity", {}) or {}
     record_id = entity.get("id") or entity.get("name") or ""
     return {id_arg: record_id}
+
+
+# ── Task 1.3 (D37/D38/O3): the product<->supplier link's reversal declarations ──────────────────
+# `procurement.link_supplier` / `unlink_supplier` / `link_suppliers` are NOT in WRITE_VERBS — see
+# `translate.run`'s docstring for why (convergence on a COMPOUND pair + a live sku lookup, neither
+# of which `edge.py`'s op=create/update/delete/method/upsert spine can express without editing
+# `edge.py`, which is scaffold-generated and out of this adapter's editable scope). Because they are
+# not curated write verbs, their reversal lives in this SEPARATE table rather than `COMPENSATIONS`:
+# the conformance suite asserts `COMPENSATIONS`'s keyspace is exactly the verb set `edge.py` commits
+# through (`test_every_declared_compensation_is_executable`, `test_manifest_declares_every_write_verb...`
+# in conformance/test_purchase_order_saga.py) — adding these here would either fail that assertion
+# (they compensate via a verb `edge.py` cannot run) or force a manifest entry for a verb the wire
+# does not actually advertise, which would be the same false-advertising bug those gates exist to
+# catch, just moved one table over.
+PRODUCT_SUPPLIER_COMPENSATIONS: dict[str, dict[str, Any]] = {
+    "procurement.link_supplier": {"reversibility": "REVERSIBLE", "verb": "procurement.unlink_supplier"},
+    # COMPENSABLE by re-creating the exact link a before-image captured — never a blind re-run of
+    # the original link_supplier args, which the caller may not have kept.
+    "procurement.unlink_supplier": {
+        "reversibility": "COMPENSABLE", "verb": "procurement.link_supplier", "strategy": "before_image",
+    },
+    # The batch's reversal unlinks EXACTLY the pairs it CREATED, never the pre-existing ones — see
+    # `compensate_product_supplier_link`'s `procurement.link_suppliers` branch, which reads
+    # `created_pairs` (not `linked`+`existing`) for exactly this reason. One call, not a `foreach`.
+    "procurement.link_suppliers": {"reversibility": "REVERSIBLE", "verb": "procurement.unlink_suppliers"},
+}
+
+
+def compensate_product_supplier_link(verb: str, result: dict[str, Any]) -> dict[str, Any]:
+    """The compensating-proposal args for a product<->supplier link verb — mirrors `compensate()`'s
+    contract (a committed `result` in, the next call's args out) but reads `PRODUCT_SUPPLIER_COMPENSATIONS`
+    instead of `COMPENSATIONS`, and builds MULTI-FIELD args (sku + supplier_id, not a single id) since
+    that table's `_COMP_ID_ARG` single-scalar shape does not fit a compound identity.
+
+    Raises NotImplementedError for an unmapped verb, matching `compensate()`'s contract."""
+    spec = PRODUCT_SUPPLIER_COMPENSATIONS.get(verb)
+    if spec is None:
+        raise NotImplementedError(f"{verb} is IRREVERSIBLE — no compensation mapped")
+    comp_verb = spec["verb"]
+    if comp_verb == "procurement.unlink_supplier":
+        entity = result.get("entity", {}) or {}
+        return {"sku": entity.get("sku"), "supplier_id": entity.get("supplier_id")}
+    if comp_verb == "procurement.link_supplier":
+        # COMPENSABLE: re-create from the before-image the unlink captured, not the caller's original
+        # args (an unlink call carries no price/min_qty/delay_days of its own to replay).
+        before = result.get("before_image") or {}
+        return {
+            "sku": before.get("sku"), "supplier_id": before.get("supplier_id"),
+            "price": before.get("price"), "min_qty": before.get("min_qty"),
+            "delay_days": before.get("delay_days"),
+        }
+    if comp_verb == "procurement.unlink_suppliers":
+        # REVERSIBLE: unlink exactly the pairs the batch CREATED — `created_pairs`, never `linked`+
+        # `existing`'s union, which would also delete links that were already there before this call.
+        return {"links": list(result.get("created_pairs") or [])}
+    raise NotImplementedError(f"no compensation strategy for compensating verb {comp_verb!r}")

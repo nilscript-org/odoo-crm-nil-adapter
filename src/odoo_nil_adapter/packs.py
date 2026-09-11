@@ -299,6 +299,20 @@ def _make_purchasing_pack() -> ModulePack:
                 "standard_price",
             ),
             "stock.quant": ("id", "product_id", "location_id", "quantity"),
+            # Task 1.3 (D37/D38/O3): the product<->supplier link. These are Odoo's OWN field names —
+            # `sku`/`supplier_id` are exposed on top of them by translate.py's read-side projection
+            # (`_project_product_supplier_row`), never requested from Odoo directly (it has no such
+            # fields).
+            "product.supplierinfo": (
+                "id",
+                "product_tmpl_id",
+                "product_id",
+                "partner_id",
+                "price",
+                "min_qty",
+                "delay",
+                "currency_id",
+            ),
         },
         sensitive={},
     )
