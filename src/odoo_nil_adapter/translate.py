@@ -1429,17 +1429,23 @@ def _id_satisfies_domain(plane: Any, resource: str, native: str, record_id: Any)
     checked via a SCOPED EXISTENCE COUNT rather than inspecting a fetched record's fields, because the
     domain's own field (`supplier_rank`) is not part of the resource's curated read projection and a
     projected `get()` result would not carry it at all. No domain declared (or no id given) is
-    vacuously true — a native model name keeps today's unfiltered behaviour."""
+    vacuously true — a native model name keeps today's unfiltered behaviour.
+
+    I3 (final review): this used to fail OPEN — a refused scoped count returned `True`, letting the
+    caller's own (unscoped) `get` proceed and potentially hand back a record outside the domain. The
+    comment that reasoning relied on only holds for a TARGET-level refusal (unprovisioned/out-of-scope
+    model), where the caller's own read fails identically either way; it does NOT hold for a refusal
+    caused by this count's own extra predicate. Fail CLOSED: propagate the refusal — every caller
+    (`_run_nil_get`'s own try/except, `_run_nil_intent` via `_ScopedPlane`) already turns a propagated
+    `_READ_REFUSALS` member into a structured `refused` outcome, never a 500 and never a silent
+    `{"found": False}` that would read exactly like an ordinary miss."""
     base = base_filter_for(resource)
     if not base or record_id is None:
         return True
     base_preds = [
         {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value} for field, op, value in base
     ]
-    try:
-        result = plane.count(native, filter=[*base_preds, {"field": "id", "op": "eq", "value": record_id}])
-    except _READ_REFUSALS:
-        return True  # let the caller's own read surface/report the refusal itself, never mask it here
+    result = plane.count(native, filter=[*base_preds, {"field": "id", "op": "eq", "value": record_id}])
     return bool(result.get("count", 0))
 
 
@@ -1629,6 +1635,12 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         SystemError
     ) as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "UPSTREAM_ERROR", "message": str(exc)}
+    # I3 (final review): a propagated read-plane refusal (e.g. the scoped existence count behind
+    # `_ScopedPlane.get` failing closed) carries its own precise code/message — surface it exactly as
+    # `_run_nil_get` does, before the generic catch-all below flattens it to an undifferentiated
+    # INTENT_ERROR.
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
     except Exception as exc:  # noqa: BLE001 — any resolution fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "INTENT_ERROR", "message": str(exc)}
     if outcome.kind == "refusal":
