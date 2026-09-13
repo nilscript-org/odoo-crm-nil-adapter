@@ -251,6 +251,22 @@ def _is_x2many_commands(value: Any) -> bool:
     return isinstance(value, (list, tuple)) and any(isinstance(el, (list, tuple)) for el in value)
 
 
+def _is_domain_group(entry: Any) -> bool:
+    """True for a `dedup_keys`/`dedup_probe` entry that is a compound AND-group of fully-resolved
+    domain TRIPLES — `(field, op, value)`, e.g. `(("email", "=", "a@b.c"), ("supplier_rank", ">", 0))`
+    — rather than the original plain field-name shape (`str`, or a `tuple[str, ...]` whose values are
+    looked up from `native` and always compared by equality). A range predicate like `supplier_rank >
+    0` cannot be expressed by that original shape at all (equality-only), so a verb whose identity
+    needs one supplies this shape instead, with every value already resolved by its own `dedup_probe`
+    — never sourced from `native` here. Vendor-neutral: this inspects TUPLE SHAPE only, never a
+    business field name, so it generalizes the SAME way the original compound-key shape did."""
+    return (
+        isinstance(entry, (list, tuple))
+        and len(entry) > 0
+        and all(isinstance(t, (list, tuple)) and len(t) == 3 for t in entry)
+    )
+
+
 def _resolve_writes(client: SystemClient, doctype: str, native: dict[str, Any]) -> dict[str, Any]:
     """Schema-driven resolution of every written field to the value the backend actually accepts —
     a selection value → its stored key (B), a many2one value → the referenced record id (C). Driven
@@ -660,14 +676,44 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         # UNEXPRESSIBLE rather than filtered — this platform's own law.
         if verb.op == "upsert" and verb.dedup_keys:
             native_probe = verb.to_native(args)
-            if not any(native_probe.get(f) for f in verb.dedup_keys):
-                keys = " or ".join(verb.dedup_keys)
+            # Fix round 1 (Task 1.3b): the keys actually probed for THIS call — narrowed by
+            # `dedup_probe` when the verb declares one (e.g. "email when given, name only when it is
+            # not" — never both), else the full declared `dedup_keys` OR-set, unchanged. Vendor-neutral:
+            # this file only ever calls the verb's own resolver, never branches on a field name.
+            probe_keys = verb.dedup_probe_keys(args) or verb.dedup_keys  # never empty: a resolver
+            # returning nothing falls back to the full declared set rather than crashing below.
+            # A dedup_keys entry is either a single field name (satisfied when THAT field alone has
+            # a value) or a tuple of field names — a compound key, satisfied only when EVERY field in
+            # the group has a value (it is probed as one AND-of-equalities; a partial group could
+            # only probe a subset of the real identity, which is exactly the blind-create hazard this
+            # guard exists to catch) — OR (I4 re-review, `_is_domain_group`) a compound AND-group of
+            # fully-resolved domain triples, always satisfied by construction: the verb's own
+            # `dedup_probe` already decided every value, so there is nothing left here to probe for
+            # presence.
+            def _group_satisfied(entry: str | tuple[str, ...]) -> bool:
+                if _is_domain_group(entry):
+                    return True
+                fields = entry if isinstance(entry, tuple) else (entry,)
+                return all(native_probe.get(f) for f in fields)
+
+            if not any(_group_satisfied(entry) for entry in probe_keys):
+                def _label(entry: str | tuple[str, ...]) -> str:
+                    if _is_domain_group(entry):
+                        return "+".join(str(t[0]) for t in entry)
+                    return "+".join(entry) if isinstance(entry, tuple) else entry
+
+                keys = " or ".join(_label(entry) for entry in probe_keys)
+                first_entry = probe_keys[0]
+                if _is_domain_group(first_entry):
+                    first_field = first_entry[0][0]
+                else:
+                    first_field = first_entry[0] if isinstance(first_entry, tuple) else first_entry
                 return _refusal(
                     env, "INVALID_ARGS",
                     f"'{verb_name}' deduplicates on {keys}, and this call supplies neither — it "
                     f"could only create blindly, so a retry would mint a second {verb.doctype}. "
                     f"Provide {keys}.",
-                    field=verb.dedup_keys[0],
+                    field=first_field,
                 )
         # An effect whose arithmetic is undefined is not a small effect — it is NO effect. A verb that
         # cannot compute its own payload (a landed cost over a received quantity of zero) must say so
@@ -888,18 +934,47 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
                     comp_override, before_image = _before_image_reversal(client, verb.doctype, record_id, native)
                 created = client.update(verb.doctype, record_id, native)
             elif verb.op == "upsert":
-                # Probe the dedup keys (in order) for an existing record. A single hit ⇒ update it in
-                # place (COMPENSABLE before-image); no hit ⇒ create (REVERSIBLE by the verb's delete).
+                # Probe the dedup keys (in order) for an existing record. Each entry is either a
+                # single field name (the original semantics: that ONE field's value alone identifies
+                # the record — unchanged, still OR-probed in order) or a TUPLE of field names — a
+                # compound key, probed as one AND-of-equalities domain (generalized here, template
+                # improvement worth porting upstream: some identities need more than one field to be
+                # unique, e.g. a link keyed on (parent_id, child_id), and no single field in it is a
+                # safe key on its own). A single hit ⇒ update it in place (COMPENSABLE before-image);
+                # no hit ⇒ create (REVERSIBLE by the verb's delete).
+                #
+                # Fix round 1 (Task 1.3b): `dedup_probe_keys` narrows the OR-set to what THIS call's
+                # args actually license probing on (e.g. email-only when given, name-only when not),
+                # so a genuinely new record whose email search misses is never allowed to fall
+                # through to an unrelated record that merely shares a display name. A verb with no
+                # `dedup_probe` gets the unchanged full-set behaviour every other verb already has.
+                #
+                # Fix round 2 (I4 re-review, `_is_domain_group`): a compound key entry can ALSO be a
+                # group of fully-resolved domain TRIPLES — `(field, op, value)` — rather than plain
+                # field names checked by equality against `native`. This is what makes a RANGE
+                # predicate expressible (e.g. `supplier_rank > 0`): the original field-name shape can
+                # only ever probe equality on whatever `to_native` happened to write, which cannot
+                # express "greater than" at all — a verb whose identity genuinely needs a range (not
+                # an exact value) supplies this shape instead, with the values already resolved by its
+                # own `dedup_probe`, never sourced from `native` here. Vendor-neutral: this file still
+                # only inspects tuple SHAPE and calls the verb's own resolver — it never branches on a
+                # business field name.
                 match_id: str | None = None
-                for field in verb.dedup_keys:
-                    value = native.get(field)
-                    if not value:
-                        continue
-                    hits = client.search(verb.doctype, [[field, "=", value]], limit=2)
+                for key in verb.dedup_probe_keys(stored["args"]) or verb.dedup_keys:
+                    if _is_domain_group(key):
+                        domain = [[field, op, value] for field, op, value in key]
+                    else:
+                        fields = key if isinstance(key, tuple) else (key,)
+                        values = [native.get(f) for f in fields]
+                        if not all(values):  # every field in the group must carry a value to probe it
+                            continue
+                        domain = [[f, "=", v] for f, v in zip(fields, values)]
+                    hits = client.search(verb.doctype, domain, limit=2)
                     if len(hits) > 1:
-                        # Ambiguous: >1 record matches this key. Guessing one (or creating a third)
-                        # corrupts the identity graph — refuse instead. Terminal, no write performed.
-                        raise SystemError(f"upsert ambiguous: {len(hits)}+ records match {field}={value!r}")
+                        # Ambiguous: >1 record matches this key (or key group). Guessing one (or
+                        # creating a third) corrupts the identity graph — refuse instead. Terminal,
+                        # no write performed.
+                        raise SystemError(f"upsert ambiguous: {len(hits)}+ records match domain {domain!r}")
                     if len(hits) == 1:
                         match_id = str(hits[0].get("id") or hits[0].get("name") or "")
                         break

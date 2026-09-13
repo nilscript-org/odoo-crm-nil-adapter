@@ -86,7 +86,14 @@ def _make_crm_pack() -> ModulePack:
             CRM_GET_CONTACT,
         ),
         projections={
+            # Fix round 1, I1: `vat` must NOT land on Customer's shared `res.partner` projection —
+            # that leaked a field nobody asked for onto every plain Customer read. `Supplier` gets its
+            # OWN entry (keyed by the business name, not the native model) instead, so the two
+            # resources sharing `res.partner` can carry different default fields. `vat` is already
+            # declared `sensitive` below (and independently caught by read_plane's generic "vat"
+            # fragment match), so it is redacted unless the caller `reveal`s it either way.
             "res.partner": ("id", "name", "phone", "email"),
+            "Supplier": ("id", "name", "email", "phone", "vat"),
             "crm.lead": (
                 "id",
                 "name",
@@ -241,6 +248,9 @@ def _make_purchasing_pack() -> ModulePack:
         PURCHASE_DELETE_ORDER,
         PURCHASE_GET_ORDER_DOCUMENT,
         WOSOOL_SET_LANDED_COST,
+        PROCUREMENT_LINK_SUPPLIER,
+        PROCUREMENT_UNLINK_SUPPLIER,
+        PROCUREMENT_CREATE_SUPPLIER,
     )
 
     return ModulePack(
@@ -255,6 +265,11 @@ def _make_purchasing_pack() -> ModulePack:
             PURCHASE_DELETE_ORDER,
             PURCHASE_CONFIRM_ORDER,
             WOSOOL_SET_LANDED_COST,
+            # Task 1.3 (D37/D38/O3, fix round 1): the product<->supplier link.
+            PROCUREMENT_LINK_SUPPLIER,
+            PROCUREMENT_UNLINK_SUPPLIER,
+            # Task 1.3b: ManageSuppliers.create routes here — a res.partner with supplier_rank>0.
+            PROCUREMENT_CREATE_SUPPLIER,
         ),
         # A READ: the ERP's OWN rendered purchase order (QWeb `purchase.report_purchaseorder`). The
         # document the vendor receives is Odoo's, never one we compose from the record.
@@ -292,6 +307,20 @@ def _make_purchasing_pack() -> ModulePack:
                 "standard_price",
             ),
             "stock.quant": ("id", "product_id", "location_id", "quantity"),
+            # Task 1.3 (D37/D38/O3): the product<->supplier link. These are Odoo's OWN field names —
+            # `sku`/`supplier_id` are exposed on top of them by translate.py's read-side projection
+            # (`_project_product_supplier_row`), never requested from Odoo directly (it has no such
+            # fields).
+            "product.supplierinfo": (
+                "id",
+                "product_tmpl_id",
+                "product_id",
+                "partner_id",
+                "price",
+                "min_qty",
+                "delay",
+                "currency_id",
+            ),
         },
         sensitive={},
     )

@@ -223,6 +223,69 @@
       ],
       "hidden_requirements": []
     },
+    "procurement.create_supplier": {
+      "doctype": "res.partner",
+      "op": "upsert",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "name"
+      ],
+      "hidden_requirements": [],
+      "dedup_keys": [
+        [
+          "email",
+          "supplier_rank"
+        ],
+        [
+          "name",
+          "supplier_rank"
+        ]
+      ],
+      "compensation": {
+        "verb": "crm.delete_contact",
+        "arg_map": {
+          "id": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "procurement.link_supplier": {
+      "doctype": "product.supplierinfo",
+      "op": "upsert",
+      "tier": "MEDIUM",
+      "reversibility": "REVERSIBLE",
+      "required": [
+        "product_ref",
+        "supplier_ref"
+      ],
+      "hidden_requirements": [],
+      "dedup_keys": [
+        [
+          "product_tmpl_id",
+          "partner_id"
+        ]
+      ],
+      "compensation": {
+        "verb": "procurement.unlink_supplier",
+        "arg_map": {
+          "link_ref": "$.result.entity.id"
+        },
+        "tier": "HIGH",
+        "window": "P30D"
+      }
+    },
+    "procurement.unlink_supplier": {
+      "doctype": "product.supplierinfo",
+      "op": "delete",
+      "tier": "HIGH",
+      "reversibility": "IRREVERSIBLE",
+      "required": [
+        "link_ref"
+      ],
+      "hidden_requirements": []
+    },
     "purchase.confirm_order": {
       "doctype": "purchase.order",
       "op": "method",

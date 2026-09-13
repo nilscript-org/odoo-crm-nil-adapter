@@ -39,7 +39,13 @@ def args_for(verb_name: str) -> dict:
     # the trade made above for `positive`, where the harness's convenience was dictating the
     # product's honesty.
     if verb.op == "upsert" and verb.dedup_keys:
-        args.setdefault(verb.dedup_keys[0], "x")
+        # A dedup_keys entry is a single field name (unchanged) OR a tuple of field names — a
+        # compound key, seeded field-by-field (fix round 1, procurement.link_supplier: a tuple
+        # itself is not a valid arg-dict key or JSON payload key, so `.setdefault(entry, "x")`
+        # would crash the POST below the moment ANY verb's dedup_keys[0] is a compound entry).
+        first = verb.dedup_keys[0]
+        for field in (first if isinstance(first, tuple) else (first,)):
+            args.setdefault(field, "x")
     return args
 
 

@@ -48,7 +48,37 @@ class WriteVerb:
     entity_type: str
     # for op="upsert": native fields probed (in order) to find an existing record before writing —
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
-    dedup_keys: tuple[str, ...] = ()
+    # Each entry is one of:
+    #   - a single field name (OR semantics: that ONE field's value alone identifies the record);
+    #   - a `tuple[str, ...]` of field names — a COMPOUND key, probed as one AND-of-EQUALITIES domain
+    #     against whatever `to_native` wrote (edge.py's op=upsert dispatch, generalized fix round 1)
+    #     — for an identity no single field can carry on its own (e.g. a link keyed on
+    #     (parent_id, child_id));
+    #   - a compound group of fully-resolved domain TRIPLES, `tuple[tuple[str, str, Any], ...]` — e.g.
+    #     `(("email", "=", "a@b.c"), ("supplier_rank", ">", 0))` (I4 re-review, fix round 2) — for an
+    #     identity that needs a RANGE or other non-equality predicate the plain field-name shape
+    #     cannot express at all (equality-only against `native`). Every value here is already resolved
+    #     by the verb's own `dedup_probe`, never sourced from `native`. `edge.py`'s `_is_domain_group`
+    #     tells the two compound shapes apart by TUPLE SHAPE alone — still vendor-neutral.
+    dedup_keys: tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...] = ()
+    # Fix round 1 (Task 1.3b, D-concern-1): `dedup_keys`' OR semantics tries EVERY declared entry in
+    # order and stops at the first hit — which is right when the keys are alternative spellings of
+    # the SAME identity (crm.create_contact's email-or-phone: whichever the caller happened to give
+    # names the same contact). It is WRONG when the keys are TIERS of a fallback — "probe email when
+    # given; consult name only when it is not" — because a genuinely NEW record whose email search
+    # comes up empty still falls through to the name search, and two unrelated records that merely
+    # share a display name can silently merge just because the caller also passed a fresh email.
+    #
+    # `dedup_probe`, when set, is a PURE function of the raw NIL args that narrows `dedup_keys` down
+    # to the ordered subset that actually applies to THIS call — e.g. `("email",)` when an email was
+    # given, `("name",)` when it was not, never both. `edge.py` only ever CALLS this (via
+    # `dedup_probe_keys`); it never branches on a business field name itself, so the mechanism stays
+    # vendor-neutral. Left `None` (the default) preserves every existing verb's behaviour exactly:
+    # `dedup_probe_keys` falls back to trying the full `dedup_keys` tuple, first hit wins.
+    dedup_probe: (
+        Callable[[dict[str, Any]], tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...]]
+        | None
+    ) = None
     method: str | None = (
         None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
     )
@@ -107,6 +137,14 @@ class WriteVerb:
 
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
+
+    def dedup_probe_keys(
+        self, args: dict[str, Any]
+    ) -> tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...]:
+        """The dedup_keys entries to actually probe FOR THIS CALL. Delegates to `dedup_probe` when
+        the verb declares one (a per-call narrowing — see its docstring above); otherwise returns the
+        full declared `dedup_keys` unchanged, which is every verb's behaviour today."""
+        return self.dedup_probe(args) if self.dedup_probe is not None else self.dedup_keys
 
     def nonpositive(self, args: dict[str, Any]) -> list[str]:
         """Declared `positive` args that are absent, non-numeric, or <= 0 — the uncomputable set."""
@@ -1085,6 +1123,220 @@ PURCHASE_CONFIRM_ORDER = WriteVerb(
     entity_type="purchase_order",
 )
 
+# ── procurement.link_supplier / unlink_supplier (Task 1.3, D37/D38/O3 — fix round 1) ──────────────
+# Coordinator ruling (fix round 1): a write not on the governed wire does not exist for this
+# platform. The earlier `translate.run()` direct-execution surface is GONE — these are now real
+# `WriteVerb` entries in WRITE_VERBS, declared in `/nil/v0.1/describe`, committed through `edge.py`'s
+# ordinary PROPOSE→COMMIT exactly like every other curated verb.
+#
+# `to_native` is PURE (no I/O, per translate.py:1): the lookup this task originally needed
+# (`sku` → `product_tmpl_id`) moves to the CALLER. Args are `{product_ref, supplier_ref, price?,
+# min_qty?, delay_days?, sku?}` — `product_ref` is the product TEMPLATE's id in the record system,
+# `supplier_ref` the partner id (both strings the caller already resolved: the control plane / the
+# os-server hold both in the Odoo mirror, `sku_by_tmpl`/`sku_by_variant`). `sku` is a display-only
+# passthrough this verb never writes (it earns its slot in `supported_args` so it is never flagged
+# `ignored` at PROPOSE — carrying it is deliberate, not a mistake).
+def _to_native_link_supplier(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → the `product.supplierinfo` fields this verb writes. `sku`, if given, is display-only
+    and never lands here — see the module comment above."""
+    doc: dict[str, Any] = {}
+    if args.get("product_ref"):
+        doc["product_tmpl_id"] = _maybe_int(args["product_ref"])
+    if args.get("supplier_ref"):
+        doc["partner_id"] = _maybe_int(args["supplier_ref"])
+    if args.get("price") is not None:
+        doc["price"] = _maybe_float(args["price"])
+    if args.get("min_qty") is not None:
+        doc["min_qty"] = _maybe_float(args["min_qty"])
+    if args.get("delay_days") is not None:
+        doc["delay"] = _maybe_float(args["delay_days"])
+    return doc
+
+
+PROCUREMENT_LINK_SUPPLIER = WriteVerb(
+    verb="procurement.link_supplier",
+    recovery_shape="convergent",
+    recovery_note=(
+        "upserts on the REQUIRED compound pair (product_tmpl_id, partner_id) — edge.py's op=upsert "
+        "dedup now probes tuple entries as an AND-group (fix round 1), so a retry converges on the "
+        "existing link instead of minting a second one"
+    ),
+    tier="MEDIUM",
+    doctype="product.supplierinfo",
+    op="upsert",
+    required=("product_ref", "supplier_ref"),
+    to_native=_to_native_link_supplier,
+    preview=lambda a: {
+        "en": f"Link supplier {a.get('supplier_ref', '')} to product "
+        f"{a.get('sku') or a.get('product_ref', '')}"
+        + (f" at {a['price']}" if a.get("price") is not None else ""),
+        "ar": f"ربط المورد {a.get('supplier_ref', '')} بالمنتج "
+        f"{a.get('sku') or a.get('product_ref', '')}"
+        + (f" بسعر {a['price']}" if a.get("price") is not None else ""),
+    },
+    entity_type="product_supplier_link",
+    # A compound (AND-probed) key — see the generalized `dedup_keys` handling in edge.py's op=upsert
+    # dispatch. Every OTHER dedup_keys entry in this file stays a single field name (OR semantics,
+    # unchanged); this is the one compound entry.
+    dedup_keys=(("product_tmpl_id", "partner_id"),),
+    supported_args=("product_ref", "supplier_ref", "price", "min_qty", "delay_days", "sku"),
+)
+
+# `procurement.unlink_supplier` identifies the record by ITS OWN id (`link_ref`), obtained by the
+# caller from a prior `nil.search`/`nil.get` on the `ProductSupplier` resource (which already
+# exposes the raw `id`) — the SAME idiom every other curated delete verb in this file uses
+# (`crm.delete_lead`/`lead_id`, `crm.delete_contact`/`contact_id`, `purchase.delete_order`/
+# `order_id`). This is a deliberate choice, not an oversight: `edge.py`'s `op="delete"` dispatch
+# resolves its record via `_resolve_id(client, doctype, args[required[0]])`, which is a SINGLE-FIELD
+# lookup — using `product_ref` (a product TEMPLATE's id) or `supplier_ref` (a partner id) directly
+# there would risk an id COLLISION across unrelated models (Odoo ids are per-table sequences, so
+# `product.template` #7 and `product.supplierinfo` #7 can both exist as unrelated rows) — an
+# `op="delete"` call could target and remove the WRONG supplier-link. `link_ref` is the
+# `product.supplierinfo` record's own id: an exact match, safe by construction.
+PROCUREMENT_UNLINK_SUPPLIER = WriteVerb(
+    verb="procurement.unlink_supplier",
+    # IRREVERSIBLE, and this is a DEVIATION from the fix round 1 ruling ("unlink COMPENSABLE by
+    # re-create from the before-image") — see the concern filed in the Task 1.3 report for the full
+    # argument. Short version: `edge.py`'s curated `op="delete"` branch never reads the record before
+    # deleting it (unlike its `op="update"` branch, which captures a before-image via
+    # `_before_image_reversal`, and unlike the GENERIC `resource.delete` path, which already does
+    # `before = client.get(...)` for exactly this reason) — so NOTHING beyond the deleted record's own
+    # id survives into `compensate()`'s `result` for any curated delete, this one included. Declaring
+    # COMPENSABLE while `compensate()` cannot actually rebuild `product_ref`/`supplier_ref`/`price`/
+    # `min_qty`/`delay_days` from an id alone would be exactly the kind of governance-envelope lie
+    # this codebase's own history (M8's dual-PO saga, the C3 RESOURCES-shape fix) exists to prevent —
+    # a declared reversibility the platform cannot actually perform. The honest fix is one more line
+    # in edge.py's delete branch (capture `before = client.get(verb.doctype, record_id)` before the
+    # delete, mirroring the update branch exactly) — outside this round's ONE permitted edit.
+    recovery_shape="convergent",
+    recovery_note="deletes an existing link_ref, and the edge re-reads to confirm ABSENCE — a second unlink is a no-op",
+    # C1 (final review): every OTHER delete in this adapter is HIGH (crm.delete_lead, crm.delete_contact,
+    # purchase.delete_order — this adapter's own stated rule is `_CRUD_TIERS = {..., "delete": "HIGH"}`,
+    # governance.py:60). This verb was the single MEDIUM exception, and MEDIUM auto-executes with no
+    # human in the loop — exactly wrong for an IRREVERSIBLE delete that captures no before-image. The
+    # fix-round-1 ruling that accepted IRREVERSIBLE here did so ON THE PREMISE that HIGH tier parks it
+    # for a human (progress.md:74); declaring MEDIUM broke that premise. HIGH, like every other delete.
+    tier="HIGH",
+    doctype="product.supplierinfo",
+    op="delete",
+    required=("link_ref",),
+    to_native=_to_native_delete,
+    preview=lambda a: {
+        "en": f"Unlink supplier from product-supplier link {a.get('link_ref', '')}",
+        "ar": f"إلغاء ربط المورد من سجل ربط المورد بالمنتج {a.get('link_ref', '')}",
+    },
+    entity_type="product_supplier_link",
+    supported_args=("link_ref",),
+)
+
+# ── procurement.create_supplier (Task 1.3b): a res.partner Odoo can be the SUPPLIER record for ────
+# `ManageSuppliers.create` (baseline capability) routes here when the operator's Supplier authority
+# is Odoo. Odoo has no separate "vendor" table — a supplier IS a `res.partner` with `supplier_rank`
+# raised above zero, the exact counter `Supplier`'s base domain already reads (`RESOURCE_DOMAINS`
+# above). So this verb writes the SAME model `crm.create_contact` writes, deliberately: it stamps
+# `supplier_rank: 1` and leaves `customer_rank` untouched (Odoo's own default, 0) — a record this
+# verb creates is a vendor, never a customer, and a `Supplier` read finds it immediately because the
+# base domain and this verb's write agree on the same field.
+def _to_native_create_supplier(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL args → an Odoo `res.partner` scoped as a supplier. `is_company` is always True (a supplier
+    is a business, never a person) — unlike `crm.create_contact`, it is not an optional input here."""
+    doc: dict[str, Any] = {"name": args["name"], "is_company": True, "supplier_rank": 1}
+    for nil_key, odoo_key in (
+        ("email", "email"),
+        ("phone", "phone"),
+        ("vat", "vat"),
+    ):
+        if args.get(nil_key):
+            doc[odoo_key] = args[nil_key]
+    return doc
+
+
+# Fix round 1 (Task 1.3b, D-concern-1): a plain OR-probed `dedup_keys=("email","name")` would try
+# `email` first and, on a miss, ALSO try `name` — so a genuinely NEW supplier whose email search
+# comes up empty could still merge into an UNRELATED existing supplier that merely shares a display
+# name. That is wrong: when the caller gave an email, `name` must never be consulted at all. The
+# ruling is exact — email given → probe email ONLY; email absent → probe name ONLY, never both in
+# the same call. `dedup_probe` (translate.py's `WriteVerb`, `edge.py`'s `dedup_probe_keys`) expresses
+# that as a pure per-call narrowing so `edge.py` stays vendor-neutral: it only ever calls this
+# function, it never itself knows that "email" or "name" are the fields in play.
+#
+# I4 (final review): the probe used to search `res.partner` UNSCOPED by rank, so a genuinely new
+# supplier's email could converge onto an existing CUSTOMER-ONLY partner and silently rename it while
+# the signed preview still read "Create supplier «X»". Ruling: scope EVERY probed entry by the SAME
+# base domain the read side already enforces for `Supplier` (`RESOURCE_DOMAINS["Supplier"]`,
+# `supplier_rank > 0`) — a customer-only partner (no `supplier_rank`, or `0`) is never a match, so the
+# create proceeds and mints its own record; Odoo's own uniqueness (if any) answers from there.
+#
+# I4 fix round 2 (re-review Important finding): the first cut scoped this via a COMPOUND
+# equality-group — `(<identity field>, "supplier_rank")`, probed as `identity = <value> AND
+# supplier_rank = 1` — reusing `procurement.link_supplier`'s existing compound-key mechanism as-is.
+# That is WRONG: `supplier_rank` in real Odoo is a CUMULATIVE counter (Odoo increments it on
+# confirmed purchase orders/vendor bills), not a boolean pinned at 1 — a genuinely pre-existing
+# supplier that has been used on more than one PO can carry `supplier_rank` of 2 or higher, and
+# `supplier_rank = 1` would not match it, silently minting a DUPLICATE `res.partner` on a repeat call
+# with that supplier's own email. Odoo's own `> 0` domain (the exact predicate `RESOURCE_DOMAINS`
+# already declares for `Supplier` reads) is a RANGE, which the compound equality-group cannot express
+# at all — no value `to_native` could ever write makes `field = value` mean `field > 0` for every
+# value greater than zero.
+#
+# The fix: return a compound group of fully-resolved DOMAIN TRIPLES instead —
+# `(identity, "=", <the given value>), ("supplier_rank", ">", 0)` — which `edge.py`'s
+# `_is_domain_group` recognizes and ANDs verbatim as `[[identity, "=", value], ["supplier_rank", ">",
+# 0]]`, matching ANY existing supplier regardless of its actual rank, while still excluding a
+# customer-only partner (rank 0, or the field absent entirely — `_triple`'s `>` comparison treats a
+# missing/`None` value as failing the predicate). `edge.py` still only inspects TUPLE SHAPE and calls
+# this function — it never itself knows "supplier_rank" is the field in play.
+#
+# A person who wants to promote an existing CUSTOMER to a supplier does so explicitly (e.g. a future
+# verb, or a direct `resource.update`) — this verb's dedup is deliberately narrow, not a general
+# partner-merge tool.
+def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[tuple[tuple[str, str, Any], ...], ...]:
+    identity = "email" if args.get("email") else "name"
+    return (((identity, "=", args.get(identity)), ("supplier_rank", ">", 0)),)
+
+
+PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
+    verb="procurement.create_supplier",
+    # Convergent by the SAME C3.5 discipline as `crm.create_contact`/`crm.create_client`: an upsert
+    # with nothing to deduplicate on is a blind create wearing an upsert's name. The difference here
+    # is that `name` (this verb's only REQUIRED arg) is itself the fallback member of `dedup_keys` —
+    # so, unlike create_contact (whose dedup set is email/phone, neither required), this verb can
+    # never actually reach C3.5's keyless-create refusal: a name is always present. That is a
+    # deliberate reading of the brief ("dedup on email when given, else on name"), not an oversight —
+    # a real supplier always has a name, and probing it when no email was given converges a retry
+    # onto the same vendor instead of minting a duplicate purely because the caller wrote the name
+    # only once.
+    recovery_shape="convergent",
+    recovery_note=(
+        "upserts on email when given, name ONLY when it is not (dedup_probe narrows the call to "
+        "exactly one of the two — never both — so an unrelated supplier sharing a display name can "
+        "never merge just because a fresh email was also given; fix round 1, D-concern-1), and EACH "
+        "probe is a domain-triple group scoped by supplier_rank>0 — a true range, not equality — so "
+        "a customer-only partner is never the match AND an existing supplier of any rank still "
+        "converges (I4, fix round 2)"
+    ),
+    tier="MEDIUM",
+    doctype="res.partner",
+    op="upsert",
+    required=("name",),
+    to_native=_to_native_create_supplier,
+    preview=lambda a: {
+        "en": f"Create supplier “{a.get('name', '')}”"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+        "ar": f"إنشاء مورد «{a.get('name', '')}»"
+        + (f" <{a['email']}>" if a.get("email") else ""),
+    },
+    entity_type="supplier",
+    # Documentation / wire (`describe`, manifest, the "identity" field) only — `dedup_probe` is
+    # ALWAYS set below and (`name` being required) NEVER returns empty for this verb, so the C3.5
+    # fallback that would otherwise consult this tuple is UNREACHABLE at runtime; the actual per-call
+    # domain (equality on email-or-name AND supplier_rank > 0 — a real range, I4 fix round 2) can only
+    # be expressed with a concrete per-call value, which a static declaration cannot carry. Kept as
+    # symbolic field-name pairs so the wire still names the two fields this verb keys on.
+    dedup_keys=(("email", "supplier_rank"), ("name", "supplier_rank")),
+    dedup_probe=_dedup_probe_create_supplier,
+)
+
 # ── the universal read data plane (nil.*): lean, filtered, paginated, governed ────────────────────
 # These delegate to the shared `ReadPlane` (projection + byte-cap-refuse + capability fallback + read
 # authz + export/bulk gating). The edge dispatches them through QUERY_VERBS like any read verb; engine
@@ -1140,11 +1392,54 @@ def _grant(args: dict[str, Any]) -> tuple[str, ...]:
     return tuple(reveal) if reveal else ()
 
 
+# D37 (Task 1.1): every nil.* read verb used to hand `args["target"]` straight to the plane — a
+# business name (`Customer`) the backend has no table for → CAPABILITY_UNSUPPORTED, even though
+# `nil.intent` (below) already resolved the identical name correctly. `_resolved_target` makes the
+# SAME call `nil.intent` makes (`_OdooBindings().resolve_target`) the FIRST thing every read verb does,
+# so a business name resolves before it ever reaches the plane — never after.
+def _resolved_target(args: dict[str, Any]) -> str:
+    return _OdooBindings().resolve_target(args.get("target", ""))
+
+
+# I1 (final review): the `Supplier` projection (packs.py's own `vat`-carrying entry, keyed by the
+# BUSINESS name) was unreachable — every real read resolved to the native model (`res.partner`)
+# BEFORE calling the plane, so `describe_target` always matched the shared `res.partner` entry
+# (Customer's) and a `Supplier` read could never see `vat`, even with `reveal`. Ruling: the plane's
+# projection is chosen by the RESOURCE when the caller named one (an EXACT declared key — "Supplier",
+# not a case-insensitive or aliased guess), falling back to the fully resolved native model for a
+# native name or an unrecognized string — today's behaviour, unchanged. `OdooReadBackend.describe_target`
+# (read_plane.py) already tries the exact name first, then the native model; this is the missing half
+# that actually HANDS it the exact name instead of resolving it away first.
+def _target_for_plane(args: dict[str, Any]) -> str:
+    about = args.get("target", "")
+    return about if about in RESOURCES else _resolved_target(args)
+
+
+# Odoo triple op → the NIL predicate op it round-trips through (the read plane's own `_to_domain`
+# undoes this on the way back out). Only the ops a `base_filter_for` entry can plausibly use.
+_TRIPLE_OP_TO_NIL: dict[str, str] = {
+    "=": "eq", "!=": "ne", ">": "gt", ">=": "gte", "<": "lt", "<=": "lte", "in": "in",
+}
+
+
+def _filter_with_base(args: dict[str, Any]) -> list[dict[str, Any]]:
+    """D37 (Task 1.2): prepend the resource's fixed base domain (e.g. `supplier_rank > 0`) to the
+    caller's filter, keyed on the ORIGINAL business name — never the resolved model, which by then
+    can no longer tell `Customer` and `Supplier` apart. A native model name (no RESOURCES entry)
+    contributes no base predicate, so today's behaviour is unchanged."""
+    base = [
+        {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value}
+        for field, op, value in base_filter_for(args.get("target", ""))
+    ]
+    return [*base, *(args.get("filter") or [])]
+
+
 def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    resource = args.get("target", "")
     try:
-        return _plane(client).search(
-            args["target"],
-            filter=args.get("filter") or [],
+        result = _plane(client).search(
+            _target_for_plane(args),
+            filter=_translate_product_supplier_filter(client, resource, _filter_with_base(args)),
             fields=args.get("fields"),
             limit=int(args.get("limit") or 50),
             cursor=args.get("cursor"),
@@ -1152,24 +1447,60 @@ def _run_nil_search(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         )
     except _READ_REFUSALS as exc:
         return _refusal(exc)
+    return _project_product_supplier_items(client, resource, result)
 
 
 def _run_nil_count(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
-        return _plane(client).count(args["target"], filter=args.get("filter") or [])
+        return _plane(client).count(_target_for_plane(args), filter=_filter_with_base(args))
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
 
+def _id_satisfies_domain(plane: Any, resource: str, native: str, record_id: Any) -> bool:
+    """Whether `record_id` on `native` satisfies `resource`'s fixed base domain (fix round 1, C2/C1) —
+    checked via a SCOPED EXISTENCE COUNT rather than inspecting a fetched record's fields, because the
+    domain's own field (`supplier_rank`) is not part of the resource's curated read projection and a
+    projected `get()` result would not carry it at all. No domain declared (or no id given) is
+    vacuously true — a native model name keeps today's unfiltered behaviour.
+
+    I3 (final review): this used to fail OPEN — a refused scoped count returned `True`, letting the
+    caller's own (unscoped) `get` proceed and potentially hand back a record outside the domain. The
+    comment that reasoning relied on only holds for a TARGET-level refusal (unprovisioned/out-of-scope
+    model), where the caller's own read fails identically either way; it does NOT hold for a refusal
+    caused by this count's own extra predicate. Fail CLOSED: propagate the refusal — every caller
+    (`_run_nil_get`'s own try/except, `_run_nil_intent` via `_ScopedPlane`) already turns a propagated
+    `_READ_REFUSALS` member into a structured `refused` outcome, never a 500 and never a silent
+    `{"found": False}` that would read exactly like an ordinary miss."""
+    base = base_filter_for(resource)
+    if not base or record_id is None:
+        return True
+    base_preds = [
+        {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value} for field, op, value in base
+    ]
+    result = plane.count(native, filter=[*base_preds, {"field": "id", "op": "eq", "value": record_id}])
+    return bool(result.get("count", 0))
+
+
 def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
+        resource = args.get("target", "")
+        native = _resolved_target(args)
+        record_id = args.get("id")
+        # Fix round 1, C2: `ReadPlane.get()` takes no `filter` — resolving the target alone (Task 1.1)
+        # let a `Supplier` fetch return ANY partner, including a pure customer. A record outside the
+        # resource's base domain answers the SAME shape a missing id answers — never the record itself.
+        if not _id_satisfies_domain(_plane(client), resource, native, record_id):
+            return {"found": False, "id": record_id}
         rec = _plane(client).get(
-            args["target"],
-            record_id=args.get("id"),
+            _target_for_plane(args),
+            record_id=record_id,
             fields=args.get("fields"),
             grant_fields=_grant(args),
         )
-        return rec if rec is not None else {"found": False, "id": args.get("id")}
+        if rec is None:
+            return {"found": False, "id": record_id}
+        return _project_product_supplier_row(client, resource, rec)
     except _READ_REFUSALS as exc:
         return _refusal(exc)
 
@@ -1177,8 +1508,8 @@ def _run_nil_get(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
 def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         return _plane(client).aggregate(
-            args["target"],
-            filter=args.get("filter") or [],
+            _target_for_plane(args),
+            filter=_filter_with_base(args),
             group_by=args["group_by"],
             metrics=tuple(args.get("metrics") or ("count",)),
         )
@@ -1189,8 +1520,8 @@ def _run_nil_aggregate(client: SystemClient, args: dict[str, Any]) -> dict[str, 
 def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     try:
         handle = _plane(client).export(
-            args["target"],
-            filter=args.get("filter") or [],
+            _target_for_plane(args),
+            filter=_filter_with_base(args),
             fields=args.get("fields"),
             tenant=str(args.get("tenant") or "default"),
             now=datetime.now(UTC),
@@ -1206,9 +1537,6 @@ def _run_nil_export(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         }
     except _READ_REFUSALS as exc:
         return _refusal(exc)
-
-
-_RESOLVERS: "weakref.WeakKeyDictionary[Any, Any]" = weakref.WeakKeyDictionary()
 
 
 class _OdooBindings:
@@ -1241,23 +1569,103 @@ class _OdooBindings:
         return attr
 
 
-def _resolver(client: SystemClient) -> Any:
-    r = _RESOLVERS.get(client)
-    if r is None:
-        r = IntentResolver(_plane(client), _OdooBindings())
-        _RESOLVERS[client] = r
-    return r
+class _ScopedPlane:
+    """Fix round 1, C1: `nil.intent` bypassed Supplier/Customer scoping entirely, because
+    `IntentResolver.resolve()` (third-party, out of adapter scope — `nilscript/dataplane/intent.py`)
+    calls `self._bind.resolve_target(intent.about)` and hands the plane only the RESOLVED model
+    string; the `BindingResolver` protocol has no hook to also carry a base domain. This wraps the
+    real `ReadPlane` and, for every search/count/aggregate/export call whose `target` is the
+    resource's native model, prepends `base_filter_for(resource)` — the exact thing `_filter_with_base`
+    does for the direct `nil.search`/`nil.count`/... verbs (Task 1.1/1.2), just applied one layer up
+    since this call site cannot touch the caller's filter before the resolver builds it. `get` is not
+    filterable at all (same reason as `_run_nil_get`, C2), so it enforces the domain by REFUSING
+    (returning `None`, the plane's own not-found shape) instead."""
+
+    def __init__(self, plane: Any, resource: str, native: str) -> None:
+        self._plane = plane
+        self._resource = resource
+        self._native = native
+
+    def _scoped_filter(self, target: str, filt: Any) -> Any:
+        if target != self._native:  # an unrelated/native target passed straight through — unfiltered
+            return filt
+        base = [
+            {"field": field, "op": _TRIPLE_OP_TO_NIL[op], "value": value}
+            for field, op, value in base_filter_for(self._resource)
+        ]
+        return [*base, *(filt or [])]
+
+    def _plane_target(self, target: str) -> str:
+        """I1 (final review): route to the RESOURCE's own name (so `describe_target` can pick its OWN
+        projection — e.g. `Supplier`'s `vat`-carrying entry, packs.py) when this call's target is the
+        native model we are scoping, mirroring `_target_for_plane`'s choice for the direct `nil.*`
+        verbs. Only an EXACT declared resource name earns this — `IntentResolver` always resolves
+        `intent.about` to `self._native` before calling us, so `self._resource` (the RAW `about`) is
+        only trustworthy as a schema key when it is itself one of the declared canonical names; a case
+        variant or an already-native model name keeps resolving to the plain native schema, unchanged."""
+        return self._resource if target == self._native and self._resource in RESOURCES else target
+
+    def search(self, target, *, filter, fields, limit, cursor=None, grant_fields=None):  # noqa: A002
+        return self._plane.search(
+            self._plane_target(target), filter=self._scoped_filter(target, filter), fields=fields,
+            limit=limit, cursor=cursor, grant_fields=grant_fields,
+        )
+
+    def count(self, target, *, filter):  # noqa: A002
+        return self._plane.count(self._plane_target(target), filter=self._scoped_filter(target, filter))
+
+    def aggregate(self, target, *, filter, group_by, metrics):  # noqa: A002
+        return self._plane.aggregate(
+            self._plane_target(target), filter=self._scoped_filter(target, filter), group_by=group_by,
+            metrics=metrics,
+        )
+
+    def export(self, target, *, filter, fields, tenant, now, approved=False, grant_fields=None):  # noqa: A002
+        return self._plane.export(
+            self._plane_target(target), filter=self._scoped_filter(target, filter), fields=fields,
+            tenant=tenant, now=now, approved=approved, grant_fields=grant_fields,
+        )
+
+    def get(self, target, *, record_id, fields, grant_fields=None):
+        # I3: `_id_satisfies_domain` no longer swallows a refused scope check into `True` — a refusal
+        # here propagates to `_run_nil_intent`'s own `except _READ_REFUSALS`, never silently `None`.
+        #
+        # Re-review note (parked minor, not a defect): this method is UNREACHABLE from its one
+        # construction site. `_run_nil_intent` builds `IntentResolver(plane, _OdooBindings())` and
+        # calls `.resolve(intent)`; `IntentResolver.resolve()` (nilscript/dataplane/intent.py) only
+        # ever calls `self._plane.count`/`.search`/`.aggregate` for its four `seek` shapes — it never
+        # calls `.get()`, even for `seek="the"` (a single-record lookup), which goes through
+        # `.search(..., limit=1)` instead. This was equally true, and equally dead, before I3 (the OLD
+        # `except _READ_REFUSALS: return True` here was just as unreachable). Kept as defensive code
+        # matching `_run_nil_get`'s real, exercised behavior in case a future `IntentResolver` gains a
+        # `seek="the"` path that calls `.get()` directly — not because anything calls it today.
+        if target == self._native and not _id_satisfies_domain(
+            self._plane, self._resource, self._native, record_id
+        ):
+            return None
+        return self._plane.get(
+            self._plane_target(target), record_id=record_id, fields=fields, grant_fields=grant_fields
+        )
 
 
 def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
     """The single intent payload: build an Intent and resolve it deterministically over the ReadPlane.
-    The caller selects no verb and builds no filter — the system owns the mechanics."""
+    The caller selects no verb and builds no filter — the system owns the mechanics.
+
+    Fix round 1, C1: a fresh `IntentResolver` is built per call (no longer cached per client) over a
+    `_ScopedPlane` derived from THIS call's `about` — the resource can differ every call, so a single
+    cached resolver could not carry a fixed scope. `resource`/`native` are computed with the SAME
+    `_OdooBindings().resolve_target` the resolver itself calls internally on `intent.about`, so the
+    proxy's notion of "the resolved model" always matches what `IntentResolver` actually passes it."""
     where = tuple(
         Binding(attr=b.get("attr"), rel=b.get("rel"), value=b.get("value"))
         for b in (args.get("where") or [])
     )
+    resource = args.get("about", "")
+    native = _OdooBindings().resolve_target(resource)
+    plane = _ScopedPlane(_plane(client), resource, native)
     intent = Intent(
-        about=args.get("about", ""),
+        about=resource,
         where=where,
         seek=args.get("seek", "all"),
         by=args.get("by"),
@@ -1265,11 +1673,25 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
         cursor=args.get("cursor"),
     )
     try:
-        outcome = _resolver(client).resolve(intent)
+        outcome = IntentResolver(plane, _OdooBindings()).resolve(intent)
     except (
         SystemError
     ) as exc:  # an upstream (Odoo) fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "UPSTREAM_ERROR", "message": str(exc)}
+    # I3 (final review): a propagated read-plane refusal (e.g. the scoped existence count behind
+    # `_ScopedPlane.get` failing closed) carries its own precise code/message — surface it exactly as
+    # `_run_nil_get` does, before the generic catch-all below flattens it to an undifferentiated
+    # INTENT_ERROR.
+    #
+    # Re-review note (parked minor, not a defect): as `_ScopedPlane.get` documents, `IntentResolver`
+    # never actually calls `.get()`, so THIS clause is unreachable today too — `resolve()` already
+    # catches `ResultTooLarge`/`CapabilityUnsupported`/`InvalidFilter` internally
+    # (nilscript/dataplane/intent.py) from its own `count`/`search`/`aggregate` calls and returns an
+    # `Outcome.refusal(...)`, handled below by `outcome.kind == "refusal"` — never raises them out to
+    # here. Kept for the same reason `_ScopedPlane.get`'s guard is kept: correct if `.get()` is ever
+    # wired in, and free (it does not shadow or change behavior for the paths that ARE exercised).
+    except _READ_REFUSALS as exc:
+        return _refusal(exc)
     except Exception as exc:  # noqa: BLE001 — any resolution fault is a structured refusal, never a 500
         return {"outcome": "refused", "code": "INTENT_ERROR", "message": str(exc)}
     if outcome.kind == "refusal":
@@ -1306,20 +1728,227 @@ QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
 # (Wave A). Odoo already serves the universal read plane, so every resource here is readable; the ones
 # with write verbs are fully ownable.
 #
-# Deliberately NOT declared: `PurchaseInvoice` and `Supplier`. Odoo spells a purchase invoice as
-# `account.move` — the SAME model as a customer invoice — and a supplier as `res.partner`, the same
-# model as a customer. Those are not two resources to Odoo; they are one model wearing two hats. If we
-# declared them, a native target would denote two different resources and routing would have to guess
-# which one a call meant. It would guess wrong eventually, silently, and in the ledger. So Odoo simply
-# does not claim to be the system of record for things it cannot tell apart.
+# FIX (review C3, fix round 1): `RESOURCES` stays `dict[str, str]` — the exact shape it has always
+# had — because `edge.py:1236` puts it on the wire VERBATIM as `describe()["resources"]`, and
+# `nilscript-controlplane`'s `resource_authority.py` (`build_target_index`, `adapter_resources`)
+# already parses that field as a plain model-name string for every resource this adapter declares
+# (Customer, Lead, Invoice, Payment, Product, PurchaseOrder). Changing the VALUE type there — even to
+# add one new resource — is a breaking change to a live cross-repo handshake, not an adapter-local
+# decision. The base domain that disambiguates `Supplier`/`Customer` lives in the SEPARATE
+# `RESOURCE_DOMAINS` map below instead, which nothing outside this adapter reads.
+#
+# `PurchaseInvoice` is still NOT declared: Odoo spells it `account.move`, the SAME model as a customer
+# invoice, and (unlike Customer/Supplier) there is no field on `account.move` that cleanly partitions
+# "a purchase invoice" from "a customer invoice" the way `supplier_rank`/`customer_rank` partition
+# `res.partner` — `move_type` does, but declaring it here would need the same base-domain treatment as
+# Supplier below, and nothing has asked for a governed PurchaseInvoice read yet. Left undeclared on
+# purpose, not by oversight: an undeclared resource still passes through as a native target
+# (`account.move`) unfiltered, so nothing is lost — it just isn't offered as its own business name.
+#
+# `Supplier` WAS the second half of "one model, two hats" — Odoo spells both a customer and a supplier
+# as `res.partner`, so a bare native target could not tell them apart, and declaring both without a
+# disambiguator would make routing guess. The fix is not to guess: `res.partner` carries
+# `customer_rank`/`supplier_rank` counters Odoo itself uses to mean exactly this distinction, so each
+# resource declares the counter as its base domain (in `RESOURCE_DOMAINS`, not here). A `Supplier`
+# read can only ever see partners with `supplier_rank > 0`; a `Customer` read keeps `supplier_rank`'s
+# twin, `customer_rank > 0`. Two resources, two domains, one model — resolved by declaration, never by
+# inference at read time.
 RESOURCES: dict[str, str] = {
     "Customer": "res.partner",
+    "Supplier": "res.partner",
     "Lead": "crm.lead",
     "Invoice": "account.move",
     "Payment": "account.payment",
     "Product": "product.product",
     "PurchaseOrder": "purchase.order",
+    # Task 1.3 (D37/D38/O3): the product<->supplier link. Odoo's own model for it —
+    # `product.supplierinfo` — is not shared with any other declared resource, so (unlike
+    # Supplier/Customer) it needs no base-domain disambiguation; it is declared here for the same
+    # reason every other resource is: a business name the agent asks about, not Odoo's own word.
+    "ProductSupplier": "product.supplierinfo",
 }
+
+# The fixed base domain (Odoo triples) that scopes a resource sharing its model with another. A
+# resource absent here (or present with `[]`) is read unfiltered — including every resource that was
+# already declared before this task. Kept OUT of `RESOURCES` itself so the wire `describe()` field
+# never changes value type (see the comment above `RESOURCES`).
+#
+# I5 (final review, ACCEPTED as-is): a caller that names the NATIVE model directly (`res.partner`,
+# never a resource in this map) reads BOTH Customer and Supplier unfiltered — deliberately, not an
+# oversight. Bypassing the business vocabulary to address Odoo's own table name is the caller's own
+# choice, made with full knowledge of what that table holds; the resource base domains above exist to
+# disambiguate the BUSINESS NAMES, not to retroactively police a caller who chose not to use one.
+RESOURCE_DOMAINS: dict[str, list[tuple[str, str, Any]]] = {
+    "Customer": [("customer_rank", ">", 0)],
+    "Supplier": [("supplier_rank", ">", 0)],
+}
+
+
+def native_model(resource: str) -> str:
+    """The native Odoo model for a declared business resource name; the value unchanged for anything
+    else (a native model name, or an unknown noun the engine will refuse on its own)."""
+    return RESOURCES.get(resource, resource)
+
+
+def base_filter_for(resource: str) -> list[tuple[str, str, Any]]:
+    """The fixed Odoo-domain triples that disambiguate a resource sharing its model with another
+    (`Supplier`/`Customer` both on `res.partner`). Empty for a resource with no ambiguity to resolve,
+    and for anything not declared at all — a native model name keeps today's unfiltered behaviour."""
+    return list(RESOURCE_DOMAINS.get(resource, []))
+
+
+def describe() -> dict[str, Any]:
+    """A translate-local mirror of the wire `/nil/v0.1/describe`'s `resources` field (business name →
+    native model — a plain string, exactly what `edge.describe()` has always put on the wire), for
+    tests that want the declared resource vocabulary without spinning up the edge."""
+    return {"resources": dict(RESOURCES)}
+
+
+# ── ProductSupplier (Task 1.3, D37/D38/O3): a read-side projection over `product.supplierinfo` ────
+# The curated read fields (packs.py) are Odoo's own native names (`product_tmpl_id`, `product_id`,
+# `partner_id`, …) — os-server keys a link by (`sku`, `supplier_id`), which are NOT native fields.
+# These helpers translate a caller's filter on the exposed names into the real ones (never sending
+# Odoo a field it doesn't have), and add the exposed names onto every row the plane returns.
+_PRODUCT_SUPPLIER_MODEL = "product.supplierinfo"
+_PRODUCT_SUPPLIER_FILTER_ALIASES: dict[str, str] = {"supplier_id": "partner_id"}
+
+
+def _resolve_sku(client: SystemClient, sku: str) -> tuple[int | None, int | None]:
+    """(product_id, product_tmpl_id) for a SKU (`product.product.default_code`) — (None, None) if no
+    product carries it. Never raises: an unknown sku is the CALLER's refusal to report, not this
+    lookup's — the caller decides what "not found" means for its own verb."""
+    if not sku:
+        return None, None
+    rows = client.search(
+        "product.product", [["default_code", "=", sku]], fields=("id", "product_tmpl_id"), limit=1
+    )
+    if not rows:
+        return None, None
+    pid = rows[0].get("id")
+    tmpl = rows[0].get("product_tmpl_id")
+    if isinstance(tmpl, (list, tuple)):  # a real Odoo many2one comes back as [id, label]
+        tmpl = tmpl[0] if tmpl else None
+    tmpl_id = int(tmpl) if tmpl is not None else (int(pid) if pid is not None else None)
+    return (int(pid) if pid is not None else None, tmpl_id)
+
+
+def _unwrap_ref(value: Any) -> Any:
+    """A real Odoo many2one comes back as `[id, label]`; the plain id (or scalar value), unwrapped.
+    `None`-safe, and a no-op for a value that is already scalar."""
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
+def _as_int_id(value: Any) -> int | None:
+    unwrapped = _unwrap_ref(value)
+    try:
+        return int(unwrapped) if unwrapped is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+# I2 (final review): `_lookup_default_code` did up to TWO XML-RPC round trips PER ROW (one by
+# `product_id`, one falling back to `product_tmpl_id`) — for os-server's mirror poller (PAGE_LIMIT=200
+# x MAX_PAGES=50), up to ~20,000 serial calls against the customer's live Odoo per sync tick. Batched:
+# collect the WHOLE page's `product_id`/`product_tmpl_id` sets up front and resolve each set in ONE
+# `search_read`, so a page costs at most two calls total — not two per row.
+def _batch_default_codes(
+    client: SystemClient, rows: list[dict[str, Any]]
+) -> dict[tuple[str, int], str]:
+    """`{("id", product_id) | ("product_tmpl_id", tmpl_id): default_code}` for every id referenced
+    across `rows` — the batched replacement for calling `_lookup_default_code` once per row."""
+    product_ids = {i for i in (_as_int_id(r.get("product_id")) for r in rows) if i is not None}
+    tmpl_ids = {i for i in (_as_int_id(r.get("product_tmpl_id")) for r in rows) if i is not None}
+    codes: dict[tuple[str, int], str] = {}
+    if product_ids:
+        for r in client.search(
+            "product.product", [["id", "in", sorted(product_ids)]],
+            fields=("id", "default_code"), limit=len(product_ids),
+        ):
+            if r.get("default_code"):
+                codes[("id", int(r["id"]))] = str(r["default_code"])
+    if tmpl_ids:
+        # Several variants can share one template; any variant's own code stands in for the template's
+        # (the original per-row lookup made the same arbitrary "first match" choice via `limit=1`,
+        # unordered) — the bound below is generous, not unbounded: a page-sized set of templates times
+        # a realistic variant fan-out, never "search everything".
+        for r in client.search(
+            "product.product", [["product_tmpl_id", "in", sorted(tmpl_ids)]],
+            fields=("product_tmpl_id", "default_code"), limit=max(len(tmpl_ids) * 20, 200),
+        ):
+            tmpl_id = _as_int_id(r.get("product_tmpl_id"))
+            if tmpl_id is not None and r.get("default_code"):
+                codes.setdefault(("product_tmpl_id", tmpl_id), str(r["default_code"]))
+    return codes
+
+
+def _is_product_supplier(resource: str) -> bool:
+    return native_model(resource) == _PRODUCT_SUPPLIER_MODEL
+
+
+def _translate_product_supplier_filter(
+    client: SystemClient, resource: str, filt: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """A `ProductSupplier` filter is written against the EXPOSED names (`sku`, `supplier_id`), which
+    are not real `product.supplierinfo` fields — sending them to Odoo verbatim would raise "invalid
+    field". `sku` resolves through a live lookup to the real `product_tmpl_id`; `supplier_id` is a
+    plain rename to `partner_id`. Any other resource, or a target with no ambiguity to resolve,
+    passes through unchanged."""
+    if not _is_product_supplier(resource) or not filt:
+        return filt
+    out: list[dict[str, Any]] = []
+    for clause in filt:
+        field = clause.get("field")
+        if field == "sku":
+            _, tmpl_id = _resolve_sku(client, str(clause.get("value", "")))
+            out.append({**clause, "field": "product_tmpl_id", "value": tmpl_id})
+        elif field in _PRODUCT_SUPPLIER_FILTER_ALIASES:
+            out.append({**clause, "field": _PRODUCT_SUPPLIER_FILTER_ALIASES[field]})
+        else:
+            out.append(clause)
+    return out
+
+
+def _project_product_supplier_row(
+    client: SystemClient, resource: str, row: dict[str, Any], codes: dict[tuple[str, int], str] | None = None
+) -> dict[str, Any]:
+    """Add the exposed `sku`/`supplier_id` keys to one raw `product.supplierinfo` read row — never
+    removing Odoo's own field names, so a caller that already reads `partner_id` keeps working.
+
+    `codes` is the batched `{("id"|"product_tmpl_id", id): default_code}` map (I2) a page-level caller
+    (`_project_product_supplier_items`) already resolved for the WHOLE page in ≤2 calls; a lone-row
+    caller (`_run_nil_get`) omits it and this falls back to a one-row batch — still ≤2 calls, just not
+    shared with any other row."""
+    if not _is_product_supplier(resource) or not isinstance(row, dict):
+        return row
+    out = dict(row)
+    partner = _unwrap_ref(row.get("partner_id"))
+    if partner is not None:
+        out["supplier_id"] = str(partner)
+    lookup = codes if codes is not None else _batch_default_codes(client, [row])
+    product_id = _as_int_id(row.get("product_id"))
+    tmpl_id = _as_int_id(row.get("product_tmpl_id"))
+    sku = lookup.get(("id", product_id)) if product_id is not None else None
+    if sku is None and tmpl_id is not None:
+        sku = lookup.get(("product_tmpl_id", tmpl_id))
+    if sku:
+        out["sku"] = sku
+    return out
+
+
+def _project_product_supplier_items(
+    client: SystemClient, resource: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    """The same projection, applied to every item of a `nil.search`/`nil.export`-shaped result — the
+    default-code lookup is batched ONCE for the whole page (I2), never once per row."""
+    if not _is_product_supplier(resource) or not isinstance(result, dict) or not result.get("items"):
+        return result
+    codes = _batch_default_codes(client, result["items"])
+    return {
+        **result,
+        "items": [_project_product_supplier_row(client, resource, r, codes) for r in result["items"]],
+    }
 
 
 def entity_ref(verb: WriteVerb, created: dict[str, Any]) -> dict[str, Any]:

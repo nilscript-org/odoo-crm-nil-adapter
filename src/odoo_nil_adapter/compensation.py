@@ -5,8 +5,9 @@ like any other action — never a silent write. A verb absent from `COMPENSATION
 (the honest default): ROLLBACK of its effect REFUSES with code IRREVERSIBLE.
 
 What's reversible here:
-  • crm.create_lead    → crm.delete_lead    (REVERSIBLE — the created record is removed)
-  • crm.create_contact → crm.delete_contact (REVERSIBLE)
+  • crm.create_lead              → crm.delete_lead    (REVERSIBLE — the created record is removed)
+  • crm.create_contact           → crm.delete_contact (REVERSIBLE)
+  • procurement.create_supplier  → crm.delete_contact (REVERSIBLE — same res.partner, same reversal)
 Left IRREVERSIBLE on the semantic path: crm.update_lead_stage, crm.delete_lead, crm.delete_contact.
 (For reversible field updates/deletes, use the generic `resource.update`/`resource.delete` family —
 the edge captures a before-image there and synthesizes a COMPENSABLE restore/recreate.)
@@ -36,6 +37,18 @@ COMPENSATIONS: dict[str, dict[str, Any]] = {
     # Odoo refuses the unlink and the edge reports that refusal as a terminal failure — which is what
     # a compensation owes its caller. A reversal that cannot run is not a reversal.
     "purchase.create_order": {"reversibility": "REVERSIBLE", "verb": "purchase.delete_order"},
+    # Task 1.3 (D37/D38/O3, fix round 1): the product<->supplier link. `procurement.unlink_supplier`
+    # is intentionally ABSENT from this table (IRREVERSIBLE) — see its WriteVerb docstring in
+    # translate.py for the full reasoning: edge.py's curated `op="delete"` branch never captures a
+    # before-image, so a "COMPENSABLE by re-create" declaration here would be undeliverable at
+    # ROLLBACK time. Only the CREATE direction is honestly reversible.
+    "procurement.link_supplier": {"reversibility": "REVERSIBLE", "verb": "procurement.unlink_supplier"},
+    # Task 1.3b: `procurement.create_supplier` writes the SAME `res.partner` model create_contact
+    # does (only the rank field differs), so it reuses the SAME reversal — exactly the precedent
+    # `crm.create_client` already set above for the identical reason ("same res.partner upsert as
+    # create_contact, same reversal"). No new delete verb: `crm.delete_contact` already deletes a
+    # `res.partner` by id, and it does not care which rank field put the record there.
+    "procurement.create_supplier": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
 }
 
 # READS ARE NOT LISTED HERE, AND THAT IS A DECISION, NOT AN OMISSION.
@@ -56,6 +69,7 @@ _COMP_ID_ARG: dict[str, str] = {
     "crm.delete_lead": "lead_id",
     "crm.delete_contact": "contact_id",
     "purchase.delete_order": "order_id",
+    "procurement.unlink_supplier": "link_ref",
 }
 
 
