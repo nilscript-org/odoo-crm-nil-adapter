@@ -48,11 +48,19 @@ class WriteVerb:
     entity_type: str
     # for op="upsert": native fields probed (in order) to find an existing record before writing —
     # so an at-least-once webhook retry updates the identity instead of duplicating it (the moat).
-    # Each entry is either a single field name (OR semantics: that ONE field's value alone
-    # identifies the record) or a `tuple[str, ...]` — a COMPOUND key, probed as one AND-of-equalities
-    # domain (edge.py's op=upsert dispatch, generalized fix round 1) — for an identity no single
-    # field can carry on its own (e.g. a link keyed on (parent_id, child_id)).
-    dedup_keys: tuple[str | tuple[str, ...], ...] = ()
+    # Each entry is one of:
+    #   - a single field name (OR semantics: that ONE field's value alone identifies the record);
+    #   - a `tuple[str, ...]` of field names — a COMPOUND key, probed as one AND-of-EQUALITIES domain
+    #     against whatever `to_native` wrote (edge.py's op=upsert dispatch, generalized fix round 1)
+    #     — for an identity no single field can carry on its own (e.g. a link keyed on
+    #     (parent_id, child_id));
+    #   - a compound group of fully-resolved domain TRIPLES, `tuple[tuple[str, str, Any], ...]` — e.g.
+    #     `(("email", "=", "a@b.c"), ("supplier_rank", ">", 0))` (I4 re-review, fix round 2) — for an
+    #     identity that needs a RANGE or other non-equality predicate the plain field-name shape
+    #     cannot express at all (equality-only against `native`). Every value here is already resolved
+    #     by the verb's own `dedup_probe`, never sourced from `native`. `edge.py`'s `_is_domain_group`
+    #     tells the two compound shapes apart by TUPLE SHAPE alone — still vendor-neutral.
+    dedup_keys: tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...] = ()
     # Fix round 1 (Task 1.3b, D-concern-1): `dedup_keys`' OR semantics tries EVERY declared entry in
     # order and stops at the first hit — which is right when the keys are alternative spellings of
     # the SAME identity (crm.create_contact's email-or-phone: whichever the caller happened to give
@@ -67,7 +75,10 @@ class WriteVerb:
     # `dedup_probe_keys`); it never branches on a business field name itself, so the mechanism stays
     # vendor-neutral. Left `None` (the default) preserves every existing verb's behaviour exactly:
     # `dedup_probe_keys` falls back to trying the full `dedup_keys` tuple, first hit wins.
-    dedup_probe: Callable[[dict[str, Any]], tuple[str | tuple[str, ...], ...]] | None = None
+    dedup_probe: (
+        Callable[[dict[str, Any]], tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...]]
+        | None
+    ) = None
     method: str | None = (
         None  # for op="method": the Odoo model method to invoke (e.g. "message_post")
     )
@@ -127,7 +138,9 @@ class WriteVerb:
     def missing(self, args: dict[str, Any]) -> list[str]:
         return [field for field in self.required if not args.get(field)]
 
-    def dedup_probe_keys(self, args: dict[str, Any]) -> tuple[str | tuple[str, ...], ...]:
+    def dedup_probe_keys(
+        self, args: dict[str, Any]
+    ) -> tuple[str | tuple[str, ...] | tuple[tuple[str, str, Any], ...], ...]:
         """The dedup_keys entries to actually probe FOR THIS CALL. Delegates to `dedup_probe` when
         the verb declares one (a per-call narrowing — see its docstring above); otherwise returns the
         full declared `dedup_keys` unchanged, which is every verb's behaviour today."""
@@ -1252,18 +1265,34 @@ def _to_native_create_supplier(args: dict[str, Any]) -> dict[str, Any]:
 # the signed preview still read "Create supplier «X»". Ruling: scope EVERY probed entry by the SAME
 # base domain the read side already enforces for `Supplier` (`RESOURCE_DOMAINS["Supplier"]`,
 # `supplier_rank > 0`) — a customer-only partner (no `supplier_rank`, or `0`) is never a match, so the
-# create proceeds and mints its own record; Odoo's own uniqueness (if any) answers from there. Each
-# entry becomes a COMPOUND (AND-probed) key — `(<identity field>, "supplier_rank")` — the exact
-# mechanism `procurement.link_supplier` already generalized in edge.py's op=upsert dispatch.
-# `_to_native_create_supplier` stamps `supplier_rank: 1` UNCONDITIONALLY (never from caller input), so
-# the equality check is satisfied by every record this verb itself ever creates or updates.
+# create proceeds and mints its own record; Odoo's own uniqueness (if any) answers from there.
+#
+# I4 fix round 2 (re-review Important finding): the first cut scoped this via a COMPOUND
+# equality-group — `(<identity field>, "supplier_rank")`, probed as `identity = <value> AND
+# supplier_rank = 1` — reusing `procurement.link_supplier`'s existing compound-key mechanism as-is.
+# That is WRONG: `supplier_rank` in real Odoo is a CUMULATIVE counter (Odoo increments it on
+# confirmed purchase orders/vendor bills), not a boolean pinned at 1 — a genuinely pre-existing
+# supplier that has been used on more than one PO can carry `supplier_rank` of 2 or higher, and
+# `supplier_rank = 1` would not match it, silently minting a DUPLICATE `res.partner` on a repeat call
+# with that supplier's own email. Odoo's own `> 0` domain (the exact predicate `RESOURCE_DOMAINS`
+# already declares for `Supplier` reads) is a RANGE, which the compound equality-group cannot express
+# at all — no value `to_native` could ever write makes `field = value` mean `field > 0` for every
+# value greater than zero.
+#
+# The fix: return a compound group of fully-resolved DOMAIN TRIPLES instead —
+# `(identity, "=", <the given value>), ("supplier_rank", ">", 0)` — which `edge.py`'s
+# `_is_domain_group` recognizes and ANDs verbatim as `[[identity, "=", value], ["supplier_rank", ">",
+# 0]]`, matching ANY existing supplier regardless of its actual rank, while still excluding a
+# customer-only partner (rank 0, or the field absent entirely — `_triple`'s `>` comparison treats a
+# missing/`None` value as failing the predicate). `edge.py` still only inspects TUPLE SHAPE and calls
+# this function — it never itself knows "supplier_rank" is the field in play.
 #
 # A person who wants to promote an existing CUSTOMER to a supplier does so explicitly (e.g. a future
 # verb, or a direct `resource.update`) — this verb's dedup is deliberately narrow, not a general
 # partner-merge tool.
-def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+def _dedup_probe_create_supplier(args: dict[str, Any]) -> tuple[tuple[tuple[str, str, Any], ...], ...]:
     identity = "email" if args.get("email") else "name"
-    return ((identity, "supplier_rank"),)
+    return (((identity, "=", args.get(identity)), ("supplier_rank", ">", 0)),)
 
 
 PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
@@ -1282,7 +1311,9 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
         "upserts on email when given, name ONLY when it is not (dedup_probe narrows the call to "
         "exactly one of the two — never both — so an unrelated supplier sharing a display name can "
         "never merge just because a fresh email was also given; fix round 1, D-concern-1), and EACH "
-        "probe is scoped by supplier_rank>0 so a customer-only partner is never the match (I4)"
+        "probe is a domain-triple group scoped by supplier_rank>0 — a true range, not equality — so "
+        "a customer-only partner is never the match AND an existing supplier of any rank still "
+        "converges (I4, fix round 2)"
     ),
     tier="MEDIUM",
     doctype="res.partner",
@@ -1296,10 +1327,12 @@ PROCUREMENT_CREATE_SUPPLIER = WriteVerb(
         + (f" <{a['email']}>" if a.get("email") else ""),
     },
     entity_type="supplier",
-    # The declared possible keys (documentation, describe/manifest, and the C3.5 fallback when no
-    # `dedup_probe` narrowing is available) — unchanged in SHAPE (compound AND-groups, I4): the actual
-    # per-call narrowing always goes through `dedup_probe` below, which selects exactly one of these
-    # two groups for a given call.
+    # Documentation / wire (`describe`, manifest, the "identity" field) only — `dedup_probe` is
+    # ALWAYS set below and (`name` being required) NEVER returns empty for this verb, so the C3.5
+    # fallback that would otherwise consult this tuple is UNREACHABLE at runtime; the actual per-call
+    # domain (equality on email-or-name AND supplier_rank > 0 — a real range, I4 fix round 2) can only
+    # be expressed with a concrete per-call value, which a static declaration cannot carry. Kept as
+    # symbolic field-name pairs so the wire still names the two fields this verb keys on.
     dedup_keys=(("email", "supplier_rank"), ("name", "supplier_rank")),
     dedup_probe=_dedup_probe_create_supplier,
 )
@@ -1596,6 +1629,16 @@ class _ScopedPlane:
     def get(self, target, *, record_id, fields, grant_fields=None):
         # I3: `_id_satisfies_domain` no longer swallows a refused scope check into `True` — a refusal
         # here propagates to `_run_nil_intent`'s own `except _READ_REFUSALS`, never silently `None`.
+        #
+        # Re-review note (parked minor, not a defect): this method is UNREACHABLE from its one
+        # construction site. `_run_nil_intent` builds `IntentResolver(plane, _OdooBindings())` and
+        # calls `.resolve(intent)`; `IntentResolver.resolve()` (nilscript/dataplane/intent.py) only
+        # ever calls `self._plane.count`/`.search`/`.aggregate` for its four `seek` shapes — it never
+        # calls `.get()`, even for `seek="the"` (a single-record lookup), which goes through
+        # `.search(..., limit=1)` instead. This was equally true, and equally dead, before I3 (the OLD
+        # `except _READ_REFUSALS: return True` here was just as unreachable). Kept as defensive code
+        # matching `_run_nil_get`'s real, exercised behavior in case a future `IntentResolver` gains a
+        # `seek="the"` path that calls `.get()` directly — not because anything calls it today.
         if target == self._native and not _id_satisfies_domain(
             self._plane, self._resource, self._native, record_id
         ):
@@ -1639,6 +1682,14 @@ def _run_nil_intent(client: SystemClient, args: dict[str, Any]) -> dict[str, Any
     # `_ScopedPlane.get` failing closed) carries its own precise code/message — surface it exactly as
     # `_run_nil_get` does, before the generic catch-all below flattens it to an undifferentiated
     # INTENT_ERROR.
+    #
+    # Re-review note (parked minor, not a defect): as `_ScopedPlane.get` documents, `IntentResolver`
+    # never actually calls `.get()`, so THIS clause is unreachable today too — `resolve()` already
+    # catches `ResultTooLarge`/`CapabilityUnsupported`/`InvalidFilter` internally
+    # (nilscript/dataplane/intent.py) from its own `count`/`search`/`aggregate` calls and returns an
+    # `Outcome.refusal(...)`, handled below by `outcome.kind == "refusal"` — never raises them out to
+    # here. Kept for the same reason `_ScopedPlane.get`'s guard is kept: correct if `.get()` is ever
+    # wired in, and free (it does not shadow or change behavior for the paths that ARE exercised).
     except _READ_REFUSALS as exc:
         return _refusal(exc)
     except Exception as exc:  # noqa: BLE001 — any resolution fault is a structured refusal, never a 500

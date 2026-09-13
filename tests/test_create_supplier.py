@@ -220,6 +220,50 @@ def test_e_an_existing_supplier_sharing_the_email_still_converges(
     assert fake_client.docs["res.partner"][0]["phone"] == "0500000000"
 
 
+# ── I4 fix round 2 (re-review Important finding): supplier_rank is a CUMULATIVE Odoo counter, not a
+# boolean pinned at 1 — a real, actively-used supplier can sit at rank >= 2. The equality-based fix
+# (round 1) could not detect this because its OWN test's "existing supplier" was always created by
+# `_to_native_create_supplier`, which always stamps exactly 1. This fixture is seeded DIRECTLY —
+# never through that function — so the record's rank is genuinely 3, the way a real Odoo instance
+# would carry it after two confirmed purchase orders.
+def test_f_an_existing_supplier_at_rank_three_still_converges_no_duplicate(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    fake_client.docs["res.partner"] = [
+        {"name": "Established Vendor Co", "email": "vendor@x.example", "is_company": True,
+         "supplier_rank": 3},
+    ]
+    client = _client(fake_client)
+
+    created = _commit(
+        client, "procurement.create_supplier",
+        {"name": "Established Vendor Co", "email": "vendor@x.example"},
+    )
+
+    assert created["state"] == "executed"
+    # The load-bearing assertion: NO create happened at all — a strict `supplier_rank = 1` equality
+    # probe would have missed this record (3 != 1) and minted a duplicate here.
+    assert fake_client.created.get("res.partner", 0) == 0
+    assert len(fake_client.docs["res.partner"]) == 1
+
+
+# ── I4 fix round 2: the field-name probe path of every OTHER verb is byte-for-byte unchanged ───────
+# (see tests/test_dedup_domain_groups.py for the direct shape-detection unit proof; these two confirm
+# it end to end for the two verb families whose dedup predates this fix).
+def test_crm_create_contact_dedup_is_unaffected_by_the_domain_group_mechanism(
+    fake_client: _CountingFakeSystem,
+) -> None:
+    # `name` held identical across both calls on purpose — see test_e's docstring above: FakeSystem
+    # has no separate numeric id, so varying it would shift what `entity.id` reads back as.
+    client = _client(fake_client)
+    first = _commit(client, "crm.create_contact", {"name": "Same Contact", "email": "same@x.example"})
+    second = _commit(
+        client, "crm.create_contact", {"name": "Same Contact", "email": "same@x.example", "phone": "1"}
+    )
+    assert first["result"]["entity"]["id"] == second["result"]["entity"]["id"]
+    assert fake_client.created["res.partner"] == 1
+
+
 # ── compensation: REVERSIBLE, reusing crm.delete_contact (same res.partner, same reversal) ────────
 def test_compensation_is_reversible_via_delete_contact() -> None:
     spec = compensation.COMPENSATIONS["procurement.create_supplier"]
