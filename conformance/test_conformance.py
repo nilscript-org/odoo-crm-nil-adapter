@@ -613,3 +613,18 @@ def test_describe_exposes_skeleton() -> None:
     for name, t in targets.items():
         assert isinstance(t, dict) and "exists" in t and "fields" in t, f"{name}: target needs exists+fields"
     assert all(t["exists"] for t in targets.values()), "FakeSystem targets are always provisioned"
+
+
+def test_describe_declares_history_capability() -> None:
+    # entity-history E1: describe SAYS which history reads this adapter supports, in one closed
+    # block, so the BFF can tell a person "current state only" instead of pretending. Appendix E
+    # proved none of the four reads exist against Odoo today — every key is honestly False except
+    # `current` (the record as it is now, which every adapter already answers via resource.read).
+    client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
+    d = client.get("/nil/v0.1/describe").json()
+    assert d.get("history") == {
+        "current": True,
+        "changes": False,
+        "movements": False,
+        "messages": False,
+    }, "describe must declare exactly the four history keys, current True and the rest honestly False"
