@@ -1124,6 +1124,13 @@ _CHANGES_MODEL = "mail.message"
 _CHANGES_FIELDS: tuple[str, ...] = (
     "id", "message_type", "subtype_id", "author_id", "subject", "body", "date", "write_date",
 )
+# Live-gate scouting finding (W5 T1 follow-up): a Product's chatter is normally posted on its
+# TEMPLATE (`product.template`), not on the variant (`product.product`) that `RESOURCES["Product"]`
+# resolves to — so a naive `model=product.product, res_id=<variant id>` domain comes back EMPTY on
+# a real instance while `describe()` says `changes: true`. That is exactly the failure this adapter
+# must never produce: "nothing happened" read as "I looked in the wrong place". For Product ONLY,
+# `history.changes` reads BOTH models and merges.
+_PRODUCT_TEMPLATE_MODEL = "product.template"
 
 
 def _require_history_int(raw: Any) -> int | None:
@@ -1174,6 +1181,14 @@ def _flatten_m2o(value: Any) -> Any:
     return value if value else None
 
 
+def _m2o_id(value: Any) -> int | None:
+    """The ID half of a many2one value (`[id, "Label"]` over XML-RPC; a bare int is also accepted,
+    for a stand-in that stores it unwrapped). Falsy → no linked record, never fabricated as 0."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return _require_history_int(value[0])
+    return _require_history_int(value) if value else None
+
+
 def _plain_text(html: Any, *, limit: int = 280) -> str | None:
     """`mail.message.body` is HTML; the answer carries plain text, never markup, bounded to
     `limit` chars — a chatter note can be arbitrarily long; the history item is a summary of it,
@@ -1185,17 +1200,23 @@ def _plain_text(html: Any, *, limit: int = 280) -> str | None:
     return text[:limit]
 
 
-def _history_fields(client: SystemClient, model: str, curated: tuple[str, ...]) -> tuple[str, ...]:
-    """The curated field list, pruned to what THIS instance's live schema actually has — the same
-    idea `read_plane.py`'s projection uses: intersect against `client.schema(model)` when it answers
-    a real shape (module/version drift — e.g. `quantity` vs `quantity_done`), keep verbatim when it
-    answers empty/None (a fake, or an instance exposing no metadata). `id` is always kept."""
+def _history_fields(
+    client: SystemClient, model: str, curated: tuple[str, ...]
+) -> tuple[tuple[str, ...], list[str]]:
+    """(fields, missing) — the curated field list pruned to what THIS instance's live schema
+    actually has (the same idea `read_plane.py`'s projection uses: intersect against
+    `client.schema(model)` when it answers a real shape — module/version drift, e.g. `quantity` vs
+    `quantity_done` — keep verbatim when it answers empty/None, a fake or an instance exposing no
+    metadata; `id` is always kept), PLUS which curated names the live schema does not have at all.
+    Pruning silently degrades a request that names a field this instance lacks; `missing` is how a
+    wrong field name stays VISIBLE on the wire instead of just disappearing into a thinner answer."""
     field_meta = client.schema(model)
     if not field_meta:
-        return curated
+        return curated, []
     available = {f.get("name") for f in field_meta}
+    missing = [f for f in curated if f != "id" and f not in available]
     pruned = tuple(f for f in curated if f == "id" or f in available)
-    return pruned or curated
+    return (pruned or curated), missing
 
 
 def _history_limit(args: dict[str, Any]) -> tuple[int | None, dict[str, Any] | None]:
@@ -1287,7 +1308,7 @@ def _run_history_movements(client: SystemClient, args: dict[str, Any]) -> dict[s
     domain: list[list[Any]] = [["product_id", "=", rid], ["state", "=", "done"]]
     if before_native is not None:
         domain.append(["date", "<", before_native])
-    fields = _history_fields(client, _MOVEMENTS_MODEL, _MOVEMENTS_FIELDS)
+    fields, missing_fields = _history_fields(client, _MOVEMENTS_MODEL, _MOVEMENTS_FIELDS)
     try:
         rows = client.search(_MOVEMENTS_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
     except SystemError as exc:
@@ -1295,8 +1316,34 @@ def _run_history_movements(client: SystemClient, args: dict[str, Any]) -> dict[s
     items = [_movement_item(r) for r in rows]
     return {
         "resource": resource, "record_id": str(rid), "model": _MOVEMENTS_MODEL,
-        "items": items, "count": len(items), "limit": limit,
+        "items": items, "count": len(items), "limit": limit, "missing_fields": missing_fields,
     }
+
+
+def _product_changes_domains(
+    client: SystemClient, variant_model: str, rid: int
+) -> tuple[list[tuple[str, list[list[Any]]]], dict[str, Any] | None]:
+    """(domains, refusal) for a Product's `history.changes` — Odoo chatter for a product is
+    normally posted on the TEMPLATE (`product.template`), not the variant `RESOURCES["Product"]`
+    resolves to. Reading only the variant's `mail.message` rows comes back empty on a real
+    instance while `describe()` says `changes: true` — "nothing happened" read as "I looked in the
+    wrong place". So: resolve the variant's `product_tmpl_id` with ONE read, and search BOTH
+    models. The resolving read ITSELF failing (a SystemError) refuses `UPSTREAM_UNAVAILABLE` —
+    never a guess at completeness; the variant simply not existing (no rows, no exception) is a
+    legitimate "nothing to resolve", so the caller proceeds on the variant domain alone."""
+    domains: list[tuple[str, list[list[Any]]]] = [
+        (variant_model, [["model", "=", variant_model], ["res_id", "=", rid]])
+    ]
+    try:
+        rows = client.search(variant_model, [["id", "=", rid]], fields=("id", "product_tmpl_id"), limit=1)
+    except SystemError as exc:
+        return [], {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+    tmpl_id = _m2o_id(rows[0].get("product_tmpl_id")) if rows else None
+    if tmpl_id is not None:
+        domains.append(
+            (_PRODUCT_TEMPLATE_MODEL, [["model", "=", _PRODUCT_TEMPLATE_MODEL], ["res_id", "=", tmpl_id]])
+        )
+    return domains, None
 
 
 def _run_history_changes(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
@@ -1326,18 +1373,34 @@ def _run_history_changes(client: SystemClient, args: dict[str, Any]) -> dict[str
             "outcome": "refused", "code": "MODULE_DISABLED",
             "message": f"{model} is not in the operator-enabled module scope",
         }
-    domain: list[list[Any]] = [["model", "=", model], ["res_id", "=", rid]]
+    if resource == "Product":
+        domains, resolve_refusal = _product_changes_domains(client, model, rid)
+        if resolve_refusal is not None:
+            return resolve_refusal
+    else:
+        domains = [(model, [["model", "=", model], ["res_id", "=", rid]])]
     if before_native is not None:
-        domain.append(["date", "<", before_native])
-    fields = _history_fields(client, _CHANGES_MODEL, _CHANGES_FIELDS)
-    try:
-        rows = client.search(_CHANGES_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
-    except SystemError as exc:
-        return {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+        domains = [(m, d + [["date", "<", before_native]]) for m, d in domains]
+    fields, missing_fields = _history_fields(client, _CHANGES_MODEL, _CHANGES_FIELDS)
+    seen_ids: set[Any] = set()
+    rows: list[dict[str, Any]] = []
+    for _m, domain in domains:
+        try:
+            found = client.search(_CHANGES_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
+        except SystemError as exc:
+            return {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+        for row in found:
+            row_id = row.get("id")
+            if row_id in seen_ids:  # merging variant + template chatter must never double-count
+                continue
+            seen_ids.add(row_id)
+            rows.append(row)
+    rows.sort(key=lambda r: (str(r.get("date") or ""), r.get("id") or 0), reverse=True)
+    rows = rows[:limit]
     items = [_change_item(r) for r in rows]
     return {
         "resource": resource, "record_id": str(rid), "model": _CHANGES_MODEL,
-        "items": items, "count": len(items), "limit": limit,
+        "items": items, "count": len(items), "limit": limit, "missing_fields": missing_fields,
     }
 
 

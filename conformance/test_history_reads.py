@@ -100,6 +100,37 @@ def _seeded_messages() -> FakeSystem:
     return sys
 
 
+def _seeded_product_messages() -> FakeSystem:
+    """A stand-in that mirrors Odoo's real template/variant split: the product VARIANT
+    (`product.product`, id 55) links to its TEMPLATE (`product.tmpl_id` -> 77, the many2one shape
+    XML-RPC hands back), and the chatter that matters lives on the TEMPLATE — exactly the live-gate
+    scouting finding (`Product` -> `product.product`, but chatter is normally posted on
+    `product.template`)."""
+    sys = FakeSystem()
+    sys.docs["product.product"] = [{"id": 55, "product_tmpl_id": [77, "Widget"]}]
+    sys.docs["mail.message"] = [
+        {
+            "id": 20, "model": "product.product", "res_id": 55,
+            "date": "2026-03-01 08:00:00", "write_date": "2026-03-01 08:00:00",
+            "message_type": "comment", "subtype_id": [2, "Note"],
+            "author_id": [5, "Sara"], "subject": "Variant note", "body": "<p>variant chatter</p>",
+        },
+        {  # the TEMPLATE's own chatter — where a real Odoo product's messages normally live
+            "id": 21, "model": "product.template", "res_id": 77,
+            "date": "2026-03-02 08:00:00", "write_date": "2026-03-02 08:00:00",
+            "message_type": "comment", "subtype_id": [2, "Note"],
+            "author_id": [6, "Nour"], "subject": "Template note", "body": "<p>template chatter</p>",
+        },
+        {  # a DIFFERENT template — must never leak in
+            "id": 22, "model": "product.template", "res_id": 999,
+            "date": "2026-03-03 08:00:00", "write_date": "2026-03-03 08:00:00",
+            "message_type": "comment", "subtype_id": [2, "Note"],
+            "author_id": [6, "Nour"], "subject": "Wrong template", "body": "<p>x</p>",
+        },
+    ]
+    return sys
+
+
 def _client(sys: FakeSystem) -> TestClient:
     return TestClient(create_app(sys, CapturingEmitter(), bearer=None), raise_server_exceptions=False)
 
@@ -258,3 +289,108 @@ class TestDeclaredEverywhere:
             assert "tier" not in entry and "reversibility" not in entry
             assert entry["required"] == list(QUERY_VERBS[verb].required)
             assert entry["target"] == QUERY_VERBS[verb].target
+
+
+class TestProductChangesReadsBothVariantAndTemplate:
+    """Live-gate scouting finding: `Product` -> `product.product`, but Odoo posts a product's
+    chatter on `product.template`. `history.changes` for a Product must read BOTH and merge —
+    otherwise it silently comes back empty on a real instance ("nothing happened" read as "I
+    looked in the wrong place"), while `describe()` says `changes: true`."""
+
+    def test_merges_variant_and_template_chatter_newest_first(self) -> None:
+        data = _query(_client(_seeded_product_messages()), "history.changes",
+                      {"resource": "Product", "record_id": "55"})
+        assert data["resource"] == "Product"
+        assert data["record_id"] == "55"
+        assert data["model"] == "mail.message"
+        ids = [item["id"] for item in data["items"]]
+        # id 21 lives on the TEMPLATE (product.template/77) — WITHOUT the fix, a domain of
+        # model=product.product, res_id=55 alone would never find it, and the answer would be
+        # [20] (or even [] if the variant itself carries no chatter): a false "nothing happened".
+        assert ids == [21, 20], "the template's own chatter (21) must be found, not just the variant's (20)"
+        assert data["count"] == 2
+
+    def test_the_wrong_templates_chatter_never_leaks_in(self) -> None:
+        data = _query(_client(_seeded_product_messages()), "history.changes",
+                      {"resource": "Product", "record_id": "55"})
+        ids = {item["id"] for item in data["items"]}
+        assert 22 not in ids
+
+    def test_limit_still_bounds_the_merged_result(self) -> None:
+        data = _query(_client(_seeded_product_messages()), "history.changes",
+                      {"resource": "Product", "record_id": "55", "limit": "1"})
+        assert [item["id"] for item in data["items"]] == [21]
+        assert data["limit"] == 1
+
+    def test_dedup_by_message_id_across_variant_and_template(self) -> None:
+        sys = _seeded_product_messages()
+        original_search = sys.search
+        mail_calls: list[tuple[str, list]] = []
+
+        def _search(target: str, domain: list, **kw: object) -> list:
+            if target == "mail.message":
+                mail_calls.append((target, domain))
+                # simulate the SAME message id surfacing from both the variant and template
+                # domain calls — dedup must collapse it to one item, never double-count.
+                return [{
+                    "id": 20, "model": "product.product", "res_id": 55,
+                    "date": "2026-03-01 08:00:00", "write_date": "2026-03-01 08:00:00",
+                    "message_type": "comment", "subtype_id": [2, "Note"], "author_id": [5, "Sara"],
+                    "subject": "Variant note", "body": "<p>variant chatter</p>",
+                }]
+            return original_search(target, domain, **kw)  # type: ignore[arg-type]
+
+        sys.search = _search  # type: ignore[method-assign]
+        data = _query(_client(sys), "history.changes", {"resource": "Product", "record_id": "55"})
+        assert [item["id"] for item in data["items"]] == [20]
+        assert data["count"] == 1
+        assert len(mail_calls) == 2, "both the variant AND the template domain must actually be queried"
+
+    def test_template_resolution_failure_refuses_not_an_empty_list(self) -> None:
+        sys = _seeded_product_messages()
+        original_search = sys.search
+
+        def _boom(target: str, domain: list, **kw: object) -> list:
+            if target == "product.product":
+                raise SystemError("odoo xmlrpc: connection reset")
+            return original_search(target, domain, **kw)  # type: ignore[arg-type]
+
+        sys.search = _boom  # type: ignore[method-assign]
+        data = _query(_client(sys), "history.changes", {"resource": "Product", "record_id": "55"})
+        assert data["outcome"] == "refused"
+        assert data["code"] == "UPSTREAM_UNAVAILABLE"
+        assert "items" not in data, "an unresolved template must never be reported as 'no history'"
+
+    def test_variant_not_found_proceeds_on_variant_domain_alone_no_refusal(self) -> None:
+        # the variant genuinely does not exist (no rows, no exception) — a legitimate "nothing to
+        # resolve", not a failed read; must not refuse.
+        data = _query(_client(_seeded_product_messages()), "history.changes",
+                      {"resource": "Product", "record_id": "12345"})
+        assert data.get("outcome") != "refused"
+        assert data["items"] == []
+
+
+class TestMissingFieldsAreVisibleNotSilentlyDropped:
+    def test_movements_missing_fields_are_reported(self) -> None:
+        sys = _seeded_moves()
+        sys.schemas["stock.move"] = [
+            {"name": n} for n in ("id", "date", "write_date", "reference", "quantity")
+        ]
+        data = _query(_client(sys), "history.movements", {"resource": "Product", "record_id": "42"})
+        assert set(data["missing_fields"]) == {
+            "quantity_done", "product_uom", "location_id", "location_dest_id", "picking_id", "origin",
+        }
+        assert data["items"], "pruning degrades the answer, it must not empty it"
+
+    def test_changes_missing_fields_are_reported(self) -> None:
+        sys = _seeded_messages()
+        sys.schemas["mail.message"] = [
+            {"name": n} for n in ("id", "date", "write_date", "message_type", "model", "res_id")
+        ]
+        data = _query(_client(sys), "history.changes", {"resource": "Supplier", "record_id": "7"})
+        assert set(data["missing_fields"]) == {"subtype_id", "author_id", "subject", "body"}
+
+    def test_no_missing_fields_when_schema_is_unknown(self) -> None:
+        data = _query(_client(_seeded_moves()), "history.movements",
+                      {"resource": "Product", "record_id": "42"})
+        assert data["missing_fields"] == []
