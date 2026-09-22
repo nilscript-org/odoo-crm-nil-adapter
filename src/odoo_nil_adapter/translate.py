@@ -1116,13 +1116,28 @@ _HISTORY_LIMIT_MAX = 200
 _HISTORY_ORDER = "date desc, id desc"
 
 _MOVEMENTS_MODEL = "stock.move"
-_MOVEMENTS_FIELDS: tuple[str, ...] = (
-    "id", "reference", "quantity", "quantity_done", "product_uom",
-    "location_id", "location_dest_id", "picking_id", "origin", "date", "write_date",
+# Each entry is a GROUP of alternate native spellings for the same logical field, preference order
+# first — `stock.move` renamed both across Odoo versions. Live-gated on a real Odoo 19 (saas~19.4)
+# via `fields_get`: `quantity` carries the moved qty (17+; `quantity_done` is the OLDER spelling,
+# absent on 19) and the unit is `uom_id` (NOT `product_uom`, which does not exist on 19 either — an
+# earlier guess). Both spellings are requested; `_history_fields` keeps whichever this instance
+# actually has, and a group is reported `missing` ONLY when NEITHER spelling exists.
+_MOVEMENTS_FIELD_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("id",),
+    ("reference",),
+    ("quantity", "quantity_done"),
+    ("uom_id", "product_uom"),
+    ("location_id",),
+    ("location_dest_id",),
+    ("picking_id",),
+    ("origin",),
+    ("date",),
+    ("write_date",),
 )
 _CHANGES_MODEL = "mail.message"
-_CHANGES_FIELDS: tuple[str, ...] = (
-    "id", "message_type", "subtype_id", "author_id", "subject", "body", "date", "write_date",
+_CHANGES_FIELD_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("id",), ("message_type",), ("subtype_id",), ("author_id",),
+    ("subject",), ("body",), ("date",), ("write_date",),
 )
 # Live-gate scouting finding (W5 T1 follow-up): a Product's chatter is normally posted on its
 # TEMPLATE (`product.template`), not on the variant (`product.product`) that `RESOURCES["Product"]`
@@ -1189,6 +1204,18 @@ def _m2o_id(value: Any) -> int | None:
     return _require_history_int(value) if value else None
 
 
+def _first_available(row: dict[str, Any], *keys: str) -> Any:
+    """The value of the first key among `keys` carrying a truthy value — for a logical field Odoo
+    has RENAMED across versions (e.g. the unit on `stock.move`: `uom_id` on 17+, `product_uom` on
+    older — only one spelling is ever actually populated on a given instance). None when none of
+    them carry a value; never fabricated."""
+    for k in keys:
+        v = row.get(k)
+        if v:
+            return v
+    return None
+
+
 def _plain_text(html: Any, *, limit: int = 280) -> str | None:
     """`mail.message.body` is HTML; the answer carries plain text, never markup, bounded to
     `limit` chars — a chatter note can be arbitrarily long; the history item is a summary of it,
@@ -1201,22 +1228,36 @@ def _plain_text(html: Any, *, limit: int = 280) -> str | None:
 
 
 def _history_fields(
-    client: SystemClient, model: str, curated: tuple[str, ...]
+    client: SystemClient, model: str, groups: tuple[tuple[str, ...], ...]
 ) -> tuple[tuple[str, ...], list[str]]:
-    """(fields, missing) — the curated field list pruned to what THIS instance's live schema
-    actually has (the same idea `read_plane.py`'s projection uses: intersect against
-    `client.schema(model)` when it answers a real shape — module/version drift, e.g. `quantity` vs
-    `quantity_done` — keep verbatim when it answers empty/None, a fake or an instance exposing no
-    metadata; `id` is always kept), PLUS which curated names the live schema does not have at all.
-    Pruning silently degrades a request that names a field this instance lacks; `missing` is how a
-    wrong field name stays VISIBLE on the wire instead of just disappearing into a thinner answer."""
+    """(fields, missing) for a CURATED set of logical fields, each declared as a GROUP of one or
+    more alternate native spellings in preference order (the same idea `read_plane.py`'s projection
+    uses, generalized: intersect against `client.schema(model)` when it answers a real shape, keep
+    every alternate verbatim when it answers empty/None — a fake, or an instance exposing no
+    metadata; `id` is always kept). `fields` carries every alternate THIS instance's live schema
+    actually has (a group with version drift, e.g. `stock.move`'s `quantity`/`quantity_done` or
+    `uom_id`/`product_uom`, may contribute more than one name — the item builder picks the real one
+    at read time). `missing` names a group ONLY when NONE of its alternates exist: a version that
+    answers under a DIFFERENT but KNOWN spelling must never be reported as missing a field it
+    actually has under another name — that would turn a healthy instance into a false alarm."""
     field_meta = client.schema(model)
     if not field_meta:
-        return curated, []
+        return tuple(name for group in groups for name in group), []
     available = {f.get("name") for f in field_meta}
-    missing = [f for f in curated if f != "id" and f not in available]
-    pruned = tuple(f for f in curated if f == "id" or f in available)
-    return (pruned or curated), missing
+    fields: list[str] = []
+    missing: list[str] = []
+    for group in groups:
+        if "id" in group:
+            fields.append("id")
+            continue
+        present = [name for name in group if name in available]
+        if present:
+            fields.extend(present)
+        else:
+            missing.append(group[0])  # the curated/primary spelling names the gap, not every alias
+    if not fields:  # nothing curated matched this schema at all — degrade to the full verbatim ask
+        return tuple(name for group in groups for name in group), missing
+    return tuple(fields), missing
 
 
 def _history_limit(args: dict[str, Any]) -> tuple[int | None, dict[str, Any] | None]:
@@ -1257,7 +1298,8 @@ def _movement_item(row: dict[str, Any]) -> dict[str, Any]:
         "at": _odoo_dt_to_iso(row.get("date")),
         "reference": row.get("reference") or None,
         "quantity": quantity,
-        "uom": _flatten_m2o(row.get("product_uom")),
+        # `uom_id` on Odoo 17+ (live-gated on a real 19); `product_uom` on older instances only.
+        "uom": _flatten_m2o(_first_available(row, "uom_id", "product_uom")),
         "from": _flatten_m2o(row.get("location_id")),
         "to": _flatten_m2o(row.get("location_dest_id")),
         "picking": _flatten_m2o(row.get("picking_id")),
@@ -1308,7 +1350,7 @@ def _run_history_movements(client: SystemClient, args: dict[str, Any]) -> dict[s
     domain: list[list[Any]] = [["product_id", "=", rid], ["state", "=", "done"]]
     if before_native is not None:
         domain.append(["date", "<", before_native])
-    fields, missing_fields = _history_fields(client, _MOVEMENTS_MODEL, _MOVEMENTS_FIELDS)
+    fields, missing_fields = _history_fields(client, _MOVEMENTS_MODEL, _MOVEMENTS_FIELD_GROUPS)
     try:
         rows = client.search(_MOVEMENTS_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
     except SystemError as exc:
@@ -1381,7 +1423,7 @@ def _run_history_changes(client: SystemClient, args: dict[str, Any]) -> dict[str
         domains = [(model, [["model", "=", model], ["res_id", "=", rid]])]
     if before_native is not None:
         domains = [(m, d + [["date", "<", before_native]]) for m, d in domains]
-    fields, missing_fields = _history_fields(client, _CHANGES_MODEL, _CHANGES_FIELDS)
+    fields, missing_fields = _history_fields(client, _CHANGES_MODEL, _CHANGES_FIELD_GROUPS)
     seen_ids: set[Any] = set()
     rows: list[dict[str, Any]] = []
     for _m, domain in domains:

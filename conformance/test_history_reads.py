@@ -69,6 +69,47 @@ def _seeded_moves() -> FakeSystem:
     return sys
 
 
+def _seeded_moves_odoo19_shape() -> FakeSystem:
+    """A stand-in shaped like a REAL Odoo 19 (saas~19.4) `fields_get` (live-gate scouting finding):
+    `quantity` carries the moved qty and the unit field is `uom_id` — there is NO `quantity_done`
+    and NO `product_uom` on this version at all (an earlier guess that does not exist on 19)."""
+    sys = FakeSystem()
+    sys.schemas["stock.move"] = [
+        {"name": n} for n in (
+            "id", "reference", "quantity", "uom_id",
+            "location_id", "location_dest_id", "picking_id", "origin", "date", "write_date",
+        )
+    ]
+    sys.docs["stock.move"] = [{
+        "id": 1, "product_id": 42, "state": "done",
+        "date": "2026-01-01 10:00:00", "write_date": "2026-01-01 10:05:00",
+        "reference": "WH/OUT/0001", "quantity": 5, "uom_id": [1, "Units"],
+        "location_id": [8, "WH/Stock"], "location_dest_id": [9, "Customers"],
+        "picking_id": [3, "WH/OUT/00001"], "origin": "SO001",
+    }]
+    return sys
+
+
+def _seeded_moves_odoo16_shape() -> FakeSystem:
+    """A stand-in shaped like an OLDER Odoo (16): `quantity_done` carries the moved qty and the
+    unit field is `product_uom` — no `quantity`, no `uom_id`."""
+    sys = FakeSystem()
+    sys.schemas["stock.move"] = [
+        {"name": n} for n in (
+            "id", "reference", "quantity_done", "product_uom",
+            "location_id", "location_dest_id", "picking_id", "origin", "date", "write_date",
+        )
+    ]
+    sys.docs["stock.move"] = [{
+        "id": 1, "product_id": 42, "state": "done",
+        "date": "2026-01-01 10:00:00", "write_date": "2026-01-01 10:05:00",
+        "reference": "WH/OUT/0001", "quantity_done": 5, "product_uom": [1, "Units"],
+        "location_id": [8, "WH/Stock"], "location_dest_id": [9, "Customers"],
+        "picking_id": [3, "WH/OUT/00001"], "origin": "SO001",
+    }]
+    return sys
+
+
 def _seeded_messages() -> FakeSystem:
     sys = FakeSystem()
     sys.docs["mail.message"] = [
@@ -373,14 +414,19 @@ class TestProductChangesReadsBothVariantAndTemplate:
 class TestMissingFieldsAreVisibleNotSilentlyDropped:
     def test_movements_missing_fields_are_reported(self) -> None:
         sys = _seeded_moves()
+        # `quantity` alone is enough to satisfy the quantity GROUP (its alternate `quantity_done`
+        # need not also exist) — but NEITHER uom spelling is present, so that group IS a real gap,
+        # reported once under its primary name. `location_id`/`location_dest_id`/`picking_id`/
+        # `origin` have no alternates at all: plain, genuine gaps.
         sys.schemas["stock.move"] = [
             {"name": n} for n in ("id", "date", "write_date", "reference", "quantity")
         ]
         data = _query(_client(sys), "history.movements", {"resource": "Product", "record_id": "42"})
         assert set(data["missing_fields"]) == {
-            "quantity_done", "product_uom", "location_id", "location_dest_id", "picking_id", "origin",
+            "uom_id", "location_id", "location_dest_id", "picking_id", "origin",
         }
         assert data["items"], "pruning degrades the answer, it must not empty it"
+        assert data["items"][0]["quantity"] == 7, "the group's PRESENT alternate must still be used"
 
     def test_changes_missing_fields_are_reported(self) -> None:
         sys = _seeded_messages()
@@ -393,4 +439,28 @@ class TestMissingFieldsAreVisibleNotSilentlyDropped:
     def test_no_missing_fields_when_schema_is_unknown(self) -> None:
         data = _query(_client(_seeded_moves()), "history.movements",
                       {"resource": "Product", "record_id": "42"})
+        assert data["missing_fields"] == []
+
+
+class TestMovementsFieldNamesAcrossOdooVersions:
+    """Live-gate scouting on a real Odoo 19 (saas~19.4) via `fields_get`: `stock.move` has NO
+    `quantity_done` and NO `product_uom` — the unit field is `uom_id` (`quantity` already carries
+    the moved qty in 17+). A version-renamed field is not a gap: a healthy instance, whichever
+    spelling it uses, must resolve the SAME logical `quantity`/`uom` and report an EMPTY
+    `missing_fields` — not the false alarm a flat curated-field list would raise."""
+
+    def test_odoo19_shape_resolves_quantity_and_uom_id_with_no_reported_gap(self) -> None:
+        data = _query(_client(_seeded_moves_odoo19_shape()), "history.movements",
+                      {"resource": "Product", "record_id": "42"})
+        item = data["items"][0]
+        assert item["quantity"] == 5
+        assert item["uom"] == "Units"
+        assert data["missing_fields"] == []
+
+    def test_odoo16_shape_resolves_quantity_done_and_product_uom_with_no_reported_gap(self) -> None:
+        data = _query(_client(_seeded_moves_odoo16_shape()), "history.movements",
+                      {"resource": "Product", "record_id": "42"})
+        item = data["items"][0]
+        assert item["quantity"] == 5
+        assert item["uom"] == "Units"
         assert data["missing_fields"] == []
