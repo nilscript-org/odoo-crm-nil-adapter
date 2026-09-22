@@ -1105,6 +1105,265 @@ ACCOUNT_GET_INVOICE_DOCUMENT = QueryVerb(
     report=_VENDOR_BILL_REPORT,
 )
 
+# ── history.movements / history.changes (entity-history E1 follow-up) — Odoo's OWN append-only
+# facts as governed READS. Neither was ever read by this adapter before: `stock.move` (the stock
+# ledger) is referenced nowhere else in this file, and `mail.message` (chatter) was write-only
+# (`crm.log_note` posts via `message_post`; nothing listed it). A failed read here REFUSES
+# `UPSTREAM_UNAVAILABLE` — never `items: []` ("nothing here" and "I could not look" must never be
+# the same answer; see `_run_get_contact`'s swallow, the bad precedent NOT copied here).
+_HISTORY_LIMIT_DEFAULT = 50
+_HISTORY_LIMIT_MAX = 200
+_HISTORY_ORDER = "date desc, id desc"
+
+_MOVEMENTS_MODEL = "stock.move"
+_MOVEMENTS_FIELDS: tuple[str, ...] = (
+    "id", "reference", "quantity", "quantity_done", "product_uom",
+    "location_id", "location_dest_id", "picking_id", "origin", "date", "write_date",
+)
+_CHANGES_MODEL = "mail.message"
+_CHANGES_FIELDS: tuple[str, ...] = (
+    "id", "message_type", "subtype_id", "author_id", "subject", "body", "date", "write_date",
+)
+
+
+def _require_history_int(raw: Any) -> int | None:
+    """Strict int coercion for a value that MUST already be numeric. Unlike `_maybe_int` (which
+    passes odd input through unchanged, to keep a WriteVerb's `to_native` crash-free), this is the
+    validation gate: non-numeric input here is the caller's refusal to report, not a value to carry
+    through unchanged."""
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _odoo_dt_to_iso(value: Any) -> str | None:
+    """Odoo's naive-UTC `"YYYY-MM-DD HH:MM:SS"` -> `"YYYY-MM-DDTHH:MM:SSZ"`. Falsy passes through
+    as None — an absent timestamp is never fabricated as a string."""
+    if not value:
+        return None
+    s = str(value).strip()
+    return s if "T" in s else s.replace(" ", "T", 1) + "Z"
+
+
+def _iso_to_odoo_dt(value: str) -> str | None:
+    """ISO-8601 (`...Z` / `...+00:00` / naive) -> Odoo's naive-UTC `"YYYY-MM-DD HH:MM:SS"` for use
+    in a domain triple. None when the input does not parse to that shape at all."""
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    s = s.replace("T", " ")
+    if "." in s:
+        s = s.split(".", 1)[0]
+    plus = s.find("+", 10)  # skip the date's own leading '-' separators
+    if plus != -1:
+        s = s[:plus]
+    minus_tz = s.rfind("-")
+    if minus_tz > 10:  # a trailing "-HH:MM" offset (the date's own '-'s are at index 4 and 7)
+        s = s[:minus_tz].rstrip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", s):
+        return s
+    return None
+
+
+def _flatten_m2o(value: Any) -> Any:
+    """Odoo hands back a many2one over XML-RPC as `[id, "Label"]`; flatten to the label string. A
+    falsy value (False/None — no linked record) is genuinely absent, never fabricated as ""."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        return value[1]
+    return value if value else None
+
+
+def _plain_text(html: Any, *, limit: int = 280) -> str | None:
+    """`mail.message.body` is HTML; the answer carries plain text, never markup, bounded to
+    `limit` chars — a chatter note can be arbitrarily long; the history item is a summary of it,
+    not the record itself."""
+    if not html:
+        return None
+    text = re.sub(r"<[^>]+>", " ", str(html))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _history_fields(client: SystemClient, model: str, curated: tuple[str, ...]) -> tuple[str, ...]:
+    """The curated field list, pruned to what THIS instance's live schema actually has — the same
+    idea `read_plane.py`'s projection uses: intersect against `client.schema(model)` when it answers
+    a real shape (module/version drift — e.g. `quantity` vs `quantity_done`), keep verbatim when it
+    answers empty/None (a fake, or an instance exposing no metadata). `id` is always kept."""
+    field_meta = client.schema(model)
+    if not field_meta:
+        return curated
+    available = {f.get("name") for f in field_meta}
+    pruned = tuple(f for f in curated if f == "id" or f in available)
+    return pruned or curated
+
+
+def _history_limit(args: dict[str, Any]) -> tuple[int | None, dict[str, Any] | None]:
+    """(limit, refusal) — exactly one is set."""
+    raw = args.get("limit")
+    if raw is None or raw == "":
+        return _HISTORY_LIMIT_DEFAULT, None
+    n = _require_history_int(raw)
+    if n is None or not (1 <= n <= _HISTORY_LIMIT_MAX):
+        return None, {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"limit must be an integer in 1..{_HISTORY_LIMIT_MAX}, got {raw!r}",
+        }
+    return n, None
+
+
+def _history_before(args: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """(before, refusal) in Odoo's own naive-UTC format — exactly one of (before, refusal) is set;
+    `before` itself may legitimately be None (the arg was not given)."""
+    raw = args.get("before")
+    if raw is None or raw == "":
+        return None, None
+    native = _iso_to_odoo_dt(str(raw))
+    if native is None:
+        return None, {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"before must be ISO-8601 UTC, got {raw!r}",
+        }
+    return native, None
+
+
+def _movement_item(row: dict[str, Any]) -> dict[str, Any]:
+    quantity = row.get("quantity")
+    if quantity is None:
+        quantity = row.get("quantity_done")
+    return {
+        "id": row.get("id"),
+        "at": _odoo_dt_to_iso(row.get("date")),
+        "reference": row.get("reference") or None,
+        "quantity": quantity,
+        "uom": _flatten_m2o(row.get("product_uom")),
+        "from": _flatten_m2o(row.get("location_id")),
+        "to": _flatten_m2o(row.get("location_dest_id")),
+        "picking": _flatten_m2o(row.get("picking_id")),
+        "origin": row.get("origin") or None,
+        "write_date": _odoo_dt_to_iso(row.get("write_date")),
+    }
+
+
+def _change_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": row.get("id"),
+        "at": _odoo_dt_to_iso(row.get("date")),
+        "message_type": row.get("message_type") or None,
+        "subtype": _flatten_m2o(row.get("subtype_id")),
+        "author": _flatten_m2o(row.get("author_id")),
+        "subject": row.get("subject") or None,
+        "body": _plain_text(row.get("body")),
+        "write_date": _odoo_dt_to_iso(row.get("write_date")),
+    }
+
+
+def _run_history_movements(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    resource = str(args.get("resource") or "")
+    if resource != "Product":
+        return {
+            "outcome": "refused", "code": "UNKNOWN_RESOURCE",
+            "message": f"history.movements only tracks Product, got {resource!r}",
+        }
+    rid = _require_history_int(args.get("record_id"))
+    if rid is None:
+        return {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"record_id must be numeric, got {args.get('record_id')!r}",
+        }
+    limit, limit_refusal = _history_limit(args)
+    if limit_refusal is not None:
+        return limit_refusal
+    before_native, before_refusal = _history_before(args)
+    if before_refusal is not None:
+        return before_refusal
+    from odoo_nil_adapter import governance  # lazy: translate<->governance would cycle at import
+
+    if not governance.module_enabled(_MOVEMENTS_MODEL):
+        return {
+            "outcome": "refused", "code": "MODULE_DISABLED",
+            "message": f"{_MOVEMENTS_MODEL} is not in the operator-enabled module scope",
+        }
+    domain: list[list[Any]] = [["product_id", "=", rid], ["state", "=", "done"]]
+    if before_native is not None:
+        domain.append(["date", "<", before_native])
+    fields = _history_fields(client, _MOVEMENTS_MODEL, _MOVEMENTS_FIELDS)
+    try:
+        rows = client.search(_MOVEMENTS_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
+    except SystemError as exc:
+        return {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+    items = [_movement_item(r) for r in rows]
+    return {
+        "resource": resource, "record_id": str(rid), "model": _MOVEMENTS_MODEL,
+        "items": items, "count": len(items), "limit": limit,
+    }
+
+
+def _run_history_changes(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    resource = str(args.get("resource") or "")
+    if resource not in RESOURCES:
+        return {
+            "outcome": "refused", "code": "UNKNOWN_RESOURCE",
+            "message": f"unknown resource: {resource!r}",
+        }
+    rid = _require_history_int(args.get("record_id"))
+    if rid is None:
+        return {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"record_id must be numeric, got {args.get('record_id')!r}",
+        }
+    limit, limit_refusal = _history_limit(args)
+    if limit_refusal is not None:
+        return limit_refusal
+    before_native, before_refusal = _history_before(args)
+    if before_refusal is not None:
+        return before_refusal
+    model = native_model(resource)
+    from odoo_nil_adapter import governance  # lazy: translate<->governance would cycle at import
+
+    if not governance.module_enabled(model):
+        return {
+            "outcome": "refused", "code": "MODULE_DISABLED",
+            "message": f"{model} is not in the operator-enabled module scope",
+        }
+    domain: list[list[Any]] = [["model", "=", model], ["res_id", "=", rid]]
+    if before_native is not None:
+        domain.append(["date", "<", before_native])
+    fields = _history_fields(client, _CHANGES_MODEL, _CHANGES_FIELDS)
+    try:
+        rows = client.search(_CHANGES_MODEL, domain, fields=fields, limit=limit, order=_HISTORY_ORDER)
+    except SystemError as exc:
+        return {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+    items = [_change_item(r) for r in rows]
+    return {
+        "resource": resource, "record_id": str(rid), "model": _CHANGES_MODEL,
+        "items": items, "count": len(items), "limit": limit,
+    }
+
+
+HISTORY_MOVEMENTS = QueryVerb(
+    verb="history.movements",
+    run=_run_history_movements,
+    required=("resource", "record_id"),
+    target=_MOVEMENTS_MODEL,
+    returns="rows",
+)
+HISTORY_CHANGES = QueryVerb(
+    verb="history.changes",
+    run=_run_history_changes,
+    required=("resource", "record_id"),
+    target=_CHANGES_MODEL,
+    returns="rows",
+)
+# Kept OUT of `_NIL_QUERY_VERBS` (the generic `nil.*` intent surface) — these two are curated,
+# always-on verbs beside it, exactly like the document reads above. `packs.py` is untouched: a
+# neighbour branch (`feat/primary-supplier`) edits it, and these two are model-fixed (stock.move /
+# native_model(resource)), not gated by any write pack.
+_HISTORY_QUERY_VERBS: dict[str, QueryVerb] = {
+    "history.movements": HISTORY_MOVEMENTS,
+    "history.changes": HISTORY_CHANGES,
+}
+
 PURCHASE_CONFIRM_ORDER = WriteVerb(
     verb="purchase.confirm_order",
     recovery_shape="convergent",
@@ -1721,7 +1980,7 @@ _packs_mod._init_packs()
 # imports it at its own load time (after translate finishes) so no cycle occurs here.
 DECLARED_TARGETS = _packs_mod.all_write_targets()
 WRITE_VERBS = {**_packs_mod.all_write_verbs()}
-QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS}
+QUERY_VERBS = {**_packs_mod.all_query_verbs(), **_NIL_QUERY_VERBS, **_HISTORY_QUERY_VERBS}
 
 
 # The business RESOURCES Odoo can be the system of record for, and the native model it spells each as

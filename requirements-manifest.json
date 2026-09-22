@@ -388,6 +388,26 @@
         "invoice_id"
       ],
       "note": "The ERP's own rendered invoice / vendor bill. Same contract, same UNWITNESSED caveat."
+    },
+    "history.movements": {
+      "effect": "read",
+      "target": "stock.move",
+      "returns": "rows",
+      "required": [
+        "resource",
+        "record_id"
+      ],
+      "note": "entity-history E1 follow-up (W5). Stock ledger movements for a Product, newest first, state == 'done' only. Args: resource (must be 'Product'), record_id, before? (ISO-8601 UTC), limit? (1..200, default 50). Refusals: MISSING_ARGS, BAD_ARGS (non-numeric id / bad before / limit out of range), UNKNOWN_RESOURCE, MODULE_DISABLED, UPSTREAM_UNAVAILABLE (a SystemError from Odoo — never an empty list). The live read is UNWITNESSED until the owner-gated live conformance run against the customer's own Odoo."
+    },
+    "history.changes": {
+      "effect": "read",
+      "target": "mail.message",
+      "returns": "rows",
+      "required": [
+        "resource",
+        "record_id"
+      ],
+      "note": "entity-history E1 follow-up (W5). Chatter (mail.message) for any declared RESOURCES key's record, newest first. Args: resource (any RESOURCES key), record_id, before? (ISO-8601 UTC), limit? (1..200, default 50). Same refusal codes as history.movements. The live read is UNWITNESSED until the owner-gated live conformance run against the customer's own Odoo."
     }
   },
   "transport_quirks": []

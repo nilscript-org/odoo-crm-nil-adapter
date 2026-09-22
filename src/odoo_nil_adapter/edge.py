@@ -1310,13 +1310,15 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
             # spells each as (Wave A). Authority names the resource; the adapter keeps its vocabulary.
             "resources": RESOURCES,
             "targets": targets,
-            # entity-history E1: which history reads this adapter can actually answer, so the BFF
-            # can tell a person "current state only" instead of pretending. `current` = the record
-            # as it is now (resource.read, already true); `changes` = a change log/chatter per
-            # record; `movements` = stock movements per product; `messages` = the messages sent to
-            # a party. False is the honest default — Appendix E proved none of the three exist
-            # against Odoo today; a key flips True only when this adapter implements the read.
-            "history": {"current": True, "changes": False, "movements": False, "messages": False},
+            # entity-history E1 (+ W5 follow-up): which history reads this adapter can actually
+            # answer, so the BFF can tell a person "current state only" instead of pretending.
+            # `current` = the record as it is now (resource.read, already true). `changes` = a
+            # change log/chatter per record — now backed by `history.changes` over `mail.message`.
+            # `movements` = stock movements per product — now backed by `history.movements` over
+            # `stock.move`. `messages` = the messages SENT to a party (comms, not chatter) — still
+            # unimplemented, honestly False. A key flips True only when this adapter implements the
+            # read that backs it.
+            "history": {"current": True, "changes": True, "movements": True, "messages": False},
         }
 
     return app

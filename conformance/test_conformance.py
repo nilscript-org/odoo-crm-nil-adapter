@@ -616,15 +616,16 @@ def test_describe_exposes_skeleton() -> None:
 
 
 def test_describe_declares_history_capability() -> None:
-    # entity-history E1: describe SAYS which history reads this adapter supports, in one closed
-    # block, so the BFF can tell a person "current state only" instead of pretending. Appendix E
-    # proved none of the four reads exist against Odoo today — every key is honestly False except
-    # `current` (the record as it is now, which every adapter already answers via resource.read).
+    # entity-history E1 + W5 follow-up: describe SAYS which history reads this adapter supports,
+    # in one closed block, so the BFF can tell a person "current state only" instead of pretending.
+    # `current` (resource.read) and now `changes` (history.changes over mail.message) and
+    # `movements` (history.movements over stock.move) are backed reads; `messages` (comms sent to a
+    # party) still has no read behind it, so it stays honestly False.
     client = TestClient(create_app(FakeSystem(), CapturingEmitter(), bearer=None), raise_server_exceptions=False)
     d = client.get("/nil/v0.1/describe").json()
     assert d.get("history") == {
         "current": True,
-        "changes": False,
-        "movements": False,
+        "changes": True,
+        "movements": True,
         "messages": False,
-    }, "describe must declare exactly the four history keys, current True and the rest honestly False"
+    }, "describe must declare exactly the four history keys — current/changes/movements True, messages False"
