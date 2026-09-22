@@ -49,6 +49,10 @@ COMPENSATIONS: dict[str, dict[str, Any]] = {
     # create_contact, same reversal"). No new delete verb: `crm.delete_contact` already deletes a
     # `res.partner` by id, and it does not care which rank field put the record there.
     "procurement.create_supplier": {"reversibility": "REVERSIBLE", "verb": "crm.delete_contact"},
+    # W3.6a (owner Q3): SetPrimarySupplier patches ONE field (`sequence`) on an existing link — the
+    # same shape as `crm.update_contact` above. The edge captures the before-image and synthesizes a
+    # `resource.update` restore; honestly COMPENSABLE, never a second copy of "was it already primary".
+    "procurement.set_primary_supplier": {"reversibility": "COMPENSABLE", "strategy": "before_image"},
 }
 
 # READS ARE NOT LISTED HERE, AND THAT IS A DECISION, NOT AN OMISSION.

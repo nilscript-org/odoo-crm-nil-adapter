@@ -366,6 +366,27 @@
       ],
       "hidden_requirements": [],
       "method": "button_validate"
+    },
+    "procurement.set_primary_supplier": {
+      "doctype": "product.supplierinfo",
+      "op": "update",
+      "tier": "MEDIUM",
+      "reversibility": "COMPENSABLE",
+      "required": [
+        "link_ref",
+        "priority"
+      ],
+      "hidden_requirements": [],
+      "compensation": {
+        "verb": "resource.update",
+        "arg_map": {
+          "target": "product.supplierinfo",
+          "id": "$.result.entity.id",
+          "data": "$.before_image"
+        },
+        "tier": "MEDIUM",
+        "window": "P30D"
+      }
     }
   },
   "read_verbs": {

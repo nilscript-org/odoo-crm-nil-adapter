@@ -1229,6 +1229,44 @@ PROCUREMENT_UNLINK_SUPPLIER = WriteVerb(
     supported_args=("link_ref",),
 )
 
+# ── procurement.set_primary_supplier (W3.6a, owner Q3): "primary" is an attribute of the LINK, ────
+# written by the link's own authority — never a second copy in the platform. The vendor-neutral verb
+# contract (shared across every adapter that declares `ProductSupplier`) is
+# `{link_ref, priority, sku?}`: `priority` is an integer, lower = preferred, and the PRIMARY link is
+# whichever has the strictly lowest priority among a product's links (a tie has no primary). The
+# CALLER computes `priority = min(priority of the product's OTHER links) - 1` from a prior read —
+# this verb stays a pure update, exactly like every other `to_native` in this module: no sibling
+# read, no I/O.
+#
+# On Odoo, the link IS `product.supplierinfo`, and Odoo's own native ordering field for that model is
+# `sequence` (ascending — Odoo already orders a product's vendors by it). So this verb writes
+# `sequence`; the catalogue and every caller only ever say `priority` (the generality rule: `sequence`
+# is spelled only here and in the read projection below, never in catalog.py or the agent).
+def _to_native_set_primary_supplier(args: dict[str, Any]) -> dict[str, Any]:
+    """NIL `priority` → Odoo's native `product.supplierinfo.sequence`. Pure: the caller already
+    resolved the new integer from a prior read; this mapping never reads a sibling row itself."""
+    return {"sequence": _maybe_int(args["priority"])}
+
+
+PROCUREMENT_SET_PRIMARY_SUPPLIER = WriteVerb(
+    verb="procurement.set_primary_supplier",
+    recovery_shape="convergent",
+    recovery_note="sets link_ref's priority to the same integer twice — the same state either way",
+    tier="MEDIUM",
+    doctype="product.supplierinfo",
+    op="update",
+    required=("link_ref", "priority"),
+    to_native=_to_native_set_primary_supplier,
+    preview=lambda a: {
+        "en": f"Set priority {a.get('priority', '')} on supplier link {a.get('link_ref', '')}"
+        + (f" for {a['sku']}" if a.get("sku") else ""),
+        "ar": f"تعيين الأولوية {a.get('priority', '')} لرابط المورد {a.get('link_ref', '')}"
+        + (f" للمنتج {a['sku']}" if a.get("sku") else ""),
+    },
+    entity_type="product_supplier_link",
+    supported_args=("link_ref", "priority", "sku"),
+)
+
 # ── procurement.create_supplier (Task 1.3b): a res.partner Odoo can be the SUPPLIER record for ────
 # `ManageSuppliers.create` (baseline capability) routes here when the operator's Supplier authority
 # is Odoo. Odoo has no separate "vendor" table — a supplier IS a `res.partner` with `supplier_rank`
@@ -1926,6 +1964,11 @@ def _project_product_supplier_row(
     partner = _unwrap_ref(row.get("partner_id"))
     if partner is not None:
         out["supplier_id"] = str(partner)
+    # W3.6a: expose Odoo's native ordering field back out under the catalogue's vendor-neutral name.
+    # Never the reverse — `sequence` is never written to a caller directly, only read here.
+    sequence = row.get("sequence")
+    if sequence is not None:
+        out["priority"] = _as_int_id(sequence) if isinstance(sequence, (list, tuple)) else sequence
     lookup = codes if codes is not None else _batch_default_codes(client, [row])
     product_id = _as_int_id(row.get("product_id"))
     tmpl_id = _as_int_id(row.get("product_tmpl_id"))

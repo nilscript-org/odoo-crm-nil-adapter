@@ -251,6 +251,7 @@ def _make_purchasing_pack() -> ModulePack:
         PROCUREMENT_LINK_SUPPLIER,
         PROCUREMENT_UNLINK_SUPPLIER,
         PROCUREMENT_CREATE_SUPPLIER,
+        PROCUREMENT_SET_PRIMARY_SUPPLIER,
     )
 
     return ModulePack(
@@ -270,6 +271,8 @@ def _make_purchasing_pack() -> ModulePack:
             PROCUREMENT_UNLINK_SUPPLIER,
             # Task 1.3b: ManageSuppliers.create routes here — a res.partner with supplier_rank>0.
             PROCUREMENT_CREATE_SUPPLIER,
+            # W3.6a (owner Q3): SetPrimarySupplier routes here — writes `sequence` on the same link.
+            PROCUREMENT_SET_PRIMARY_SUPPLIER,
         ),
         # A READ: the ERP's OWN rendered purchase order (QWeb `purchase.report_purchaseorder`). The
         # document the vendor receives is Odoo's, never one we compose from the record.
@@ -308,9 +311,9 @@ def _make_purchasing_pack() -> ModulePack:
             ),
             "stock.quant": ("id", "product_id", "location_id", "quantity"),
             # Task 1.3 (D37/D38/O3): the product<->supplier link. These are Odoo's OWN field names —
-            # `sku`/`supplier_id` are exposed on top of them by translate.py's read-side projection
-            # (`_project_product_supplier_row`), never requested from Odoo directly (it has no such
-            # fields).
+            # `sku`/`supplier_id`/`priority` are exposed on top of them by translate.py's read-side
+            # projection (`_project_product_supplier_row`), never requested from Odoo directly (it has
+            # no such fields — `priority` in particular is `sequence` there, W3.6a).
             "product.supplierinfo": (
                 "id",
                 "product_tmpl_id",
@@ -320,6 +323,7 @@ def _make_purchasing_pack() -> ModulePack:
                 "min_qty",
                 "delay",
                 "currency_id",
+                "sequence",
             ),
         },
         sensitive={},
