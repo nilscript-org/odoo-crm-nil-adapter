@@ -132,6 +132,53 @@ def _triple(row: dict[str, Any], triple: list[Any]) -> bool:
     return False
 
 
+def domain_matches(row: dict[str, Any], domain: list[Any] | None) -> bool:
+    """Evaluate a whole Odoo domain against an in-memory row (FakeSystem), in Odoo's own PREFIX
+    notation: `'|'`, `'&'` and `'!'` apply to the terms that follow, and terms left over are
+    ANDed — so a plain list of triples means what it always meant. The cursor read
+    (`history.movements_feed`) sends an OR; a fake that ignored it would let the cursor tests pass
+    against a domain Odoo would answer differently."""
+    terms = list(domain or [])
+    pos = 0
+
+    def term() -> bool:
+        nonlocal pos
+        token = terms[pos]
+        pos += 1
+        if token == "|":
+            left, right = term(), term()
+            return left or right
+        if token == "&":
+            left, right = term(), term()
+            return left and right
+        if token == "!":
+            return not term()
+        return _triple(row, token)
+
+    result = True
+    while pos < len(terms):
+        result = term() and result
+    return result
+
+
+def _order_key(order: str) -> list[tuple[str, bool]]:
+    """`"write_date asc, id asc"` -> [("write_date", False), ("id", False)] (True = descending)."""
+    keys: list[tuple[str, bool]] = []
+    for part in order.split(","):
+        bits = part.split()
+        if bits:
+            keys.append((bits[0], len(bits) > 1 and bits[1].lower() == "desc"))
+    return keys
+
+
+def _sorted_rows(rows: list[dict[str, Any]], order: str) -> list[dict[str, Any]]:
+    """Every key of `order`, applied least-significant first (Python's sort is stable), so a tie on
+    the first key is broken by the next — as Odoo does."""
+    for key, desc in reversed(_order_key(order)):
+        rows = sorted(rows, key=lambda r, k=key: (r.get(k) is None, r.get(k)), reverse=desc)
+    return rows
+
+
 def _as_int(value: Any) -> int | None:
     """Odoo record ids are integers. Returns the int, or None for anything non-numeric (so a human
     identifier like an email is cleanly handled by the edge's id-or-identifier resolution)."""
@@ -590,15 +637,14 @@ class FakeSystem:
         limit: int = 50,
         order: str | None = None,
     ) -> list[dict[str, Any]]:
-        # Interpret the same AND-of-triples domain RealSystemClient forwards to Odoo search_read.
-        rows = [r for r in self.docs.get(target, []) if all(_triple(r, t) for t in (domain or []))]
+        # Interpret the same domain RealSystemClient forwards to Odoo search_read.
+        rows = [r for r in self.docs.get(target, []) if domain_matches(r, domain)]
         if order:
-            key = order.split()[0]
-            rows = sorted(rows, key=lambda r: (r.get(key) is None, r.get(key)), reverse="desc" in order)
+            rows = _sorted_rows(rows, order)
         return rows[:limit]
 
     def count(self, target: str, domain: list[list[Any]]) -> int:
-        return sum(1 for r in self.docs.get(target, []) if all(_triple(r, t) for t in (domain or [])))
+        return sum(1 for r in self.docs.get(target, []) if domain_matches(r, domain))
 
     def update(self, target: str, record_id: str, doc: dict[str, Any]) -> dict[str, Any]:
         for record in self.docs.get(target, []):

@@ -408,6 +408,15 @@
         "record_id"
       ],
       "note": "entity-history E1 follow-up (W5). Chatter (mail.message) for any declared RESOURCES key's record, newest first. Args: resource (any RESOURCES key), record_id, before? (ISO-8601 UTC), limit? (1..200, default 50). Same refusal codes as history.movements. The live read is UNWITNESSED until the owner-gated live conformance run against the customer's own Odoo."
+    },
+    "history.movements_feed": {
+      "effect": "read",
+      "target": "stock.move",
+      "returns": "rows",
+      "required": [
+        "after_write_date"
+      ],
+      "note": "Completed stock moves across ALL products, oldest first, from a resumable (write_date, id) cursor, for the engine's observed-external-fact tick. Args: after_write_date (ISO-8601 UTC), after_id? (int >= 0, default 0), limit? (1..200, default 50). Answer: items (history.movements' fields plus product_id, from_id/to_id, from_usage/to_usage, picking_type, is_inventory, last_written_by), next {after_write_date, after_id}, complete. A move written again after done comes back again: the consumer dedupes on the move id. This read only exposes Odoo's data; interpreting a move is the engine's job. Refusals: MISSING_ARGS, BAD_ARGS, MODULE_DISABLED, UPSTREAM_UNAVAILABLE (never an empty page, never an advanced cursor). The live read is UNWITNESSED until the owner-gated live conformance run."
     }
   },
   "transport_quirks": []

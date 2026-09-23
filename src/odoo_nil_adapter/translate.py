@@ -1362,6 +1362,107 @@ def _run_history_movements(client: SystemClient, args: dict[str, Any]) -> dict[s
     }
 
 
+# ── history.movements_feed — the same `stock.move` ledger, asked the OTHER question: not "what
+# happened to this product" (newest first) but "what has Odoo moved since I last looked", across all
+# products, oldest first, from a resumable cursor. It EXPOSES Odoo's data; deciding what a move means
+# (issue, receipt, adjustment, transfer) and recording it is the engine's job.
+#
+# The cursor is (write_date, id), strict on both:
+# - not id alone: a move is created when its transfer is confirmed and becomes `done` later, so a
+#   LOW id can complete after a higher one, and an id cursor would skip it;
+# - not write_date alone: one validated transfer writes all its moves with the SAME write_date, so a
+#   paged write_date cursor would stall or skip inside it.
+# A move written again after `done` comes back again; the consumer dedupes on the move id.
+_FEED_ORDER = "write_date asc, id asc"
+_FEED_FIELD_GROUPS: tuple[tuple[str, ...], ...] = _MOVEMENTS_FIELD_GROUPS + (
+    ("product_id",),
+    ("location_usage",),       # related location_id.usage (internal/supplier/customer/inventory/…)
+    ("location_dest_usage",),
+    ("picking_code",),         # related picking_type_id.code (incoming/outgoing/internal)
+    ("is_inventory",),         # True on an inventory-adjustment move
+    ("write_uid",),            # the LAST writer; on a done move usually whoever validated it
+)
+
+
+def _feed_item(row: dict[str, Any]) -> dict[str, Any]:
+    """`_movement_item` plus what a consumer of ALL products needs to interpret a move on its own:
+    the product and location ids (labels are not keys), both location usages, the transfer type, the
+    inventory-adjustment flag and the last writer. A field this instance lacks is None — never a
+    fabricated False or ""."""
+    item = _movement_item(row)
+    writer = row.get("write_uid")
+    item.update({
+        "product_id": _m2o_id(row.get("product_id")),
+        "product": _flatten_m2o(row.get("product_id")),
+        "from_id": _m2o_id(row.get("location_id")),
+        "to_id": _m2o_id(row.get("location_dest_id")),
+        "from_usage": row.get("location_usage") or None,
+        "to_usage": row.get("location_dest_usage") or None,
+        "picking_type": row.get("picking_code") or None,
+        "is_inventory": bool(row["is_inventory"]) if "is_inventory" in row else None,
+        "last_written_by": (
+            {"id": _m2o_id(writer), "name": _flatten_m2o(writer)} if writer else None
+        ),
+    })
+    return item
+
+
+def _feed_cursor(args: dict[str, Any]) -> tuple[tuple[str, int] | None, dict[str, Any] | None]:
+    """((odoo write_date, id), refusal) — exactly one is set."""
+    native = _iso_to_odoo_dt(str(args.get("after_write_date") or ""))
+    if native is None:
+        return None, {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"after_write_date must be ISO-8601 UTC, got {args.get('after_write_date')!r}",
+        }
+    raw_id = args.get("after_id")
+    after_id = 0 if raw_id is None or raw_id == "" else _require_history_int(raw_id)
+    if after_id is None or after_id < 0:
+        return None, {
+            "outcome": "refused", "code": "BAD_ARGS",
+            "message": f"after_id must be a non-negative integer, got {raw_id!r}",
+        }
+    return (native, after_id), None
+
+
+def _run_history_movements_feed(client: SystemClient, args: dict[str, Any]) -> dict[str, Any]:
+    cursor, cursor_refusal = _feed_cursor(args)
+    if cursor_refusal is not None:
+        return cursor_refusal
+    limit, limit_refusal = _history_limit(args)
+    if limit_refusal is not None:
+        return limit_refusal
+    from odoo_nil_adapter import governance  # lazy: translate<->governance would cycle at import
+
+    if not governance.module_enabled(_MOVEMENTS_MODEL):
+        return {
+            "outcome": "refused", "code": "MODULE_DISABLED",
+            "message": f"{_MOVEMENTS_MODEL} is not in the operator-enabled module scope",
+        }
+    after_date, after_id = cursor  # type: ignore[misc]
+    domain: list[Any] = [
+        ["state", "=", "done"],
+        "|", ["write_date", ">", after_date],
+        "&", ["write_date", "=", after_date], ["id", ">", after_id],
+    ]
+    fields, missing_fields = _history_fields(client, _MOVEMENTS_MODEL, _FEED_FIELD_GROUPS)
+    try:
+        rows = client.search(_MOVEMENTS_MODEL, domain, fields=fields, limit=limit, order=_FEED_ORDER)
+    except SystemError as exc:
+        return {"outcome": "refused", "code": "UPSTREAM_UNAVAILABLE", "message": str(exc)}
+    items = [_feed_item(r) for r in rows]
+    if rows:
+        last = rows[-1]
+        next_cursor = {"after_write_date": _odoo_dt_to_iso(last.get("write_date")),
+                       "after_id": _require_history_int(last.get("id"))}
+    else:
+        next_cursor = {"after_write_date": _odoo_dt_to_iso(after_date), "after_id": after_id}
+    return {
+        "model": _MOVEMENTS_MODEL, "items": items, "count": len(items), "limit": limit,
+        "next": next_cursor, "complete": len(items) < limit, "missing_fields": missing_fields,
+    }
+
+
 def _product_changes_domains(
     client: SystemClient, variant_model: str, rid: int
 ) -> tuple[list[tuple[str, list[list[Any]]]], dict[str, Any] | None]:
@@ -1467,6 +1568,13 @@ HISTORY_CHANGES = QueryVerb(
 _HISTORY_QUERY_VERBS: dict[str, QueryVerb] = {
     "history.movements": HISTORY_MOVEMENTS,
     "history.changes": HISTORY_CHANGES,
+    "history.movements_feed": QueryVerb(
+        verb="history.movements_feed",
+        run=_run_history_movements_feed,
+        required=("after_write_date",),
+        target=_MOVEMENTS_MODEL,
+        returns="rows",
+    ),
 }
 
 PURCHASE_CONFIRM_ORDER = WriteVerb(
