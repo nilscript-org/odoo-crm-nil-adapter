@@ -108,13 +108,15 @@ class WriteVerb:
     # Only a field that is REALLY a free-text reference on the model may be named here, and the edge
     # additionally checks the LIVE schema before stamping — an Odoo whose model lacks the field
     # degrades to the honest refusal, never to a rejected write.
-    #     purchase.order  → `origin`  (Source Document; already a supported arg on this verb)
-    #     account.payment → `ref`     (Reference; this adapter already writes it, translate.py:631)
-    #     account.move    → `ref`     (Reference; the invoice-create verbs set nothing else there)
+    #     purchase.order  → `origin`      (Source Document; already a supported arg on this verb)
+    #     account.payment → `ref`         (Reference; this adapter already writes it, translate.py:631)
+    #     account.move    → `ref`         (Reference; the invoice-create verbs set nothing else there)
+    #     product.product → `description` (T3/O9: `default_code` IS the SKU — the product's own
+    #                                      identity, not one attempt's, so the marker rides in the
+    #                                      product's internal notes instead, never on a purchase
+    #                                      document; a caller-given description is kept alongside it)
     # Verbs with NO honest home for a key, left unstamped on purpose rather than inventing a field:
     #     crm.create_lead        (crm.lead has no reference/source Char — nothing to query on)
-    #     commerce.create_product(product.product's `default_code` IS the SKU, a business key that
-    #                             belongs to the product, not to one commit attempt)
     #     resource.create        (arbitrary target — no field can be declared for a model we do not
     #                             know until the request arrives)
     idempotency_field: str | None = None
@@ -847,14 +849,17 @@ WOSOOL_RECORD_PAYMENT = WriteVerb(
     idempotency_field="ref",
 )
 WOSOOL_CREATE_PRODUCT = WriteVerb(
+    # T3/O9: `default_code` is the SKU — the PRODUCT's own identity, not one attempt's — so the
+    # attempt key rides in `description` (the product's internal notes) instead, never on a purchase
+    # document. This makes the verb keyed: an unobserved create can now ASK Odoo whether this exact
+    # attempt already landed, instead of permanently refusing to a human.
     verb="commerce.create_product",
-    recovery_shape="none",
-    recovery_note="`default_code` is the SKU — the PRODUCT's key, not one attempt's; reusing it as a witness would conflate two different identities",
     tier="MEDIUM",
     doctype="product.product",
     op="create",
     required=("name",),
     to_native=_to_native_commerce_create_product,
+    idempotency_field="description",
     preview=lambda a: {
         "en": f"Create product “{a.get('name', '')}”"
         + (f" at {a['price']}" if a.get("price") is not None else ""),

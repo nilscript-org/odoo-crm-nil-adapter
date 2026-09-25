@@ -1,9 +1,10 @@
 """C3.7 — every write verb answers the recovery question, and the answer travels.
 
-The six `a8be065` creates carry an attempt key. The other fifteen carry none — and the plan's
-framing (*"the permanent human-gate rows are declared, not forgotten"*) understates what the
-inventory actually showed: **a keyless verb is not automatically unsafe.** Twelve of the fifteen
-are safe by CONVERGENCE, which is the owner's second shape:
+The six `a8be065` creates carried an attempt key; T3/O9 added a seventh (`commerce.create_product`,
+via `description`). The other fourteen carry none — and the plan's framing (*"the permanent
+human-gate rows are declared, not forgotten"*) understates what the inventory actually showed:
+**a keyless verb is not automatically unsafe.** Twelve of the fourteen are safe by CONVERGENCE,
+which is the owner's second shape:
 
     convergent = a stable pre-existing identity + SET semantics
 
@@ -12,10 +13,12 @@ and the edge already reports `already_confirmed` rather than confirming twice. I
 key because replay is a no-op, not because anyone asks. Demanding a key there would add ceremony
 without adding safety, and would misreport a safe verb as unsafe.
 
-Three are genuinely `none`, and that is a **correct final answer, not technical debt**:
-`crm.create_lead` (no reference field, no dedup key), `crm.log_note` (a `mail.message` nothing
-correlates to one attempt), and `commerce.create_product` — whose `default_code` is the SKU, i.e.
-**the product's key, not one attempt's**; reusing it as a witness would conflate two identities.
+Two are genuinely `none`, and that is a **correct final answer, not technical debt**:
+`crm.create_lead` (no reference field, no dedup key) and `crm.log_note` (a `mail.message` nothing
+correlates to one attempt). `commerce.create_product` was believed to belong here too — `default_code`
+is the SKU, **the product's key, not one attempt's**, so reusing it as a witness would conflate two
+identities — but T3/O9 found an honest home for the attempt key anyway: `description` (the product's
+internal notes, never printed on a purchase document), which no business fact already occupies.
 
 What this file enforces is that the question was ASKED. Silence and a considered "there is nothing
 to query on" must never read the same, because only one of them is finished work.
@@ -77,13 +80,12 @@ class TestEveryVerbAnswers:
 
 
 class TestTheClassificationIsHONEST:
-    def test_create_product_is_NONE_because_the_sku_is_not_an_attempt_key(self) -> None:
+    def test_create_product_is_keyed_via_description_never_the_sku(self) -> None:
         """The one most likely to be mis-declared: `default_code` looks like a witness and is the
-        PRODUCT's identity, not one attempt's. Two attempts at creating the same product share it,
-        so it cannot distinguish them — which is exactly what a witness must do."""
+        PRODUCT's identity, not one attempt's — two attempts at creating the same product share it,
+        so it cannot distinguish them. T3/O9 keys the verb through `description` instead."""
         v = WRITE_VERBS["commerce.create_product"]
-        assert v.recovery_shape == "none"
-        assert "SKU" in v.recovery_note or "sku" in v.recovery_note
+        assert v.idempotency_field == "description"
 
     def test_the_two_upserts_are_convergent_ONLY_because_a_key_is_now_REQUIRED(self) -> None:
         """Their convergence is not intrinsic — it was bought by C3.5's refusal of a keyless
@@ -94,9 +96,10 @@ class TestTheClassificationIsHONEST:
             assert v.recovery_shape == "convergent" and v.dedup_keys
             assert "C3.5" in v.recovery_note, v.recovery_note
 
-    def test_the_keyed_six_are_untouched(self) -> None:
+    def test_the_keyed_seven_are_untouched(self) -> None:
+        """T3/O9 added `commerce.create_product` to the a8be065 six."""
         rows = _rows()
         keyed = [n for n, v in WRITE_VERBS.items() if v.idempotency_field]
-        assert len(keyed) == 6, keyed
+        assert len(keyed) == 7, keyed
         for name in keyed:
             assert rows[name]["witness"]["shape"] == "attempt_keyed"

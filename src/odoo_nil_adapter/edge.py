@@ -443,6 +443,47 @@ def _find_by_marker(client: SystemClient, doctype: str, field: str,
     return client.get(doctype, rid) or dict(row)
 
 
+def _status_by_key(client: SystemClient, verb: Any, key: str) -> dict[str, Any]:
+    """Answer STATUS from Odoo, by the commit's own attempt key — never from `state.ledger`, which is
+    a plain dict and is gone the instant the adapter restarts (M41/M42). Quotes "The status-by-key
+    contract" (plan 2026-09-25-simplicity-w0-defects.md, shared by T2/T3/T4/T5/T6):
+
+        {"state": "executed"|"not_found"|"unknown", "authoritative": bool,
+         "result": {"external_ref": str|None}, "reason": str}
+
+    `executed`: the same ask-first probe the commit path already runs (`_find_by_marker`) finds the
+    record. `not_found` + `authoritative: true`: that SAME probe finds nothing — an exact key filter
+    the backend honours, so it is safe to commit again under the identical key. `convergent`: no probe
+    is needed at all — SET semantics over a pre-existing id make replay a no-op by construction.
+    Anything else (ambiguous, unreachable, no queryable field): `unknown` — no answer yet, never a
+    guess."""
+    if verb.idempotency_field:
+        idem_field = _stampable(client, verb.doctype, verb.idempotency_field)
+        if idem_field is None:
+            return {"state": "unknown", "authoritative": False, "result": {"external_ref": None},
+                    "reason": f"`{verb.idempotency_field}` is not a live writable field on "
+                              f"{verb.doctype} in this Odoo instance — cannot ask"}
+        marker = _idem_marker(key)
+        try:
+            landed = _find_by_marker(client, verb.doctype, idem_field, marker)
+        except OutcomeInDoubt as exc:
+            return {"state": "unknown", "authoritative": False, "result": {"external_ref": None},
+                    "reason": str(exc)}
+        except SystemError as exc:
+            return {"state": "unknown", "authoritative": False, "result": {"external_ref": None},
+                    "reason": f"could not query {verb.doctype}: {exc}"}
+        if landed is not None:
+            ref = str(landed.get("id") or landed.get("name") or "")
+            return {"state": "executed", "authoritative": True, "result": {"external_ref": ref}}
+        return {"state": "not_found", "authoritative": True, "result": {"external_ref": None},
+                "reason": "the adapter searched Odoo by the key with a query that cannot miss"}
+    if verb.recovery_shape == "convergent":
+        return {"state": "not_found", "authoritative": True, "result": {"external_ref": None},
+                "reason": "convergent: replay is safe"}
+    return {"state": "unknown", "authoritative": False, "result": {"external_ref": None},
+            "reason": verb.recovery_note or "no queryable identity for this verb"}
+
+
 def _recovery_hint(op: str, field: str | None) -> str:
     """What a human can safely do next — said PER VERB, because the honest answer differs. Inventing
     a reassuring generic sentence here would be the same class of lie as reporting failed_terminal."""
@@ -1151,8 +1192,24 @@ def create_app(client: SystemClient, emitter: EventEmitter, *, bearer: str | Non
         return {"data": verb.run(client, args)}  # bare { data }
 
     @app.get("/nil/v0.1/status/{proposal_id}")
-    def status(proposal_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
+    def status(
+        proposal_id: str,
+        verb: str | None = None,
+        idempotency_key: str | None = None,
+        authorization: str | None = Header(None),
+    ) -> dict[str, Any]:
         _auth(authorization)
+        if verb and idempotency_key:  # the status-by-key contract: ask Odoo, never our own memory
+            w = WRITE_VERBS.get(verb)
+            if w is None:
+                by_key = {"state": "unknown", "authoritative": False, "result": {"external_ref": None},
+                          "reason": f"unrecognized verb: {verb}"}
+            else:
+                by_key = _status_by_key(client, w, idempotency_key)
+            return _envelope(
+                "STATUS", {"grant": "", "workspace": ""}, {"proposal": proposal_id, **by_key},
+            )
+        # legacy: no key/verb given — the in-process ledger (backward compatible; lost on restart)
         if proposal_id in state.executed:
             current = "executed"
         elif proposal_id in state.proposals:

@@ -31,6 +31,7 @@ from odoo_nil_adapter.translate import WRITE_VERBS
 KEYED = {
     "account.create_invoice": "ref",
     "account.register_payment": "ref",
+    "commerce.create_product": "description",  # T3/O9: default_code is the product's own identity
     "commerce.record_payment": "ref",
     "procurement.create_purchase_invoice": "ref",
     "purchase.create_order": "origin",
