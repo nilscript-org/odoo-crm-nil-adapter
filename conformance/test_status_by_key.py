@@ -14,6 +14,7 @@ verb with nowhere to put a key) is `unknown` — no answer yet, never a guess.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -27,6 +28,44 @@ def _po_system() -> FakeSystem:
     # `origin` is a real, writable Char on purchase.order (as `_stampable` would find via fields_get).
     sys.schemas["purchase.order"] = [{"name": "origin", "type": "char", "readonly": False}]
     return sys
+
+
+def _like_to_regex(pattern: str) -> str:
+    """A minimal SQL LIKE → regex translator (honours `\\` escapes of `\\`, `%`, `_`) — real Odoo
+    forwards a `like` domain straight to Postgres, where a bare `_` matches ANY single character and
+    `%` matches any run. The built-in `FakeSystem.search`'s `like` is a plain Python substring check
+    and cannot exercise that wildcard-collision, so this test double reproduces the real semantics."""
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            out.append(re.escape(pattern[i + 1]))
+            i += 2
+            continue
+        if c == "%":
+            out.append(".*")
+        elif c == "_":
+            out.append(".")
+        else:
+            out.append(re.escape(c))
+        i += 1
+    return "".join(out)
+
+
+class _SQLLikeSystem(FakeSystem):
+    """A fake whose `search` honours REAL SQL LIKE wildcard semantics for the `like`/`ilike` ops used
+    by the ask-first marker probe — everything else is the inherited in-memory behaviour."""
+
+    def search(self, target: str, domain: list[list[Any]], *, fields: Any = None,
+               limit: int = 50, order: str | None = None) -> list[dict[str, Any]]:
+        field, op, value = domain[0]
+        assert op in ("like", "ilike"), f"unexpected op in this test double: {op}"
+        rx = _like_to_regex(str(value))
+        flags = re.IGNORECASE if op == "ilike" else 0
+        rows = [r for r in self.docs.get(target, [])
+                if re.search(rx, str(r.get(field, "")), flags)]
+        return rows[:limit]
 
 
 def _product_system() -> FakeSystem:
@@ -142,3 +181,20 @@ def test_a_second_create_product_commit_with_the_same_key_creates_nothing_new() 
     assert second["state"] == "executed"
     assert second.get("replayed") is True
     assert len(sys.docs["product.product"]) == 1, "a second product was created"
+
+
+def test_a_literal_underscore_in_the_key_does_not_wildcard_match_a_different_record() -> None:
+    """Real SQL LIKE treats a bare `_` as "match any one character". An attempt key that happens to
+    contain an underscore must not be able to wildcard-match a DIFFERENT attempt's marker that
+    merely carries some other character in that same position — that would be a false `executed`
+    against a record that has nothing to do with this attempt, reported as an AUTHORITATIVE answer."""
+    sys = _SQLLikeSystem()
+    sys.schemas["purchase.order"] = [{"name": "origin", "type": "char", "readonly": False}]
+    # a genuinely different attempt's marker — differs from ours ONLY at the `_`/`X` position
+    other = "[WSL-prep:abcXr1]"
+    sys.docs["purchase.order"] = [
+        {"id": 1, "name": "P00001", "origin": other, "target": "purchase.order"},
+    ]
+    body = _status(_app(sys), "pid", "purchase.create_order", "prep:abc_r1")
+    assert body["state"] == "not_found", body  # must NOT report the other attempt's record as ours
+    assert body["authoritative"] is True

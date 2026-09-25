@@ -409,6 +409,16 @@ def _idem_marker(key: str) -> str:
     return f"[WSL-{safe}]"
 
 
+def _like_escape(value: str) -> str:
+    """Escape SQL LIKE wildcards (`\\`, `%`, `_`) before a marker is used AS a `like` query — never
+    when it is stamped into the record (the bracketed marker stays human-legible there). `_KEY_SAFE`
+    keeps a literal `_` (a live key character, e.g. `prep:abc_r1`), and Odoo forwards `like` straight
+    to Postgres, where an unescaped `_` matches ANY single character on the wire. Without this a key
+    that happens to contain `_`/`%` could wildcard-match a DIFFERENT attempt's marker that merely
+    differs at that one position — an authoritative-sounding, and wrong, `executed`."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def _stampable(client: SystemClient, doctype: str, field: str | None) -> str | None:
     """The declared idempotency field, but only if the LIVE model really carries it as a writable
     one. A declaration is our belief; `fields_get` is the instance's truth. Believing wrongly would
@@ -429,7 +439,7 @@ def _find_by_marker(client: SystemClient, doctype: str, field: str,
     Two hits mean a duplicate ALREADY exists under this key (or the key was reused). Which of them
     this commit produced is not knowable from here, so it raises the doubt rather than picking one —
     and, crucially, rather than adding a third."""
-    hits = client.search(doctype, [[field, "like", marker]], limit=2)
+    hits = client.search(doctype, [[field, "like", _like_escape(marker)]], limit=2)
     if len(hits) > 1:
         raise OutcomeInDoubt(
             f"{len(hits)}+ {doctype} records already carry this attempt key in `{field}` — which of "
