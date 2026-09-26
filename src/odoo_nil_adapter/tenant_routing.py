@@ -19,6 +19,7 @@ from typing import Any
 
 import httpx
 
+from odoo_nil_adapter.cp_auth import auth_headers
 from odoo_nil_adapter.system import RealSystemClient, SystemClient, SystemError
 
 # Set by the edge at the top of each governed request from env["workspace"]; None = no tenant scope
@@ -42,14 +43,22 @@ class VaultResolvingClient:
     # The vault secret names this adapter provisions/reads for a tenant's Odoo backend.
     _SECRET_KEYS = ("odoo_url", "odoo_db", "odoo_login", "odoo_api_key")
 
-    def __init__(self, registry_url: str, registry_token: str) -> None:
+    def __init__(
+        self, registry_url: str, registry_token: str = "", *, headers: dict[str, str] | None = None
+    ) -> None:
         self._registry_url = registry_url.rstrip("/")
         self._registry_token = registry_token
+        # `headers` (from `cp_auth.auth_headers()`) wins; kept `registry_token` for backward
+        # compatibility with callers that still build the shared-bearer header themselves.
+        self._headers: dict[str, str] = (
+            headers if headers is not None
+            else ({"Authorization": f"Bearer {registry_token}"} if registry_token else {})
+        )
         self._cache: dict[str, RealSystemClient] = {}
 
     def _fetch_secret(self, workspace: str, name: str) -> str | None:
         url = f"{self._registry_url}/tenants/{workspace}/secret/{name}"
-        headers = {"Authorization": f"Bearer {self._registry_token}"} if self._registry_token else {}
+        headers = self._headers
         try:
             r = httpx.get(url, headers=headers, timeout=8)
         except httpx.HTTPError as exc:
@@ -141,4 +150,4 @@ def build_from_env() -> SystemClient | None:
     registry_url = os.environ.get("NIL_REGISTRY_URL", "").strip()
     if not registry_url:
         return None
-    return VaultResolvingClient(registry_url, os.environ.get("NIL_REGISTRY_TOKEN", ""))
+    return VaultResolvingClient(registry_url, headers=auth_headers())
