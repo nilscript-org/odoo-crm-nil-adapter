@@ -357,10 +357,11 @@ class CapturingEmitter:
 class HttpEventEmitter:
     """Real emitter: HMAC-SHA256 over the raw body + a monotonic per-workspace sequence header.
 
-    With an own service key (`key_id`/`key_secret`, both non-empty) it signs with
-    `cp_auth.event_mac` and sends `X-NIL-Key-Id` instead of the shared-secret signature — the
-    control plane's per-service counter for this adapter's events. Without one, today's
-    shared-secret signature is unchanged, byte for byte."""
+    With an own service key (`own_key = (kid, secret)`) it signs with `cp_auth.event_mac` and
+    sends `X-NIL-Key-Id` instead of the shared-secret signature — the control plane's per-service
+    counter for this adapter's events. Without one, today's shared-secret signature is unchanged,
+    byte for byte. `own_key` is ONE pair, never two separate optional halves — a caller with only
+    a kid or only a secret cannot silently fall back to the weaker shared signature."""
 
     def __init__(
         self,
@@ -368,14 +369,12 @@ class HttpEventEmitter:
         secret: str,
         *,
         source: str = "",
-        key_id: str | None = None,
-        key_secret: str | None = None,
+        own_key: tuple[str, str] | None = None,
     ) -> None:
         self._url = webhook_url
         self._secret = secret.encode("utf-8")
         self._source = source  # tags events in the control plane (e.g. "playground" vs "mcp")
-        self._key_id = key_id or None
-        self._key_secret = key_secret or None
+        self._own_key = own_key
 
     def emit(self, event_envelope: dict[str, Any], sequence: int) -> None:
         import httpx
@@ -387,9 +386,10 @@ class HttpEventEmitter:
             "Content-Type": "application/json",
             "X-NIL-Sequence": str(sequence),
         }
-        if self._key_id and self._key_secret:
-            headers["X-NIL-Key-Id"] = self._key_id
-            headers["X-NIL-Signature"] = event_mac(self._key_secret, raw)
+        if self._own_key is not None:
+            key_id, key_secret = self._own_key
+            headers["X-NIL-Key-Id"] = key_id
+            headers["X-NIL-Signature"] = event_mac(key_secret, raw)
         else:
             headers["X-NIL-Signature"] = hmac.new(self._secret, raw, hashlib.sha256).hexdigest()
         if self._source:

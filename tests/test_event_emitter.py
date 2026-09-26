@@ -57,8 +57,7 @@ def test_emit_with_key_sends_key_id_and_event_mac_not_shared_signature(
     emitter = HttpEventEmitter(
         "https://cp.example/events",
         SHARED_SECRET,
-        key_id=KEY_ID,
-        key_secret=KEY_SECRET,
+        own_key=(KEY_ID, KEY_SECRET),
     )
 
     emitter.emit(ENVELOPE, sequence=3)
@@ -76,7 +75,7 @@ def test_emit_with_key_sends_key_id_and_event_mac_not_shared_signature(
 def test_emit_with_key_signs_the_exact_posted_body(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capture_post(monkeypatch)
     emitter = HttpEventEmitter(
-        "https://cp.example/events", SHARED_SECRET, key_id=KEY_ID, key_secret=KEY_SECRET
+        "https://cp.example/events", SHARED_SECRET, own_key=(KEY_ID, KEY_SECRET)
     )
 
     emitter.emit(ENVELOPE, sequence=1)

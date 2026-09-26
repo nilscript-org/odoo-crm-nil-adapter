@@ -50,8 +50,7 @@ def build_app():
         HttpEventEmitter(
             webhook,
             os.environ.get("NIL_EVENTS_SECRET", ""),
-            key_id=own_key[0] if own_key else None,
-            key_secret=own_key[1] if own_key else None,
+            own_key=own_key,
         )
         if webhook
         else CapturingEmitter()
