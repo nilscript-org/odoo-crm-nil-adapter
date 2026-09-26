@@ -6,7 +6,10 @@
     export ODOO_API_KEY=...                # NEVER commit this — keep it in .env (git-ignored)
     export NIL_BEARER=...                  # optional: front-door bearer for /nil/v0.1/*
     export NIL_EVENTS_WEBHOOK=...          # optional: control-plane ingest URL for EVENTs
-    export NIL_EVENTS_SECRET=...           # optional: HMAC secret for the webhook
+    export NIL_EVENTS_SECRET=...           # optional: shared HMAC secret for the webhook (fallback)
+    export NIL_SERVICE_KEY=<kid>:<secret>  # optional: this adapter's own key — signs the vault
+                                            # bearer AND events; wins over NIL_REGISTRY_TOKEN /
+                                            # NIL_EVENTS_SECRET when set
 
     uvicorn odoo_nil_adapter.run_live:build_app --factory --host 0.0.0.0 --port 8099
 """
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import os
 
+from odoo_nil_adapter.cp_auth import service_key_from_env
 from odoo_nil_adapter.edge import CapturingEmitter, HttpEventEmitter, create_app
 from odoo_nil_adapter.system import RealSystemClient
 from odoo_nil_adapter.tenant_routing import build_from_env as _tenant_client_from_env
@@ -41,8 +45,14 @@ def build_app():
             api_key=_require("ODOO_API_KEY"),
         )
     webhook = os.environ.get("NIL_EVENTS_WEBHOOK")
+    own_key = service_key_from_env()  # malformed NIL_SERVICE_KEY raises here at boot, not silently
     emitter = (
-        HttpEventEmitter(webhook, os.environ.get("NIL_EVENTS_SECRET", ""))
+        HttpEventEmitter(
+            webhook,
+            os.environ.get("NIL_EVENTS_SECRET", ""),
+            key_id=own_key[0] if own_key else None,
+            key_secret=own_key[1] if own_key else None,
+        )
         if webhook
         else CapturingEmitter()
     )

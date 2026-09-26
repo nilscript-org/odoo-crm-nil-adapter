@@ -20,9 +20,33 @@ VECTOR_HEADER = (
     "897ce1af1bd86c9c4c7560f41de7e54eb23c29d7a9d3ed6df4af8913a7e9d262"
 )
 
+EVENT_TEST_SECRET = "fedcba9876543210fedcba9876543210"
+EVENT_TEST_RAW = b'{"type":"test.vector","n":1}'
+EVENT_TEST_MAC = "d83b9e63c855e9c72b44c8b829627599a629204bd1b33f7336e3f792e92d9b15"
+
 
 def test_bearer_matches_hub_vector_byte_for_byte() -> None:
     assert cp_auth.bearer(VECTOR_KID, VECTOR_SECRET) == VECTOR_HEADER
+
+
+def test_event_mac_matches_hub_vector_byte_for_byte() -> None:
+    assert cp_auth.event_mac(EVENT_TEST_SECRET, EVENT_TEST_RAW) == EVENT_TEST_MAC
+
+
+def test_service_key_from_env_none_when_unset() -> None:
+    assert cp_auth.service_key_from_env({}) is None
+
+
+def test_service_key_from_env_parses_when_set() -> None:
+    assert cp_auth.service_key_from_env(
+        {"NIL_SERVICE_KEY": f"{VECTOR_KID}:{VECTOR_SECRET}"}
+    ) == (VECTOR_KID, VECTOR_SECRET)
+
+
+@pytest.mark.parametrize("raw", ["nocolon", ":x", "k:"])
+def test_service_key_from_env_raises_on_malformed(raw: str) -> None:
+    with pytest.raises(ValueError, match="NIL_SERVICE_KEY"):
+        cp_auth.service_key_from_env({"NIL_SERVICE_KEY": raw})
 
 
 def test_auth_headers_prefers_service_key() -> None:
